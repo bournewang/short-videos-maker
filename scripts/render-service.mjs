@@ -1,0 +1,443 @@
+import { createServer } from "node:http";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { normalizePlannedShots } from "../app/lib/timeline.js";
+import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const workRoot = path.join(root, ".shortform");
+const exportRoot = path.join(workRoot, "exports");
+const assetRoot = path.join(workRoot, "assets");
+const audioPreviewRoot = path.join(workRoot, "audio-previews");
+const bgmRoot = path.join(root, "public", "bgm");
+
+async function loadLocalEnvironment() {
+  try {
+    const source = await readFile(path.join(root, ".env.local"), "utf8");
+    for (const rawLine of source.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const separator = line.indexOf("=");
+      if (separator < 1) continue;
+      const key = line.slice(0, separator).trim();
+      let value = line.slice(separator + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+      if (process.env[key] === undefined) process.env[key] = value;
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+await loadLocalEnvironment();
+const port = Number(process.env.SHORTFORM_PORT || 4317);
+
+const providerDefaults = {
+  image: {
+    openai: { endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1" },
+    volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128" },
+    sdwebui: { endpoint:"http://127.0.0.1:7860", model:"Local checkpoint" },
+  },
+  text: {
+    openai: { endpoint:"https://api.openai.com/v1/chat/completions", model:"gpt-4.1-mini" },
+    volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", model:"doubao-seed-2-1-turbo-260628" },
+  },
+};
+
+function configuredImageProvider(kind = process.env.IMAGE_PROVIDER || "openai") {
+  const selected = process.env.IMAGE_PROVIDER || "openai";
+  const defaults = providerDefaults.image[kind] || providerDefaults.image.openai;
+  const providerKey = kind === "volcengine" ? (process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "") : kind === "openai" ? (process.env.OPENAI_API_KEY || "") : "";
+  return {
+    kind,
+    endpoint:(kind === selected ? process.env.IMAGE_API_ENDPOINT : "") || (kind === "volcengine" ? process.env.VOLCENGINE_IMAGE_ENDPOINT : "") || defaults.endpoint,
+    model:(kind === selected ? process.env.IMAGE_MODEL : "") || (kind === "volcengine" ? process.env.VOLCENGINE_IMAGE_MODEL : "") || defaults.model,
+    apiKey:(kind === selected ? process.env.IMAGE_API_KEY : "") || providerKey,
+  };
+}
+
+function configuredTextProvider(kind = process.env.TEXT_PROVIDER || "openai") {
+  const selected = process.env.TEXT_PROVIDER || "openai";
+  const defaults = providerDefaults.text[kind] || providerDefaults.text.openai;
+  const providerKey = kind === "volcengine" ? (process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "") : (process.env.OPENAI_API_KEY || "");
+  return {
+    kind,
+    endpoint:(kind === selected ? process.env.TEXT_API_ENDPOINT : "") || (kind === "volcengine" ? process.env.VOLCENGINE_TEXT_ENDPOINT : "") || defaults.endpoint,
+    model:(kind === selected ? process.env.TEXT_MODEL : "") || (kind === "volcengine" ? process.env.VOLCENGINE_TEXT_MODEL : "") || defaults.model,
+    apiKey:(kind === selected ? process.env.TEXT_API_KEY : "") || providerKey,
+  };
+}
+
+function environmentProviders() {
+  const imageKind = process.env.IMAGE_PROVIDER || "openai";
+  const textKind = process.env.TEXT_PROVIDER || "openai";
+  return {
+    image: configuredImageProvider(imageKind),
+    text: configuredTextProvider(textKind),
+    transcription: {
+      endpoint: process.env.TRANSCRIPTION_ENDPOINT || "http://localhost:8000/v1/transcriptions",
+      language: process.env.TRANSCRIPTION_LANGUAGE || "en",
+    },
+  };
+}
+
+export function getProviderStatus() {
+  const providers = environmentProviders();
+  return {
+    image: { configured: providers.image.kind === "sdwebui" ? Boolean(providers.image.endpoint) : Boolean(providers.image.apiKey), kind: providers.image.kind, endpoint: providers.image.endpoint, model: providers.image.model, source: providers.image.apiKey ? "environment" : "default" },
+    text: { configured: Boolean(providers.text.apiKey && providers.text.model), kind:providers.text.kind, endpoint: providers.text.endpoint, model: providers.text.model, source: providers.text.apiKey ? "environment" : "default" },
+    transcription: { configured:Boolean(providers.transcription.endpoint), endpoint:providers.transcription.endpoint, language:providers.transcription.language, source:process.env.TRANSCRIPTION_ENDPOINT ? "environment" : "default" },
+  };
+}
+
+function resolveImageProvider(data = {}) {
+  const kind = data.kind || environmentProviders().image.kind;
+  const configured = configuredImageProvider(kind);
+  if (data.kind === "sdwebui") return { ...configured, ...data, apiKey: data.apiKey || "" };
+  const useEnvironment = !data.apiKey && Boolean(configured.apiKey);
+  return {
+    kind,
+    endpoint: useEnvironment ? configured.endpoint : (data.endpoint || configured.endpoint),
+    model: useEnvironment ? configured.model : (data.model || configured.model),
+    apiKey: data.apiKey || configured.apiKey,
+    prompt: data.prompt,
+  };
+}
+
+function resolveTextProvider(data = {}) {
+  const kind = data.textKind || data.kind || environmentProviders().text.kind;
+  const configured = configuredTextProvider(kind);
+  const useEnvironment = !data.apiKey && Boolean(configured.apiKey);
+  return {
+    kind,
+    endpoint: useEnvironment ? configured.endpoint : (data.endpoint || configured.endpoint),
+    model: useEnvironment ? configured.model : (data.model || configured.model),
+    apiKey: data.apiKey || configured.apiKey,
+    lines: data.lines,
+    script: data.script,
+    contentFormat: data.contentFormat,
+    visualStyle: data.visualStyle,
+    creativeDirection: data.creativeDirection,
+    audioDuration: data.audioDuration,
+    transcription: data.transcription,
+  };
+}
+
+function cors(extra = {}) {
+  return { "Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST,OPTIONS", ...extra };
+}
+
+function json(res, status, value) {
+  res.writeHead(status, cors({ "Content-Type": "application/json; charset=utf-8" }));
+  res.end(JSON.stringify(value));
+}
+
+async function body(req, maxBytes = 160 * 1024 * 1024) {
+  const chunks = []; let size = 0;
+  for await (const chunk of req) { size += chunk.length; if (size > maxBytes) throw new Error("Request is too large"); chunks.push(chunk); }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+function fromDataUrl(value) {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(value || "");
+  if (!match) throw new Error("Invalid media data");
+  return { mime: match[1] || "application/octet-stream", data: match[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3])) };
+}
+
+export function normalizeTranscription(result = {}) {
+  const segments = Array.isArray(result.segments) ? result.segments.map((segment, index) => ({
+    id:segment?.id ?? index,
+    start:Number(segment?.start) || 0,
+    end:Number(segment?.end) || 0,
+    text:String(segment?.text || "").trim(),
+    words:Array.isArray(segment?.words) ? segment.words.map((word) => ({ start:Number(word?.start) || 0, end:Number(word?.end) || 0, word:String(word?.word || ""), probability:Number.isFinite(Number(word?.probability)) ? Number(word.probability) : null })) : [],
+  })) : [];
+  const lastEnd = segments.reduce((value, segment) => Math.max(value, segment.end), 0);
+  return {
+    text:String(result.text || segments.map((segment) => segment.text).join(" ")).trim(),
+    language:String(result.language || ""),
+    languageProbability:Number.isFinite(Number(result.language_probability)) ? Number(result.language_probability) : null,
+    duration:Number(result.duration) || lastEnd,
+    durationAfterVad:Number(result.duration_after_vad) || 0,
+    segments,
+  };
+}
+
+export async function transcribeAudio(payload = {}, options = {}) {
+  const providers = environmentProviders();
+  const endpoint = String(payload.endpoint || providers.transcription.endpoint || "").trim();
+  const language = String(payload.language || providers.transcription.language || "en").trim();
+  if (!endpoint) throw new Error("A local transcription service URL is required");
+  const media = fromDataUrl(payload.audioData);
+  const form = new FormData();
+  form.append("file", new Blob([media.data], { type:media.mime }), String(payload.filename || "narration.mp3"));
+  form.append("language", language);
+  form.append("word_timestamps", "true");
+  const response = await (options.fetchImpl || fetch)(endpoint, { method:"POST", body:form });
+  if (!response.ok) {
+    let detail = "";
+    try { const result = await response.json(); detail = result.error?.message || result.error || result.detail || result.message || ""; } catch { detail = await response.text().catch(() => ""); }
+    throw new Error(detail || `Local transcription service returned ${response.status}`);
+  }
+  return normalizeTranscription(await response.json());
+}
+
+async function saveMedia(value, targetBase, fetchImpl = fetch) {
+  if (!value) return "";
+  let mime = "application/octet-stream"; let data;
+  if (/^https?:\/\//.test(value)) {
+    const response = await fetchImpl(value); if (!response.ok) throw new Error(`Could not download generated image (${response.status})`);
+    mime = response.headers.get("content-type") || mime; data = Buffer.from(await response.arrayBuffer());
+  } else ({ mime, data } = fromDataUrl(value));
+  const ext = mime.includes("png") ? ".png" : mime.includes("jpeg") || mime.includes("jpg") ? ".jpg" : mime.includes("wav") ? ".wav" : mime.includes("mpeg") ? ".mp3" : mime.includes("mp4") ? ".m4a" : ".bin";
+  const filename = `${targetBase}${ext}`; await writeFile(filename, data); return filename;
+}
+
+export async function persistGeneratedImage(value, options = {}) {
+  if (!value) throw new Error("Provider returned no image");
+  await mkdir(assetRoot, { recursive:true });
+  const filename = await saveMedia(value, path.join(assetRoot, options.id || randomUUID()), options.fetchImpl || fetch);
+  return {
+    path:filename,
+    url:`http://127.0.0.1:${port}/assets/${encodeURIComponent(path.basename(filename))}`,
+  };
+}
+
+function imageContentType(filename) {
+  const extension = path.extname(filename).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+function run(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: root, stdio: ["ignore", "ignore", "pipe"] }); let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); if (stderr.length > 30000) stderr = stderr.slice(-30000); });
+    child.on("error", reject); child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}: ${stderr.slice(-2500)}`)));
+  });
+}
+
+async function renderNarrationStages(source, presetId, jobDir, prefix = "voice") {
+  const preset = voicePreset(presetId);
+  const raw = path.join(jobDir, `${prefix}-raw.wav`);
+  const clean = path.join(jobDir, `${prefix}-clean.wav`);
+  await run("ffmpeg", ["-y", "-i", source, "-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s24le", raw]);
+  if (preset.id === "original") return { preset, raw, clean:raw, final:raw };
+  await run("ffmpeg", ["-y", "-i", raw, "-af", cleanupFilters(preset.id).join(","), "-ar", "48000", "-c:a", "pcm_s24le", clean]);
+  return { preset, raw, clean, final:clean };
+}
+
+export async function processNarration(payload = {}, options = {}) {
+  if (!payload.audioData) throw new Error("Recorded narration is required");
+  const preset = voicePreset(payload.preset);
+  const id = options.id || randomUUID();
+  const jobDir = options.jobDir || path.join(audioPreviewRoot, id);
+  await mkdir(jobDir, { recursive:true });
+  const source = await saveMedia(payload.audioData, path.join(jobDir, "source"));
+  const stages = await renderNarrationStages(source, preset.id, jobDir);
+
+  const base = `/audio/${encodeURIComponent(id)}`;
+  return {
+    id,
+    preset:{ id:preset.id, label:preset.label, pitchSemitones:preset.pitchSemitones },
+    stages:{ raw:`${base}/${path.basename(stages.raw)}`, clean:`${base}/${path.basename(stages.clean)}`, final:`${base}/${path.basename(stages.final)}` },
+    format:{ sampleRate:48000, channels:1, bitDepth:24 },
+    engines:{ denoise:preset.id === "denoise" ? "FFmpeg afftdn · light reduction" : "Off", pitch:"None" },
+  };
+}
+
+function assTime(value) {
+  const h = Math.floor(value / 3600); const m = Math.floor(value / 60) % 60; const s = Math.floor(value) % 60; const cs = Math.floor((value % 1) * 100);
+  return `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}.${String(cs).padStart(2,"0")}`;
+}
+
+function assText(value) { return String(value || "").replace(/\\/g, "\\\\").replace(/[\r\n]+/g, " ").replace(/\{/g, "（").replace(/\}/g, "）"); }
+
+function subtitles(shots, width, height) {
+  const fontSize = Math.round(height * .028); const marginV = Math.round(height * .08);
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,Arial,${fontSize},&H00FFFFFF,&H000000FF,&H00131313,&H9A000000,-1,0,0,0,100,100,0,0,3,2,0,2,70,70,${marginV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
+  return header + shots.map((shot) => `Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Main,,0,0,0,,${assText(shot.narration)}\\N{\\c&H9FD7F2&}${assText(shot.chinese)}`).join("\n");
+}
+
+export async function renderEpisode(payload, options = {}) {
+  if (!Array.isArray(payload.shots) || !payload.shots.length) throw new Error("At least one shot is required");
+  if (payload.shots.length > 80) throw new Error("The MVP supports up to 80 shots per episode");
+  const started = Date.now(); const id = options.id || randomUUID(); const jobDir = path.join(workRoot, "jobs", id);
+  await mkdir(jobDir, { recursive: true }); await mkdir(exportRoot, { recursive: true });
+  const width = Math.min(1080, Math.max(360, Number(payload.width) || 1080)); const height = Math.min(1920, Math.max(640, Number(payload.height) || 1920));
+  const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
+  let cursor = 0; const shots = [];
+  for (let i = 0; i < payload.shots.length; i += 1) {
+    if (!payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image`);
+    const duration = Math.max(.6, Number(payload.shots[i].duration) || 2); const image = await saveMedia(payload.shots[i].image, path.join(jobDir, `shot-${String(i).padStart(3,"0")}`));
+    shots.push({ ...payload.shots[i], duration, start: cursor, end: cursor + duration, image }); cursor += duration;
+  }
+  let narration = await saveMedia(payload.narrationData, path.join(jobDir, "narration"));
+  if (narration && payload.voicePreset !== "original") narration = (await renderNarrationStages(narration, "denoise", jobDir, "narration")).final;
+  let customBgm = null;
+  if (payload.bgmPath) {
+    const filename = path.basename(String(payload.bgmPath));
+    if (!/\.mp3$/i.test(filename)) throw new Error("The selected BGM format is not supported");
+    customBgm = path.join(bgmRoot, filename);
+    await readFile(customBgm);
+  }
+  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, subtitles(shots, width, height));
+  const concatFile = path.join(jobDir, "images.txt");
+  const quoteConcat = (value) => value.replace(/'/g, "'\\''");
+  const concatLines = shots.flatMap((shot) => [`file '${quoteConcat(shot.image)}'`, `duration ${shot.duration}`]);
+  concatLines.push(`file '${quoteConcat(shots.at(-1).image)}'`);
+  await writeFile(concatFile, concatLines.join("\n"));
+  const output = options.output || path.join(exportRoot, `${id}.mp4`); const args = ["-y", "-f", "concat", "-safe", "0", "-i", concatFile];
+  const audioInputs = [];
+  if (narration) { audioInputs.push({ kind: "narration", index: 1 }); args.push("-i", narration); }
+  if (customBgm) { audioInputs.push({ kind: "bgm", index: 1 + audioInputs.length }); args.push("-stream_loop", "-1", "-i", customBgm); }
+  if (!audioInputs.length) { audioInputs.push({ kind:"silence", index:1 }); args.push("-f", "lavfi", "-t", String(total), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"); }
+  const filters = [];
+  const escapedAss = ass.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
+  filters.push(`[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30,setsar=1,ass=filename='${escapedAss}'[vout]`);
+  const narrationInput = audioInputs.find((item) => item.kind === "narration"); const bgmInput = audioInputs.find((item) => item.kind === "bgm");
+  const requestedBgmVolume = Number(payload.bgmVolume); const bgmVolume = Number.isFinite(requestedBgmVolume) ? Math.max(0, Math.min(1, requestedBgmVolume)) : .08;
+  if (narrationInput && bgmInput) filters.push(`[${narrationInput.index}:a]volume=1[nar];[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[bg];[nar][bg]amix=inputs=2:duration=longest:dropout_transition=2,alimiter=limit=.8414:level=false[aout]`);
+  else if (narrationInput) filters.push(`[${narrationInput.index}:a]volume=1[aout]`);
+  else if (bgmInput) filters.push(`[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[aout]`);
+  else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
+  args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
+  await run("ffmpeg", args);
+  return { id, output, url: `/renders/${path.basename(output)}`, seconds: (Date.now() - started) / 1000, duration: total };
+}
+
+export async function generateImage(data, options = {}) {
+  data = resolveImageProvider(data);
+  if (!data.endpoint) throw new Error("Provider endpoint is required");
+  if (!data.model && data.kind !== "sdwebui") throw new Error("Provider model or endpoint ID is required");
+  const fetchImpl = options.fetchImpl || fetch;
+  if (data.kind === "sdwebui") {
+    const endpoint = data.endpoint.includes("txt2img") ? data.endpoint : `${data.endpoint.replace(/\/$/,"")}/sdapi/v1/txt2img`;
+    const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ prompt:data.prompt, negative_prompt:"text, watermark, logo, low quality, distorted anatomy, duplicate subjects", width:768, height:1344, steps:28 }) });
+    const result = await response.json(); if (!response.ok) throw new Error(result.error || `Provider returned ${response.status}`); if (!result.images?.[0]) throw new Error("Provider returned no image");
+    return `data:image/png;base64,${result.images[0]}`;
+  }
+  const requestBody = data.kind === "volcengine"
+    ? { model:data.model, prompt:data.prompt, size:"1440x2560", response_format:"url", watermark:false }
+    : { model:data.model, prompt:data.prompt, size:"1024x1536", n:1, response_format:"b64_json" };
+  const response = await fetchImpl(data.endpoint, { method:"POST", headers:{"Content-Type":"application/json",...(data.apiKey?{Authorization:`Bearer ${data.apiKey}`}:{})}, body:JSON.stringify(requestBody) });
+  const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); const item = result.data?.[0]; if (!item) throw new Error("Provider returned no image");
+  return item.b64_json ? `data:image/png;base64,${item.b64_json}` : item.url;
+}
+
+export async function completeText(data, messages, options = {}) {
+  data = resolveTextProvider(data);
+  if (!data.endpoint || !data.apiKey || !data.model) throw new Error("Text endpoint, API key, and model or endpoint ID are required");
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.TEXT_REQUEST_TIMEOUT_MS) || 120000);
+  const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${data.apiKey}`}, body:JSON.stringify({ model:data.model, temperature:options.temperature ?? .2, max_tokens:options.maxTokens ?? 8000, response_format:{type:"json_object"}, ...(data.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages }) };
+  const callProvider = () => fetchImpl(data.endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
+  let response;
+  try { response = await callProvider(); }
+  catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try { response = await callProvider(); }
+    catch (retryError) {
+      if (retryError?.name === "TimeoutError" || retryError?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      throw retryError;
+    }
+  }
+  if (response.status === 429 || response.status >= 500) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    response = await callProvider();
+  }
+  const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || `Provider returned ${response.status}`);
+  return result.choices?.[0]?.message?.content || "{}";
+}
+
+async function translate(data) {
+  if (!Array.isArray(data.lines)) throw new Error("Subtitle lines are required");
+  const raw = await completeText(data, [{role:"system",content:"Translate English short-video subtitles into concise, natural Simplified Chinese. Preserve names, numbers, dates, tone, and factual meaning. Return only JSON with a translations array in the same order."},{role:"user",content:JSON.stringify({lines:data.lines})}], { temperature:.2 });
+  const parsed = JSON.parse(raw.replace(/^```json\s*|\s*```$/g,"")); if (!Array.isArray(parsed.translations)) throw new Error("Translation provider returned an unexpected format"); return parsed.translations;
+}
+
+export async function planEpisode(data, options = {}) {
+  const config = resolveTextProvider(data);
+  if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
+  if (!String(config.script || "").trim()) throw new Error("A script is required");
+  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return JSON only with a shots array. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise image-generation prompt, at most 45 words, faithful to the narration, content format, visual style, and creative direction, with subject, setting, composition, lighting, vertical 9:16 framing, subtitle-safe lower area, and exclusions for text and watermark), and motion (Slow push-in, Slow drift, or Static). Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
+  const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
+  const minimumShotCount = narrationDuration ? Math.ceil(narrationDuration / 4) : null;
+  const targetShotCount = narrationDuration ? Math.ceil(narrationDuration / 3.3) : null;
+  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, fetchImpl:options.fetchImpl });
+  const parsed = JSON.parse(raw.replace(/^```json\s*|\s*```$/g,""));
+  return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, transcription:config.transcription });
+}
+
+function modelsEndpoint(endpoint, kind) {
+  if (kind === "sdwebui") {
+    const base = endpoint.replace(/\/sdapi\/v1\/txt2img\/?$/, "").replace(/\/$/, "");
+    return `${base}/sdapi/v1/sd-models`;
+  }
+  return endpoint.replace(/\/(images\/generations|chat\/completions)\/?$/, "/models");
+}
+
+async function testProviderConnection(data) {
+  const target = data.target === "text" ? "text" : "image";
+  const config = target === "text" ? resolveTextProvider(data) : resolveImageProvider(data);
+  if (!config.endpoint) throw new Error("Provider endpoint is required");
+  if (target === "text" && !config.apiKey) throw new Error("No translation API key is configured");
+  if (target === "image" && config.kind !== "sdwebui" && !config.apiKey) throw new Error("No image API key is configured");
+  const response = await fetch(modelsEndpoint(config.endpoint, config.kind), { headers: config.apiKey ? { Authorization:`Bearer ${config.apiKey}` } : {} });
+  if (!response.ok) {
+    let detail = "";
+    try { const result = await response.json(); detail = result.error?.message || result.error || result.message || ""; } catch { /* status is enough */ }
+    throw new Error(detail || `Provider returned ${response.status}`);
+  }
+  return { ok:true, target, model:config.model, endpoint:config.endpoint };
+}
+
+export function createRenderServer() {
+  return createServer(async (req, res) => {
+    try {
+      if (req.method === "OPTIONS") { res.writeHead(204, cors()); res.end(); return; }
+      const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      if (req.method === "GET" && url.pathname === "/health") { json(res, 200, { ok:true, ffmpeg:"available" }); return; }
+      if (req.method === "GET" && url.pathname === "/audio/presets") { json(res, 200, { presets:voicePresetSummaries(), processing:"local" }); return; }
+      if (req.method === "GET" && url.pathname === "/config/status") { json(res, 200, getProviderStatus()); return; }
+      if (req.method === "GET" && url.pathname.startsWith("/audio/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        if (parts.length !== 3) throw new Error("Audio preview was not found");
+        const file = path.join(audioPreviewRoot, path.basename(parts[1]), path.basename(parts[2])); await readFile(file);
+        res.writeHead(200, cors({"Content-Type":"audio/wav","Content-Disposition":`inline; filename="${path.basename(file)}"`})); createReadStream(file).pipe(res); return;
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/renders/")) {
+        const filename = path.basename(url.pathname); const file = path.join(exportRoot, filename); await readFile(file);
+        res.writeHead(200, cors({"Content-Type":"video/mp4","Content-Disposition":`attachment; filename="${filename}"`})); createReadStream(file).pipe(res); return;
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/assets/")) {
+        const filename = path.basename(decodeURIComponent(url.pathname)); const file = path.join(assetRoot, filename); await readFile(file);
+        res.writeHead(200, cors({"Content-Type":imageContentType(filename),"Cache-Control":"public, max-age=31536000, immutable"})); createReadStream(file).pipe(res); return;
+      }
+      if (req.method === "POST" && url.pathname === "/render") { const result = await renderEpisode(await body(req)); json(res, 200, result); return; }
+      if (req.method === "POST" && url.pathname === "/image/generate") {
+        const generated = await generateImage(await body(req, 2*1024*1024));
+        const cached = await persistGeneratedImage(generated);
+        json(res, 200, { image:cached.url }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
+      if (req.method === "POST" && url.pathname === "/text/plan") { json(res, 200, { shots:await planEpisode(await body(req, 4*1024*1024)) }); return; }
+      if (req.method === "POST" && url.pathname === "/audio/transcribe") { json(res, 200, await transcribeAudio(await body(req))); return; }
+      if (req.method === "POST" && url.pathname === "/audio/process") { json(res, 200, await processNarration(await body(req))); return; }
+      if (req.method === "POST" && url.pathname === "/providers/test") { json(res, 200, await testProviderConnection(await body(req, 2*1024*1024))); return; }
+      json(res, 404, { error:"Not found" });
+    } catch (error) { json(res, 500, { error:error instanceof Error ? error.message : "Unexpected error" }); }
+  });
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await Promise.all([mkdir(exportRoot, { recursive:true }), mkdir(assetRoot, { recursive:true })]); const server = createRenderServer(); server.listen(port, "127.0.0.1", () => console.log(`Shortform render service: http://127.0.0.1:${port}`));
+}
