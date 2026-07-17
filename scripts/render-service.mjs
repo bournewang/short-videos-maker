@@ -42,6 +42,9 @@ const providerDefaults = {
     volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128" },
     sdwebui: { endpoint:"http://127.0.0.1:7860", model:"Local checkpoint" },
   },
+  video: {
+    volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", model:"doubao-seedance-2-0-260128" },
+  },
   text: {
     openai: { endpoint:"https://api.openai.com/v1/chat/completions", model:"gpt-4.1-mini" },
     volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", model:"doubao-seed-2-1-turbo-260628" },
@@ -72,11 +75,22 @@ function configuredTextProvider(kind = process.env.TEXT_PROVIDER || "openai") {
   };
 }
 
+function configuredVideoProvider(kind = process.env.VIDEO_PROVIDER || "volcengine") {
+  const defaults = providerDefaults.video[kind] || providerDefaults.video.volcengine;
+  return {
+    kind,
+    endpoint:process.env.VIDEO_API_ENDPOINT || process.env.VOLCENGINE_VIDEO_ENDPOINT || defaults.endpoint,
+    model:process.env.VIDEO_MODEL || process.env.VOLCENGINE_VIDEO_MODEL || defaults.model,
+    apiKey:process.env.VIDEO_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "",
+  };
+}
+
 function environmentProviders() {
   const imageKind = process.env.IMAGE_PROVIDER || "openai";
   const textKind = process.env.TEXT_PROVIDER || "openai";
   return {
     image: configuredImageProvider(imageKind),
+    video: configuredVideoProvider(process.env.VIDEO_PROVIDER || "volcengine"),
     text: configuredTextProvider(textKind),
     transcription: {
       endpoint: process.env.TRANSCRIPTION_ENDPOINT || "http://localhost:8000/v1/transcriptions",
@@ -89,8 +103,25 @@ export function getProviderStatus() {
   const providers = environmentProviders();
   return {
     image: { configured: providers.image.kind === "sdwebui" ? Boolean(providers.image.endpoint) : Boolean(providers.image.apiKey), kind: providers.image.kind, endpoint: providers.image.endpoint, model: providers.image.model, source: providers.image.apiKey ? "environment" : "default" },
+    video: { configured:Boolean(providers.video.apiKey && providers.video.model), kind:providers.video.kind, endpoint:providers.video.endpoint, model:providers.video.model, source:providers.video.apiKey ? "environment" : "default" },
     text: { configured: Boolean(providers.text.apiKey && providers.text.model), kind:providers.text.kind, endpoint: providers.text.endpoint, model: providers.text.model, source: providers.text.apiKey ? "environment" : "default" },
     transcription: { configured:Boolean(providers.transcription.endpoint), endpoint:providers.transcription.endpoint, language:providers.transcription.language, source:process.env.TRANSCRIPTION_ENDPOINT ? "environment" : "default" },
+  };
+}
+
+function resolveVideoProvider(data = {}) {
+  const kind = data.videoKind || data.kind || environmentProviders().video.kind;
+  const configured = configuredVideoProvider(kind);
+  const useEnvironment = !data.apiKey && !data.videoApiKey && Boolean(configured.apiKey);
+  return {
+    kind,
+    endpoint:useEnvironment ? configured.endpoint : (data.endpoint || data.videoEndpoint || configured.endpoint),
+    model:useEnvironment ? configured.model : (data.model || data.videoModel || configured.model),
+    apiKey:data.apiKey || data.videoApiKey || configured.apiKey,
+    prompt:data.prompt,
+    image:data.image,
+    motion:data.motion,
+    duration:data.duration,
   };
 }
 
@@ -188,12 +219,13 @@ export async function transcribeAudio(payload = {}, options = {}) {
 
 async function saveMedia(value, targetBase, fetchImpl = fetch) {
   if (!value) return "";
-  let mime = "application/octet-stream"; let data;
+  let mime = "application/octet-stream"; let data; let remoteExtension = "";
   if (/^https?:\/\//.test(value)) {
-    const response = await fetchImpl(value); if (!response.ok) throw new Error(`Could not download generated image (${response.status})`);
+    try { remoteExtension = path.extname(new URL(value).pathname).toLowerCase(); } catch { /* response MIME remains authoritative */ }
+    const response = await fetchImpl(value); if (!response.ok) throw new Error(`Could not download generated media (${response.status})`);
     mime = response.headers.get("content-type") || mime; data = Buffer.from(await response.arrayBuffer());
   } else ({ mime, data } = fromDataUrl(value));
-  const ext = mime.includes("png") ? ".png" : mime.includes("jpeg") || mime.includes("jpg") ? ".jpg" : mime.includes("wav") ? ".wav" : mime.includes("mpeg") ? ".mp3" : mime.includes("mp4") ? ".m4a" : ".bin";
+  const ext = mime.includes("png") ? ".png" : mime.includes("jpeg") || mime.includes("jpg") ? ".jpg" : mime.startsWith("video/") ? ".mp4" : mime.includes("wav") ? ".wav" : mime.includes("mpeg") ? ".mp3" : mime.includes("mp4") ? ".m4a" : [".png",".jpg",".jpeg",".mp4",".wav",".mp3",".m4a"].includes(remoteExtension) ? remoteExtension : ".bin";
   const filename = `${targetBase}${ext}`; await writeFile(filename, data); return filename;
 }
 
@@ -207,12 +239,42 @@ export async function persistGeneratedImage(value, options = {}) {
   };
 }
 
-function imageContentType(filename) {
+export async function persistGeneratedVideo(value, options = {}) {
+  if (!value) throw new Error("Provider returned no video");
+  await mkdir(assetRoot, { recursive:true });
+  const filename = await saveMedia(value, path.join(assetRoot, options.id || randomUUID()), options.fetchImpl || fetch);
+  if (path.extname(filename).toLowerCase() !== ".mp4") throw new Error("Provider returned an unsupported video format");
+  return {
+    path:filename,
+    url:`http://127.0.0.1:${port}/assets/${encodeURIComponent(path.basename(filename))}`,
+  };
+}
+
+function assetContentType(filename) {
   const extension = path.extname(filename).toLowerCase();
   if (extension === ".png") return "image/png";
   if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
   if (extension === ".webp") return "image/webp";
+  if (extension === ".mp4") return "video/mp4";
   return "application/octet-stream";
+}
+
+async function providerImageUrl(value) {
+  if (!value) throw new Error("A generated storyboard image is required before creating a clip");
+  if (/^data:image\//.test(value)) return value;
+  try {
+    const url = new URL(value);
+    if ((url.hostname === "127.0.0.1" || url.hostname === "localhost") && url.pathname.startsWith("/assets/")) {
+      const filename = path.join(assetRoot, path.basename(decodeURIComponent(url.pathname)));
+      const mime = assetContentType(filename);
+      if (!mime.startsWith("image/")) throw new Error("The local storyboard asset is not an image");
+      return `data:${mime};base64,${(await readFile(filename)).toString("base64")}`;
+    }
+  } catch (error) {
+    if (error instanceof TypeError) throw new Error("The storyboard image URL is invalid");
+    throw error;
+  }
+  return value;
 }
 
 function run(command, args) {
@@ -274,9 +336,19 @@ export async function renderEpisode(payload, options = {}) {
   const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
   let cursor = 0; const shots = [];
   for (let i = 0; i < payload.shots.length; i += 1) {
-    if (!payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image`);
-    const duration = Math.max(.6, Number(payload.shots[i].duration) || 2); const image = await saveMedia(payload.shots[i].image, path.join(jobDir, `shot-${String(i).padStart(3,"0")}`));
-    shots.push({ ...payload.shots[i], duration, start: cursor, end: cursor + duration, image }); cursor += duration;
+    if (!payload.shots[i].video && !payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image or video clip`);
+    const duration = Math.max(.6, Number(payload.shots[i].duration) || 2);
+    const sourceValue = payload.shots[i].video || payload.shots[i].image;
+    const source = await saveMedia(sourceValue, path.join(jobDir, `source-${String(i).padStart(3,"0")}`));
+    const segment = path.join(jobDir, `segment-${String(i).padStart(3,"0")}.mp4`);
+    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,setsar=1`;
+    if (payload.shots[i].video) {
+      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", scale, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", segment]);
+    } else {
+      const stillMotion = `${scale},zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30`;
+      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", segment]);
+    }
+    shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment }); cursor += duration;
   }
   let narration = await saveMedia(payload.narrationData, path.join(jobDir, "narration"));
   if (narration && payload.voicePreset !== "original") narration = (await renderNarrationStages(narration, "denoise", jobDir, "narration")).final;
@@ -288,11 +360,9 @@ export async function renderEpisode(payload, options = {}) {
     await readFile(customBgm);
   }
   const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, subtitles(shots, width, height));
-  const concatFile = path.join(jobDir, "images.txt");
+  const concatFile = path.join(jobDir, "segments.txt");
   const quoteConcat = (value) => value.replace(/'/g, "'\\''");
-  const concatLines = shots.flatMap((shot) => [`file '${quoteConcat(shot.image)}'`, `duration ${shot.duration}`]);
-  concatLines.push(`file '${quoteConcat(shots.at(-1).image)}'`);
-  await writeFile(concatFile, concatLines.join("\n"));
+  await writeFile(concatFile, shots.map((shot) => `file '${quoteConcat(shot.segment)}'`).join("\n"));
   const output = options.output || path.join(exportRoot, `${id}.mp4`); const args = ["-y", "-f", "concat", "-safe", "0", "-i", concatFile];
   const audioInputs = [];
   if (narration) { audioInputs.push({ kind: "narration", index: 1 }); args.push("-i", narration); }
@@ -300,16 +370,16 @@ export async function renderEpisode(payload, options = {}) {
   if (!audioInputs.length) { audioInputs.push({ kind:"silence", index:1 }); args.push("-f", "lavfi", "-t", String(total), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"); }
   const filters = [];
   const escapedAss = ass.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
-  filters.push(`[0:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30,setsar=1,ass=filename='${escapedAss}'[vout]`);
+  filters.push(`[0:v]setpts=PTS-STARTPTS,ass=filename='${escapedAss}'[vout]`);
   const narrationInput = audioInputs.find((item) => item.kind === "narration"); const bgmInput = audioInputs.find((item) => item.kind === "bgm");
-  const requestedBgmVolume = Number(payload.bgmVolume); const bgmVolume = Number.isFinite(requestedBgmVolume) ? Math.max(0, Math.min(1, requestedBgmVolume)) : .08;
+  const requestedBgmVolume = Number(payload.bgmVolume); const bgmVolume = Number.isFinite(requestedBgmVolume) ? Math.max(0, Math.min(.2, requestedBgmVolume)) : .08;
   if (narrationInput && bgmInput) filters.push(`[${narrationInput.index}:a]volume=1[nar];[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[bg];[nar][bg]amix=inputs=2:duration=longest:dropout_transition=2,alimiter=limit=.8414:level=false[aout]`);
   else if (narrationInput) filters.push(`[${narrationInput.index}:a]volume=1[aout]`);
   else if (bgmInput) filters.push(`[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[aout]`);
   else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
   await run("ffmpeg", args);
-  return { id, output, url: `/renders/${path.basename(output)}`, seconds: (Date.now() - started) / 1000, duration: total };
+  return { id, output, url: `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length };
 }
 
 export async function generateImage(data, options = {}) {
@@ -329,6 +399,57 @@ export async function generateImage(data, options = {}) {
   const response = await fetchImpl(data.endpoint, { method:"POST", headers:{"Content-Type":"application/json",...(data.apiKey?{Authorization:`Bearer ${data.apiKey}`}:{})}, body:JSON.stringify(requestBody) });
   const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); const item = result.data?.[0]; if (!item) throw new Error("Provider returned no image");
   return item.b64_json ? `data:image/png;base64,${item.b64_json}` : item.url;
+}
+
+function videoTasksEndpoint(endpoint) {
+  const base = String(endpoint || "").replace(/\/$/, "");
+  if (!base) return "";
+  return /\/contents\/generations\/tasks$/.test(base) ? base : `${base}/contents/generations/tasks`;
+}
+
+function providerError(result, status) {
+  return result?.error?.message || (typeof result?.error === "string" ? result.error : "") || result?.message || `Provider returned ${status}`;
+}
+
+export async function generateVideo(data, options = {}) {
+  data = resolveVideoProvider(data);
+  if (data.kind !== "volcengine") throw new Error("Volcengine Ark is the only configured video provider");
+  if (!data.endpoint || !data.apiKey || !data.model) throw new Error("Video endpoint, API key, and model are required");
+  const fetchImpl = options.fetchImpl || fetch;
+  const sleepImpl = options.sleepImpl || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || Number(process.env.VIDEO_POLL_INTERVAL_MS) || 5000);
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.VIDEO_REQUEST_TIMEOUT_MS) || 15 * 60 * 1000);
+  const endpoint = videoTasksEndpoint(data.endpoint);
+  const duration = Math.max(2, Math.min(15, Math.ceil(Number(data.duration) || 5)));
+  const image = await providerImageUrl(data.image);
+  const direction = String(data.motion || "Slow push-in").trim();
+  const prompt = `${String(data.prompt || "Animate this storyboard frame naturally").trim()}. Camera direction: ${direction}. Preserve the subject, composition, lighting, and visual style of the supplied first frame; use coherent cinematic motion and avoid text, logos, cuts, morphing, or new subjects. --ratio 9:16 --dur ${duration} --resolution 720p --generate_audio false --watermark false`;
+  const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
+  const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
+    model:data.model,
+    content:[
+      { type:"text", text:prompt },
+      { type:"image_url", image_url:{ url:image }, role:"first_frame" },
+    ],
+  }) });
+  const created = await createdResponse.json();
+  if (!createdResponse.ok) throw new Error(providerError(created, createdResponse.status));
+  if (!created.id) throw new Error("Video provider returned no task ID");
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleepImpl(pollIntervalMs);
+    const response = await fetchImpl(`${endpoint}/${encodeURIComponent(created.id)}`, { headers });
+    const result = await response.json();
+    if (!response.ok) throw new Error(providerError(result, response.status));
+    if (result.status === "succeeded") {
+      if (!result.content?.video_url) throw new Error("Video task succeeded without a download URL");
+      return { taskId:created.id, videoUrl:result.content.video_url, duration:Number(result.duration) || duration, status:result.status };
+    }
+    if (result.status === "failed" || result.status === "cancelled") throw new Error(providerError(result, result.status));
+    if (result.status !== "queued" && result.status !== "running") throw new Error(`Video provider returned unexpected task status: ${result.status || "unknown"}`);
+  }
+  throw new Error(`Video generation timed out after ${Math.round(timeoutMs / 1000)} seconds`);
 }
 
 export async function completeText(data, messages, options = {}) {
@@ -382,14 +503,15 @@ function modelsEndpoint(endpoint, kind) {
     const base = endpoint.replace(/\/sdapi\/v1\/txt2img\/?$/, "").replace(/\/$/, "");
     return `${base}/sdapi/v1/sd-models`;
   }
-  return endpoint.replace(/\/(images\/generations|chat\/completions)\/?$/, "/models");
+  return endpoint.replace(/\/(images\/generations|chat\/completions|contents\/generations\/tasks)\/?$/, "/models");
 }
 
 async function testProviderConnection(data) {
-  const target = data.target === "text" ? "text" : "image";
-  const config = target === "text" ? resolveTextProvider(data) : resolveImageProvider(data);
+  const target = data.target === "text" ? "text" : data.target === "video" ? "video" : "image";
+  const config = target === "text" ? resolveTextProvider(data) : target === "video" ? resolveVideoProvider(data) : resolveImageProvider(data);
   if (!config.endpoint) throw new Error("Provider endpoint is required");
   if (target === "text" && !config.apiKey) throw new Error("No translation API key is configured");
+  if (target === "video" && !config.apiKey) throw new Error("No video API key is configured");
   if (target === "image" && config.kind !== "sdwebui" && !config.apiKey) throw new Error("No image API key is configured");
   const response = await fetch(modelsEndpoint(config.endpoint, config.kind), { headers: config.apiKey ? { Authorization:`Bearer ${config.apiKey}` } : {} });
   if (!response.ok) {
@@ -420,13 +542,18 @@ export function createRenderServer() {
       }
       if (req.method === "GET" && url.pathname.startsWith("/assets/")) {
         const filename = path.basename(decodeURIComponent(url.pathname)); const file = path.join(assetRoot, filename); await readFile(file);
-        res.writeHead(200, cors({"Content-Type":imageContentType(filename),"Cache-Control":"public, max-age=31536000, immutable"})); createReadStream(file).pipe(res); return;
+        res.writeHead(200, cors({"Content-Type":assetContentType(filename),"Cache-Control":"public, max-age=31536000, immutable"})); createReadStream(file).pipe(res); return;
       }
       if (req.method === "POST" && url.pathname === "/render") { const result = await renderEpisode(await body(req)); json(res, 200, result); return; }
       if (req.method === "POST" && url.pathname === "/image/generate") {
         const generated = await generateImage(await body(req, 2*1024*1024));
         const cached = await persistGeneratedImage(generated);
         json(res, 200, { image:cached.url }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/video/generate") {
+        const generated = await generateVideo(await body(req, 24*1024*1024));
+        const cached = await persistGeneratedVideo(generated.videoUrl);
+        json(res, 200, { video:cached.url, taskId:generated.taskId, duration:generated.duration }); return;
       }
       if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
       if (req.method === "POST" && url.pathname === "/text/plan") { json(res, 200, { shots:await planEpisode(await body(req, 4*1024*1024)) }); return; }

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { completeText, generateImage, getProviderStatus, persistGeneratedImage, planEpisode, renderEpisode, transcribeAudio } from "../scripts/render-service.mjs";
+import { completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, renderEpisode, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -24,6 +24,16 @@ function probe(file) {
   });
 }
 
+async function generatedClipDataUrl(dir) {
+  const output = path.join(dir, "clip.mp4");
+  await new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=0x38566b:s=180x320:r=30", "-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", output]);
+    let stderr = ""; child.stderr.on("data", (data) => stderr += data);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
+  });
+  return `data:video/mp4;base64,${(await readFile(output)).toString("base64")}`;
+}
+
 test("local renderer produces a playable vertical MP4", { timeout: 120000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "shortform-test-")); const output = path.join(dir, "episode.mp4");
   const result = await renderEpisode({ title:"Test", width:360, height:640, bgmPreset:"None", narrationData:narrationWav(), voicePreset:"documentary", shots:[
@@ -41,6 +51,16 @@ test("local renderer mixes a selected built-in BGM", { timeout: 120000 }, async 
   ] }, { id:`bgm-test-${Date.now()}`, output });
   const info = await stat(output); const duration = await probe(output);
   assert.ok(info.size > 5000); assert.ok(duration >= 1.5 && duration <= 1.8);
+});
+
+test("local renderer normalizes and concatenates generated video clips", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-clip-test-")); const output = path.join(dir, "episode.mp4");
+  const video = await generatedClipDataUrl(dir);
+  const result = await renderEpisode({ width:360, height:640, narrationData:narrationWav(1.2), voicePreset:"original", shots:[
+    { duration:1.1, video, image:png, narration:"A real generated clip moves.", chinese:"真实生成的片段开始运动。" },
+  ] }, { id:`clip-test-${Date.now()}`, output });
+  const info = await stat(output); const duration = await probe(output);
+  assert.ok(info.size > 5000); assert.ok(duration >= 1 && duration <= 1.3); assert.equal(result.clipsUsed, 1);
 });
 
 test("provider status reports configuration without exposing secrets", () => {
@@ -78,6 +98,25 @@ test("Volcengine image adapter sends a vertical Seedream request", async () => {
   assert.equal(image, "https://example.test/seedream.png");
 });
 
+test("Volcengine video adapter creates and polls an image-to-video task", async () => {
+  const requests = []; let poll = 0;
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ id:"cgt-test-123" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    poll += 1;
+    return new Response(JSON.stringify(poll === 1 ? { id:"cgt-test-123", status:"running" } : { id:"cgt-test-123", status:"succeeded", duration:"3", content:{ video_url:"https://example.test/generated.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", model:"doubao-seedance-2-0-260128", apiKey:"ark-test", prompt:"Cinematic rain crosses the window", image:png, motion:"Slow push-in", duration:2.4 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(requests[0].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer ark-test");
+  assert.equal(payload.model, "doubao-seedance-2-0-260128");
+  assert.equal(payload.content[1].role, "first_frame"); assert.equal(payload.content[1].image_url.url, png);
+  assert.match(payload.content[0].text, /--ratio 9:16 --dur 3 --resolution 720p/);
+  assert.equal(requests[2].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-test-123");
+  assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
+});
+
 test("generated provider images are copied into the local intermediate asset store", async () => {
   const bytes = Buffer.from("stable-local-image");
   const fetchImpl = async (url) => {
@@ -89,6 +128,17 @@ test("generated provider images are copied into the local intermediate asset sto
   assert.ok(info.size > 0);
   assert.match(result.path, /\.shortform\/assets\/cache-test-\d+\.png$/);
   assert.match(result.url, /^http:\/\/127\.0\.0\.1:4317\/assets\/cache-test-\d+\.png$/);
+});
+
+test("generated provider videos are copied into the local intermediate asset store", async () => {
+  const bytes = Buffer.from("stable-local-video");
+  const fetchImpl = async (url) => {
+    assert.equal(url, "https://example.test/temporary-provider-video.mp4");
+    return new Response(bytes, { status:200, headers:{ "Content-Type":"video/mp4" } });
+  };
+  const result = await persistGeneratedVideo("https://example.test/temporary-provider-video.mp4", { id:`video-cache-test-${Date.now()}`, fetchImpl });
+  const info = await stat(result.path);
+  assert.ok(info.size > 0); assert.match(result.path, /\.shortform\/assets\/video-cache-test-\d+\.mp4$/); assert.match(result.url, /\/assets\/video-cache-test-\d+\.mp4$/);
 });
 
 test("Volcengine text adapter uses Ark chat completions", async () => {

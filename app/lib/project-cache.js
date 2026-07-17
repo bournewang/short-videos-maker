@@ -8,6 +8,9 @@ export function normalizeCachedProject(value) {
     ...shot,
     image:String(shot?.image || ""),
     variants:Array.isArray(shot?.variants) ? shot.variants : [],
+    video:String(shot?.video || ""),
+    videoStatus:shot?.videoStatus === "generating" || (shot?.videoStatus === "generated" && !shot?.video) ? "idle" : (shot?.videoStatus || (shot?.video ? "generated" : "idle")),
+    videoProvider:String(shot?.videoProvider || ""),
     status:shot?.status === "generating" || (shot?.status === "generated" && !shot?.image) ? "planned" : (shot?.status || "planned"),
   })) : [];
   return { ...value, shots };

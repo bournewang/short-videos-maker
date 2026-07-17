@@ -42,16 +42,16 @@ Open **Provider settings** in the editor to see whether environment keys were lo
 
 ### Volcengine Ark
 
-Select **Volcengine Ark · Seedream** for images and **Volcengine Ark · Doubao** for storyboard planning and translation. Both use the same `VOLCENGINE_API_KEY`. The default image adapter targets Ark's `/api/v3/images/generations` endpoint with a vertical Seedream request. Text uses `/api/v3/chat/completions` with `doubao-seed-2-1-turbo-260628`, explicitly disables thinking mode, and times out after 120 seconds. Override the model or timeout with `TEXT_MODEL` and `TEXT_REQUEST_TIMEOUT_MS`.
+Select **Volcengine Ark · Seedream** for images, **Volcengine Ark · Seedance** for image-to-video clips, and **Volcengine Ark · Doubao** for storyboard planning and translation. All three can reuse `VOLCENGINE_API_KEY`. The video adapter submits each generated storyboard frame to Ark's asynchronous `/api/v3/contents/generations/tasks` API, polls until completion, and immediately copies the temporary result into `.shortform/assets/`. It defaults to `doubao-seedance-2-0-260128`, vertical 9:16 output, 720p generation, no generated audio, and no watermark; narration and BGM are mixed during the local final render. Override the video model, endpoint, timeout, or polling interval with the settings shown in `.env.example`.
 
 ## Workflow
 
 1. In **Episode**, paste a script and upload narration. The app transcribes the audio locally, then uses those timings when the configured AI provider plans the storyboard.
-2. In **Storyboard**, review AI-generated timing, bilingual lines, and prompts, then generate the real images.
+2. In **Storyboard**, review AI-generated timing, bilingual lines, and prompts, generate the real images, then choose **Animate all shots** to create Volcengine video clips.
 3. In **Audio & captions**, edit English and Chinese lines and optionally upload a licensed BGM track.
-4. In **Export**, render the finished H.264 MP4 locally.
+4. In **Export**, normalize and concatenate generated clips in storyboard order, mix narration/BGM, burn captions, and render the finished H.264 MP4 locally. Shots without a generated clip retain the subtle still-image motion fallback.
 
-Provider settings supports OpenAI-compatible images, Volcengine Ark Seedream, and local Stable Diffusion WebUI. Storyboard planning and translation support OpenAI-compatible chat APIs and Volcengine Ark Doubao. Session keys remain in memory; environment keys stay inside the local provider bridge. Export requires recorded narration and a generated image for every shot.
+Provider settings supports OpenAI-compatible images, Volcengine Ark Seedream and Seedance, and local Stable Diffusion WebUI. Storyboard planning and translation support OpenAI-compatible chat APIs and Volcengine Ark Doubao. Session keys remain in memory; environment keys stay inside the local provider bridge. Export requires recorded narration and at least one generated visual asset for every shot.
 
 ## Verification
 
