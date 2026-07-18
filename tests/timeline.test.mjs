@@ -4,12 +4,13 @@ import { formatTime, normalizePlannedShots } from "../app/lib/timeline.js";
 
 test("AI shot timing is normalized to the narration duration", () => {
   const shots = normalizePlannedShots([
-    { narration:"A compact battery powers the prototype.", chinese:"一块紧凑型电池为原型机供电。", type:"Opening", duration:1.2, prompt:"Photorealistic technology prototype, vertical 9:16", motion:"Slow push-in" },
+    { narration:"A compact battery powers the prototype.", chinese:"一块紧凑型电池为原型机供电。", type:"Opening", duration:1.2, prompt:"Photorealistic technology prototype, vertical 9:16", videoPrompt:"Indicator lights pulse while the camera slowly pushes toward the battery", motion:"Slow push-in" },
     { narration:"The first test runs for an entire day.", chinese:"首次测试持续了整整一天。", type:"Narrative", duration:2.8, prompt:"Photorealistic engineering lab, vertical 9:16", motion:"Slow drift" },
   ], 6, { contentFormat:"Educational explainer", visualStyle:"Photorealistic", creativeDirection:"Clean engineering lab" });
   assert.equal(shots[0].start, 0);
   assert.ok(Math.abs(shots.at(-1).end - 6) < .02);
   assert.equal(shots.length, 2);
+  assert.match(shots[0].videoPrompt, /Indicator lights pulse/);
   assert.equal(formatTime(6), "00:06.0");
 });
 
@@ -31,6 +32,7 @@ test("fallback prompts use episode-level creative settings", () => {
   const [shot] = normalizePlannedShots([{ narration:"The camera follows the runner." }], 2, { contentFormat:"Narrative story", visualStyle:"Anime", creativeDirection:"Neon city at night" });
   assert.match(shot.prompt, /Anime Narrative story/i);
   assert.match(shot.prompt, /Neon city at night/i);
+  assert.match(shot.videoPrompt, /camera follows the runner/i);
   assert.doesNotMatch(shot.prompt, /historical|period clothing/i);
 });
 

@@ -23,3 +23,9 @@ export async function mapWithConcurrency(items, limit, worker, onProgress) {
   await Promise.all(Array.from({ length:workerCount }, () => runWorker()));
   return results;
 }
+
+export function canStartConcurrentJob(activeIds, jobId, limit) {
+  const active = activeIds instanceof Set ? activeIds : new Set(activeIds || []);
+  const maximum = Math.max(1, Math.floor(Number(limit) || 1));
+  return Boolean(jobId) && !active.has(jobId) && active.size < maximum;
+}

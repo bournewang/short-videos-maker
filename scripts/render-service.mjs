@@ -15,9 +15,9 @@ const assetRoot = path.join(workRoot, "assets");
 const audioPreviewRoot = path.join(workRoot, "audio-previews");
 const bgmRoot = path.join(root, "public", "bgm");
 
-async function loadLocalEnvironment() {
+async function loadEnvironmentFile(filename) {
   try {
-    const source = await readFile(path.join(root, ".env.local"), "utf8");
+    const source = await readFile(path.join(root, filename), "utf8");
     for (const rawLine of source.split(/\r?\n/)) {
       const line = rawLine.trim();
       if (!line || line.startsWith("#")) continue;
@@ -33,7 +33,9 @@ async function loadLocalEnvironment() {
   }
 }
 
-await loadLocalEnvironment();
+// Load local overrides first, then use .env to fill any settings they omit.
+await loadEnvironmentFile(".env.local");
+await loadEnvironmentFile(".env");
 const port = Number(process.env.SHORTFORM_PORT || 4317);
 
 const providerDefaults = {
@@ -51,46 +53,34 @@ const providerDefaults = {
   },
 };
 
-function configuredImageProvider(kind = process.env.IMAGE_PROVIDER || "openai") {
-  const selected = process.env.IMAGE_PROVIDER || "openai";
-  const defaults = providerDefaults.image[kind] || providerDefaults.image.openai;
-  const providerKey = kind === "volcengine" ? (process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "") : kind === "openai" ? (process.env.OPENAI_API_KEY || "") : "";
+function selectedProvider(modality, fallback) {
+  return String(process.env[`${modality.toUpperCase()}_PROVIDER`] || fallback).trim().toLowerCase();
+}
+
+function configuredProvider(modality, kind, fallbackKind) {
+  const normalizedKind = String(kind || fallbackKind).trim().toLowerCase();
+  const modalityName = modality.toUpperCase();
+  const providerName = normalizedKind.replace(/[^a-z0-9]+/g, "_").toUpperCase();
+  const defaults = providerDefaults[modality]?.[normalizedKind] || {};
+  const selected = selectedProvider(modality, fallbackKind);
   return {
-    kind,
-    endpoint:(kind === selected ? process.env.IMAGE_API_ENDPOINT : "") || (kind === "volcengine" ? process.env.VOLCENGINE_IMAGE_ENDPOINT : "") || defaults.endpoint,
-    model:(kind === selected ? process.env.IMAGE_MODEL : "") || (kind === "volcengine" ? process.env.VOLCENGINE_IMAGE_MODEL : "") || defaults.model,
-    apiKey:(kind === selected ? process.env.IMAGE_API_KEY : "") || providerKey,
+    kind: normalizedKind,
+    endpoint: process.env[`${providerName}_${modalityName}_ENDPOINT`] || defaults.endpoint || "",
+    model: (normalizedKind === selected ? process.env[`${modalityName}_MODEL`] : "") || defaults.model || "",
+    apiKey: process.env[`${providerName}_API_KEY`] || "",
   };
 }
 
-function configuredTextProvider(kind = process.env.TEXT_PROVIDER || "openai") {
-  const selected = process.env.TEXT_PROVIDER || "openai";
-  const defaults = providerDefaults.text[kind] || providerDefaults.text.openai;
-  const providerKey = kind === "volcengine" ? (process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "") : (process.env.OPENAI_API_KEY || "");
-  return {
-    kind,
-    endpoint:(kind === selected ? process.env.TEXT_API_ENDPOINT : "") || (kind === "volcengine" ? process.env.VOLCENGINE_TEXT_ENDPOINT : "") || defaults.endpoint,
-    model:(kind === selected ? process.env.TEXT_MODEL : "") || (kind === "volcengine" ? process.env.VOLCENGINE_TEXT_MODEL : "") || defaults.model,
-    apiKey:(kind === selected ? process.env.TEXT_API_KEY : "") || providerKey,
-  };
-}
-
-function configuredVideoProvider(kind = process.env.VIDEO_PROVIDER || "volcengine") {
-  const defaults = providerDefaults.video[kind] || providerDefaults.video.volcengine;
-  return {
-    kind,
-    endpoint:process.env.VIDEO_API_ENDPOINT || process.env.VOLCENGINE_VIDEO_ENDPOINT || defaults.endpoint,
-    model:process.env.VIDEO_MODEL || process.env.VOLCENGINE_VIDEO_MODEL || defaults.model,
-    apiKey:process.env.VIDEO_API_KEY || process.env.VOLCENGINE_API_KEY || process.env.ARK_API_KEY || "",
-  };
-}
+const configuredImageProvider = (kind = selectedProvider("image", "openai")) => configuredProvider("image", kind, "openai");
+const configuredTextProvider = (kind = selectedProvider("text", "openai")) => configuredProvider("text", kind, "openai");
+const configuredVideoProvider = (kind = selectedProvider("video", "volcengine")) => configuredProvider("video", kind, "volcengine");
 
 function environmentProviders() {
-  const imageKind = process.env.IMAGE_PROVIDER || "openai";
-  const textKind = process.env.TEXT_PROVIDER || "openai";
+  const imageKind = selectedProvider("image", "openai");
+  const textKind = selectedProvider("text", "openai");
   return {
     image: configuredImageProvider(imageKind),
-    video: configuredVideoProvider(process.env.VIDEO_PROVIDER || "volcengine"),
+    video: configuredVideoProvider(selectedProvider("video", "volcengine")),
     text: configuredTextProvider(textKind),
     transcription: {
       endpoint: process.env.TRANSCRIPTION_ENDPOINT || "http://localhost:8000/v1/transcriptions",
@@ -112,13 +102,13 @@ export function getProviderStatus() {
 function resolveVideoProvider(data = {}) {
   const kind = data.videoKind || data.kind || environmentProviders().video.kind;
   const configured = configuredVideoProvider(kind);
-  const useEnvironment = !data.apiKey && !data.videoApiKey && Boolean(configured.apiKey);
   return {
-    kind,
-    endpoint:useEnvironment ? configured.endpoint : (data.endpoint || data.videoEndpoint || configured.endpoint),
-    model:useEnvironment ? configured.model : (data.model || data.videoModel || configured.model),
+    kind:configured.kind,
+    endpoint:data.endpoint || data.videoEndpoint || configured.endpoint,
+    model:data.model || data.videoModel || configured.model,
     apiKey:data.apiKey || data.videoApiKey || configured.apiKey,
     prompt:data.prompt,
+    videoPrompt:data.videoPrompt,
     image:data.image,
     motion:data.motion,
     duration:data.duration,
@@ -128,26 +118,24 @@ function resolveVideoProvider(data = {}) {
 function resolveImageProvider(data = {}) {
   const kind = data.kind || environmentProviders().image.kind;
   const configured = configuredImageProvider(kind);
-  if (data.kind === "sdwebui") return { ...configured, ...data, apiKey: data.apiKey || "" };
-  const useEnvironment = !data.apiKey && Boolean(configured.apiKey);
+  if (configured.kind === "sdwebui") return { ...configured, ...data, kind:configured.kind, apiKey:data.apiKey || "" };
   return {
-    kind,
-    endpoint: useEnvironment ? configured.endpoint : (data.endpoint || configured.endpoint),
-    model: useEnvironment ? configured.model : (data.model || configured.model),
-    apiKey: data.apiKey || configured.apiKey,
-    prompt: data.prompt,
+    kind:configured.kind,
+    endpoint:data.endpoint || configured.endpoint,
+    model:data.model || configured.model,
+    apiKey:data.apiKey || configured.apiKey,
+    prompt:data.prompt,
   };
 }
 
 function resolveTextProvider(data = {}) {
   const kind = data.textKind || data.kind || environmentProviders().text.kind;
   const configured = configuredTextProvider(kind);
-  const useEnvironment = !data.apiKey && Boolean(configured.apiKey);
   return {
-    kind,
-    endpoint: useEnvironment ? configured.endpoint : (data.endpoint || configured.endpoint),
-    model: useEnvironment ? configured.model : (data.model || configured.model),
-    apiKey: data.apiKey || configured.apiKey,
+    kind:configured.kind,
+    endpoint:data.endpoint || configured.endpoint,
+    model:data.model || configured.model,
+    apiKey:data.apiKey || configured.apiKey,
     lines: data.lines,
     script: data.script,
     contentFormat: data.contentFormat,
@@ -341,12 +329,14 @@ export async function renderEpisode(payload, options = {}) {
     const sourceValue = payload.shots[i].video || payload.shots[i].image;
     const source = await saveMedia(sourceValue, path.join(jobDir, `source-${String(i).padStart(3,"0")}`));
     const segment = path.join(jobDir, `segment-${String(i).padStart(3,"0")}.mp4`);
-    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=30,setsar=1`;
+    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709,crop=${width}:${height},fps=30,setsar=1`;
+    const normalizedFormat = "format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+    const colorMetadata = ["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"];
     if (payload.shots[i].video) {
-      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", scale, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", segment]);
+      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
     } else {
-      const stillMotion = `${scale},zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30`;
-      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", segment]);
+      const stillMotion = `${scale},zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30,${normalizedFormat}`;
+      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
     }
     shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment }); cursor += duration;
   }
@@ -423,7 +413,8 @@ export async function generateVideo(data, options = {}) {
   const duration = Math.max(2, Math.min(15, Math.ceil(Number(data.duration) || 5)));
   const image = await providerImageUrl(data.image);
   const direction = String(data.motion || "Slow push-in").trim();
-  const prompt = `${String(data.prompt || "Animate this storyboard frame naturally").trim()}. Camera direction: ${direction}. Preserve the subject, composition, lighting, and visual style of the supplied first frame; use coherent cinematic motion and avoid text, logos, cuts, morphing, or new subjects. --ratio 9:16 --dur ${duration} --resolution 720p --generate_audio false --watermark false`;
+  const motionPrompt = String(data.videoPrompt || data.prompt || "Animate this storyboard frame naturally with coherent subject and environmental motion").trim();
+  const prompt = `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects. --ratio 9:16 --dur ${duration} --resolution 720p --generate_audio false --watermark false`;
   const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
   const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
     model:data.model,
@@ -488,7 +479,7 @@ export async function planEpisode(data, options = {}) {
   const config = resolveTextProvider(data);
   if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
   if (!String(config.script || "").trim()) throw new Error("A script is required");
-  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return JSON only with a shots array. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise image-generation prompt, at most 45 words, faithful to the narration, content format, visual style, and creative direction, with subject, setting, composition, lighting, vertical 9:16 framing, subtitle-safe lower area, and exclusions for text and watermark), and motion (Slow push-in, Slow drift, or Static). Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return JSON only with a shots array. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 45 words, faithful to the narration, content format, visual style, and creative direction, with subject, setting, composition, lighting, vertical 9:16 framing, subtitle-safe lower area, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (Slow push-in, Slow drift, or Static). The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
   const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
   const minimumShotCount = narrationDuration ? Math.ceil(narrationDuration / 4) : null;

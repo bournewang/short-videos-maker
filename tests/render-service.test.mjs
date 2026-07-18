@@ -24,14 +24,33 @@ function probe(file) {
   });
 }
 
-async function generatedClipDataUrl(dir) {
-  const output = path.join(dir, "clip.mp4");
+async function generatedClipDataUrl(dir, name = "clip", color = "0x38566b") {
+  const output = path.join(dir, `${name}.mp4`);
   await new Promise((resolve, reject) => {
-    const child = spawn("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=0x38566b:s=180x320:r=30", "-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", output]);
+    const child = spawn("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=${color}:s=180x320:r=30`, "-t", "1", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", output]);
     let stderr = ""; child.stderr.on("data", (data) => stderr += data);
     child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
   });
   return `data:video/mp4;base64,${(await readFile(output)).toString("base64")}`;
+}
+
+async function generatedJpegDataUrl(dir, name = "still", color = "0xc06020") {
+  const output = path.join(dir, `${name}.jpg`);
+  await new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=${color}:s=180x320`, "-frames:v", "1", "-update", "1", output]);
+    let stderr = ""; child.stderr.on("data", (data) => stderr += data);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
+  });
+  return `data:image/jpeg;base64,${(await readFile(output)).toString("base64")}`;
+}
+
+function samplePixel(file, at) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", ["-v", "error", "-i", file, "-ss", String(at), "-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
+    const chunks = []; let stderr = "";
+    child.stdout.on("data", (data) => chunks.push(data)); child.stderr.on("data", (data) => stderr += data);
+    child.on("close", (code) => code === 0 ? resolve([...Buffer.concat(chunks).subarray(0, 3)]) : reject(new Error(stderr)));
+  });
 }
 
 test("local renderer produces a playable vertical MP4", { timeout: 120000 }, async () => {
@@ -63,14 +82,47 @@ test("local renderer normalizes and concatenates generated video clips", { timeo
   assert.ok(info.size > 5000); assert.ok(duration >= 1 && duration <= 1.3); assert.equal(result.clipsUsed, 1);
 });
 
+test("local renderer keeps image shots visible after generated clips", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-mixed-test-")); const output = path.join(dir, "episode.mp4");
+  const blueClip = await generatedClipDataUrl(dir, "blue", "0x204060");
+  const greenClip = await generatedClipDataUrl(dir, "green", "0x206040");
+  const orangeStill = await generatedJpegDataUrl(dir);
+  const result = await renderEpisode({ width:360, height:640, narrationData:narrationWav(4), voicePreset:"original", shots:[
+    { duration:1, video:blueClip, image:orangeStill, narration:"Blue clip.", chinese:"蓝色视频。" },
+    { duration:1, image:orangeStill, narration:"Still image.", chinese:"静态图片。" },
+    { duration:1, video:greenClip, image:orangeStill, narration:"Green clip.", chinese:"绿色视频。" },
+    { duration:1, image:orangeStill, narration:"Final still image.", chinese:"最后一张图片。" },
+  ] }, { id:`mixed-test-${Date.now()}`, output });
+  const duration = await probe(output);
+  const greenPixel = await samplePixel(output, 2.5);
+  const finalPixel = await samplePixel(output, 3.8);
+  assert.ok(duration >= 3.9 && duration <= 4.1); assert.equal(result.clipsUsed, 2);
+  assert.ok(Math.abs(finalPixel[0] - greenPixel[0]) + Math.abs(finalPixel[1] - greenPixel[1]) + Math.abs(finalPixel[2] - greenPixel[2]) > 25, `Expected final still to replace the preceding clip; green=${greenPixel}, final=${finalPixel}`);
+});
+
 test("provider status reports configuration without exposing secrets", () => {
-  const previous = process.env.OPENAI_API_KEY;
-  process.env.OPENAI_API_KEY = "test-secret-that-must-not-leak";
-  const status = getProviderStatus();
-  assert.equal(status.image.configured, true);
-  assert.equal(status.text.configured, true);
-  assert.doesNotMatch(JSON.stringify(status), /test-secret/);
-  if (previous === undefined) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previous;
+  const environment = {
+    IMAGE_PROVIDER:"volcengine", IMAGE_MODEL:"seedream-test",
+    TEXT_PROVIDER:"openai", TEXT_MODEL:"openai-text-test",
+    VIDEO_PROVIDER:"volcengine", VIDEO_MODEL:"seedance-test",
+    VOLCENGINE_API_KEY:"volcengine-test-secret", OPENAI_API_KEY:"openai-test-secret",
+    VOLCENGINE_IMAGE_ENDPOINT:"https://volcengine.test/images",
+    VOLCENGINE_VIDEO_ENDPOINT:"https://volcengine.test/videos",
+    OPENAI_TEXT_ENDPOINT:"https://openai.test/chat",
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    const status = getProviderStatus();
+    assert.deepEqual(status.image, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/images", model:"seedream-test", source:"environment" });
+    assert.deepEqual(status.video, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/videos", model:"seedance-test", source:"environment" });
+    assert.deepEqual(status.text, { configured:true, kind:"openai", endpoint:"https://openai.test/chat", model:"openai-text-test", source:"environment" });
+    assert.doesNotMatch(JSON.stringify(status), /test-secret/);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
 
 test("local transcription proxy sends audio and word timestamp options", async () => {
@@ -106,15 +158,46 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
     poll += 1;
     return new Response(JSON.stringify(poll === 1 ? { id:"cgt-test-123", status:"running" } : { id:"cgt-test-123", status:"succeeded", duration:"3", content:{ video_url:"https://example.test/generated.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
   };
-  const result = await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", model:"doubao-seedance-2-0-260128", apiKey:"ark-test", prompt:"Cinematic rain crosses the window", image:png, motion:"Slow push-in", duration:2.4 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const result = await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", model:"doubao-seedance-2-0-260128", apiKey:"ark-test", videoPrompt:"Rain streams diagonally across the window while the subject breathes naturally", image:png, motion:"Slow push-in", duration:2.4 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
   const payload = JSON.parse(requests[0].options.body);
   assert.equal(requests[0].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks");
   assert.equal(requests[0].options.headers.Authorization, "Bearer ark-test");
   assert.equal(payload.model, "doubao-seedance-2-0-260128");
   assert.equal(payload.content[1].role, "first_frame"); assert.equal(payload.content[1].image_url.url, png);
+  assert.match(payload.content[0].text, /Rain streams diagonally/);
+  assert.match(payload.content[0].text, /Camera direction override: Slow push-in/);
   assert.match(payload.content[0].text, /--ratio 9:16 --dur 3 --resolution 720p/);
   assert.equal(requests[2].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-test-123");
   assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
+});
+
+test("session video model and endpoint are retained when the API key comes from the provider environment", async () => {
+  const environment = {
+    VIDEO_PROVIDER:"volcengine",
+    VIDEO_MODEL:"environment-lite-model",
+    VOLCENGINE_API_KEY:"environment-ark-key",
+    VOLCENGINE_VIDEO_ENDPOINT:"https://environment.test/tasks",
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ id:"session-model-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ id:"session-model-task", status:"succeeded", content:{ video_url:"https://example.test/session-model.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  try {
+    await generateVideo({ videoKind:"volcengine", endpoint:"https://session.test/contents/generations/tasks", model:"session-pro-fast-model", apiKey:"", image:png, duration:3 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+    const payload = JSON.parse(requests[0].options.body);
+    assert.equal(requests[0].url, "https://session.test/contents/generations/tasks");
+    assert.equal(requests[0].options.headers.Authorization, "Bearer environment-ark-key");
+    assert.equal(payload.model, "session-pro-fast-model");
+    assert.equal(requests[1].url, "https://session.test/contents/generations/tasks/session-model-task");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
 });
 
 test("generated provider images are copied into the local intermediate asset store", async () => {
@@ -161,7 +244,8 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   const providerShots = Array.from({ length:21 }, (_, index) => ({
     narration:`Timed narration ${index + 1}.`, chinese:`定时旁白 ${index + 1}。`,
     type:index === 0 ? "Opening" : "Narrative", duration:3.9,
-    prompt:`Photorealistic timed scene ${index + 1}, vertical 9:16, subtitle-safe lower area, no text, no watermark`, motion:"Slow drift",
+    prompt:`Photorealistic timed scene ${index + 1}, vertical 9:16, subtitle-safe lower area, no text, no watermark`,
+    videoPrompt:`The subject in timed scene ${index + 1} moves naturally while the camera drifts slowly`, motion:"Slow drift",
   }));
   const fetchImpl = async (_url, options) => {
     providerPayload = JSON.parse(options.body);
@@ -174,7 +258,9 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   assert.equal(planningInput.narrationDurationSeconds, 82);
   assert.equal(planningInput.minimumShotCount, 21);
   assert.equal(planningInput.targetShotCount, 25);
+  assert.match(providerPayload.messages[0].content, /videoPrompt/);
   assert.deepEqual(planningInput.localTranscriptionSegments, [{ start:.4, end:82, text:"The complete timed narration." }]);
+  assert.match(shots[0].videoPrompt, /moves naturally/);
   assert.equal(shots.at(-1).end, 82);
   assert.equal(Number(shots.reduce((sum, shot) => sum + shot.duration, 0).toFixed(2)), 82);
 });

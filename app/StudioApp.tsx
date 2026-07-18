@@ -2,14 +2,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect, react-hooks/exhaustive-deps, @next/next/no-img-element */
 
 import { ChangeEvent, useEffect, useRef, useState } from "react";
-import { mapWithConcurrency } from "./lib/concurrency";
+import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
 import { clearProjectCache, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
 import { formatTime } from "./lib/timeline";
 import { VIDEO_RESOLUTIONS, videoResolution } from "./lib/video";
 
 type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
-  type: string; narration: string; chinese: string; prompt: string; status: string;
+  type: string; narration: string; chinese: string; prompt: string; videoPrompt: string; status: string;
   locked: boolean; image: string; variants: string[]; provider: string; seed: string; motion: string;
   video: string; videoStatus: string; videoProvider: string;
 };
@@ -99,6 +99,8 @@ export default function StudioApp() {
   const allowSave = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cacheEpoch = useRef(0);
+  const activeManualVideoIds = useRef(new Set<string>());
+  const [activeManualVideoCount, setActiveManualVideoCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
     return { stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, ...overrides };
@@ -332,7 +334,7 @@ export default function StudioApp() {
     if (!shot.image) return { ok:false, shot, error:"Generate the storyboard image first" };
     updateShot(shot.id, { videoStatus:"generating" });
     try {
-      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, prompt:shot.prompt, image:shot.image, motion:shot.motion, duration:shot.duration }) });
+      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, videoPrompt:shot.videoPrompt, image:shot.image, motion:shot.motion, duration:shot.duration }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Video generation failed");
       updateShot(shot.id, { video:data.video, videoStatus:"generated", videoProvider:provider.videoModel });
       return { ok:true, shot };
@@ -343,13 +345,26 @@ export default function StudioApp() {
   }
 
   async function generateOneVideo(shot:Shot) {
-    if (shot.locked || busy || !await videoProviderReady()) return;
+    if (shot.locked || shot.videoStatus === "generating") return;
     if (!shot.image) { setMessage(`Generate the image for shot ${shot.index + 1} before animating it.`); return; }
-    setBusy(`Animating shot ${shot.index + 1} with Volcengine`);
+    if (busy) return;
+    if (!await videoProviderReady()) return;
+    const concurrency = Math.max(1, Math.min(4, Math.floor(provider.videoConcurrency) || 2));
+    if (!canStartConcurrentJob(activeManualVideoIds.current, shot.id, concurrency)) {
+      setMessage(activeManualVideoIds.current.has(shot.id) ? `Shot ${shot.index + 1} is already animating.` : `All ${concurrency} parallel video slots are currently in use.`);
+      return;
+    }
+    activeManualVideoIds.current.add(shot.id);
+    setActiveManualVideoCount(activeManualVideoIds.current.size);
+    setMessage(`Animating shot ${shot.index + 1} with Volcengine · ${activeManualVideoIds.current.size}/${concurrency} slots active.`);
     try {
       const result = await requestShotVideo(shot);
       setMessage(result.ok ? `Shot ${shot.index + 1} video clip generated and cached locally.` : result.error || "Video generation failed");
-    } finally { setBusy(""); }
+    } finally {
+      activeManualVideoIds.current.delete(shot.id);
+      const remaining = activeManualVideoIds.current.size;
+      setActiveManualVideoCount(remaining);
+    }
   }
 
   async function generateAllVideos() {
@@ -411,6 +426,9 @@ export default function StudioApp() {
     await renderVideo("download", downloadResolution);
   }
 
+  const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(provider.videoConcurrency) || 2));
+  const activityLabel = busy || (activeManualVideoCount ? `Animating clips · ${activeManualVideoCount}/${manualVideoLimit} manual jobs active` : "");
+
   return (
     <main className="studio-shell">
       <aside className="sidebar">
@@ -430,12 +448,12 @@ export default function StudioApp() {
         </header>
 
         {stage === "episode" && <EpisodePanel script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
-        {stage === "storyboard" && <Storyboard shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} />}
+        {stage === "storyboard" && <Storyboard shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualVideoCount={activeManualVideoCount} videoConcurrency={provider.videoConcurrency} />}
         {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
         {stage === "export" && <ExportPanel shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} buildPreview={() => renderVideo("preview", "720")} prepareDownload={prepareDownload} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { setDownloadResolution(value); setDownloadUrl(""); }} busy={busy} />}
       </section>
 
-      <div className="statusbar"><span>{busy ? <><i className="spinner"/>{busy}</> : message}</span><span>{shots.length} shots · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · 9:16</span></div>
+      <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} shots · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · 9:16</span></div>
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
@@ -448,16 +466,21 @@ function EpisodePanel({ script, setScript, contentFormat, setContentFormat, visu
         <label className="upload-card"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Narration attached" : "Add recorded narration"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
 }
 
-function Storyboard({ shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy }: any) {
+function Storyboard({ shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualVideoCount, videoConcurrency }: any) {
   if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>Your production shots will appear here after AI analysis.</p></div></div><div className="empty-state"><span>01</span><h2>No storyboard yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
-  return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated</p></div><div className="story-actions"><button className="ghost" onClick={generateAll} disabled={!!busy}>{busy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={!!busy}>{busy ? "Working…" : "Animate all shots"}</button></div></div>
+  const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(Number(videoConcurrency)) || 2));
+  const manualVideoSlotFull = activeManualVideoCount >= manualVideoLimit;
+  const otherWorkBusy = Boolean(busy);
+  const batchActionsBusy = otherWorkBusy || activeManualVideoCount > 0;
+  return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated</p></div><div className="story-actions"><button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Animate all shots"}</button></div></div>
     <div className="story-grid"><div className="shot-list">{shots.map((shot: Shot) => <button key={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
       <div className="thumb">{shot.image ? <img src={shot.image} alt="Generated shot"/> : <span>{String(shot.index + 1).padStart(2,'0')}</span>}{shot.video && <i className="clip-badge">CLIP</i>}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? "animating" : shot.video ? "clip ready" : shot.status}</span></button>)}</div>
       {selected && <div className="inspector"><div className="phone-frame"><div className="phone-canvas">{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview"/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>Awaiting image</b></div>}<div className="preview-captions"><b>{selected.narration}</b><span>{selected.chinese}</span></div></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">SHOT {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
-          <label className="field"><span>Visual prompt</span><textarea rows={9} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoProvider:''})}/></label>
+          <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoProvider:''})}/></label>
+          <label className="field"><span>Video prompt</span><textarea rows={5} value={selected.videoPrompt || ""} onChange={(e) => updateShot(selected.id,{videoPrompt:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}/><small>Created during AI analysis; describes subject action, environmental movement, and continuity from the generated first frame.</small></label>
           <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min="0.6" max="8" step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}><option>Slow push-in</option><option>Slow drift</option><option>Static</option></select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
-          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || !!busy}>{selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !!busy || !selected.image}>{selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div></div></div>}
+          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || !!busy || selected.videoStatus === "generating"}>{selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !selected.image || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Animating…" : selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div></div></div>}
     </div></div>;
 }
 

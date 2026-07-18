@@ -1,11 +1,14 @@
+import { defaultVideoPrompt } from "./timeline.js";
+
 const DATABASE_NAME = "shortform-studio-cache";
 const STORE_NAME = "projects";
 const ACTIVE_PROJECT_KEY = "active-episode";
 
 export function normalizeCachedProject(value) {
   if (!value || typeof value !== "object") return null;
-  const shots = Array.isArray(value.shots) ? value.shots.map((shot) => ({
+  const shots = Array.isArray(value.shots) ? value.shots.map((shot, index) => ({
     ...shot,
+    videoPrompt:String(shot?.videoPrompt || defaultVideoPrompt(shot, index)).trim(),
     image:String(shot?.image || ""),
     variants:Array.isArray(shot?.variants) ? shot.variants : [],
     video:String(shot?.video || ""),

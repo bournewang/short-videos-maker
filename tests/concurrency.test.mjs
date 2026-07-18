@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mapWithConcurrency } from "../app/lib/concurrency.js";
+import { canStartConcurrentJob, mapWithConcurrency } from "../app/lib/concurrency.js";
+
+test("manual video jobs can fill the configured parallel slots", () => {
+  assert.equal(canStartConcurrentJob(new Set(["shot-1"]), "shot-2", 2), true);
+  assert.equal(canStartConcurrentJob(new Set(["shot-1", "shot-2"]), "shot-3", 2), false);
+  assert.equal(canStartConcurrentJob(new Set(["shot-1"]), "shot-1", 2), false);
+});
 
 test("parallel image worker pool respects its concurrency limit", async () => {
   let active = 0;

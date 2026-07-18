@@ -12,6 +12,7 @@ test("cached episodes preserve API output and reset interrupted jobs", () => {
   assert.equal(cached.audioData, "data:audio/mpeg;base64,AA==");
   assert.equal(cached.shots[0].status, "planned");
   assert.equal(cached.shots[0].videoStatus, "idle");
+  assert.match(cached.shots[0].videoPrompt, /First/);
   assert.equal(cached.shots[1].status, "generated");
   assert.equal(cached.shots[1].videoStatus, "generated");
   assert.equal(cached.shots[1].video, "https://example.test/clip.mp4");

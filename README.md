@@ -36,7 +36,7 @@ Add a provider key to `.env.local`, then restart `npm run dev`:
 OPENAI_API_KEY=your_key_here
 ```
 
-That shared key powers the default image-generation and translation endpoints. To use separate services or models, copy the optional settings from `.env.example` and configure `IMAGE_API_KEY`, `IMAGE_API_ENDPOINT`, `IMAGE_MODEL`, `TEXT_API_KEY`, `TEXT_API_ENDPOINT`, and `TEXT_MODEL`.
+Each provider has one shared API key and a separate endpoint for every supported modality. Select the active provider and model with `TEXT_PROVIDER` and `TEXT_MODEL`, `IMAGE_PROVIDER` and `IMAGE_MODEL`, or `VIDEO_PROVIDER` and `VIDEO_MODEL`. Copy the complete structure from `.env.example`.
 
 Open **Provider settings** in the editor to see whether environment keys were loaded and test each connection. You can also enter a session-only override there. The editor never returns environment keys to the browser, and `.env.local` is ignored by Git.
 
@@ -47,7 +47,7 @@ Select **Volcengine Ark · Seedream** for images, **Volcengine Ark · Seedance**
 ## Workflow
 
 1. In **Episode**, paste a script and upload narration. The app transcribes the audio locally, then uses those timings when the configured AI provider plans the storyboard.
-2. In **Storyboard**, review AI-generated timing, bilingual lines, and prompts, generate the real images, then choose **Animate all shots** to create Volcengine video clips.
+2. In **Storyboard**, review AI-generated timing, bilingual lines, separate image and video prompts, generate the real images, then choose **Animate all shots** to create Volcengine video clips. The animation request uses the motion-specific prompt planned during **Analyze with AI**, with the generated image as its exact first frame.
 3. In **Audio & captions**, edit English and Chinese lines and optionally upload a licensed BGM track.
 4. In **Export**, normalize and concatenate generated clips in storyboard order, mix narration/BGM, burn captions, and render the finished H.264 MP4 locally. Shots without a generated clip retain the subtle still-image motion fallback.
 

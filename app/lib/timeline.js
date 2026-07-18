@@ -9,6 +9,12 @@ export function formatTime(seconds) {
 
 const allowedTypes = new Set(["Opening", "Narrative", "Climax", "Map", "Timeline", "Emotion"]);
 
+export function defaultVideoPrompt(shot = {}, index = 0) {
+  const narration = String(shot?.narration || shot?.text || shot?.voiceover || "the planned action").trim();
+  const motion = ["Slow push-in", "Slow drift", "Static"].includes(shot?.motion) ? shot.motion : (index % 2 ? "Slow drift" : "Slow push-in");
+  return `${motion}. Animate the visible subject naturally to express: ${narration}. Add restrained environmental motion and realistic parallax. Preserve identity, anatomy, composition, lighting, and scene continuity in one continuous shot; no cuts, new subjects, text, logos, flicker, warping, or morphing.`;
+}
+
 function transcriptionWords(transcription) {
   if (!Array.isArray(transcription?.segments)) return [];
   return transcription.segments.flatMap((segment) => {
@@ -52,13 +58,15 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     const visualStyle = String(options.visualStyle || "photorealistic");
     const creativeDirection = String(options.creativeDirection || "").trim();
     const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong mobile composition, coherent subjects and setting, vertical 9:16 frame, subtitle-safe lower area, no text, no watermark.`;
+    const motion = ["Slow push-in", "Slow drift", "Static"].includes(item?.motion) ? item.motion : (index % 2 ? "Slow drift" : "Slow push-in");
     return {
       type,
       duration,
       narration,
       chinese: String(item?.chinese || "").trim(),
       prompt: String(item?.prompt || fallbackPrompt).trim(),
-      motion: ["Slow push-in", "Slow drift", "Static"].includes(item?.motion) ? item.motion : (index % 2 ? "Slow drift" : "Slow push-in"),
+      videoPrompt: String(item?.videoPrompt || defaultVideoPrompt({ ...item, narration, motion }, index)).trim(),
+      motion,
     };
   });
   const rawTotal = source.reduce((sum, shot) => sum + shot.duration, 0);
