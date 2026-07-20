@@ -44,6 +44,8 @@ Open **Provider settings** in the editor to see whether environment keys were lo
 
 Select **Volcengine Ark · Seedream** for images, **Volcengine Ark · Seedance** for image-to-video clips, and **Volcengine Ark · Doubao** for storyboard planning and translation. All three can reuse `VOLCENGINE_API_KEY`. The video adapter submits each generated storyboard frame to Ark's asynchronous `/api/v3/contents/generations/tasks` API, polls until completion, and immediately copies the temporary result into `.shortform/assets/`. It defaults to `doubao-seedance-2-0-260128`, vertical 9:16 output, 720p generation, no generated audio, and no watermark; narration and BGM are mixed during the local final render. Override the video model, endpoint, timeout, or polling interval with the settings shown in `.env.example`.
 
+For a subscribed **Volcengine Agent Plan**, select the Agent Plan preset in Provider settings, or use its separate API key with the base URL `https://ark.cn-beijing.volces.com/api/plan/v3`. Agent Plan uses model names rather than dated online-inference model IDs: `ark-code-latest` for OpenAI-compatible text chat, `doubao-seedream-5.0-lite` for images, and `doubao-seedance-2.0` for video. The bridge accepts either the base URL or a complete modality endpoint and appends the correct API path automatically. Agent Plan text requests intentionally send only `model` and `messages`, matching the OpenAI client request shape; Ark-specific `thinking` and structured-output parameters remain limited to the pay-as-you-go endpoint.
+
 ## Workflow
 
 1. In **Episode**, paste a script and upload narration. The app transcribes the audio locally, then uses those timings when the configured AI provider plans the storyboard.

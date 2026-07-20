@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, renderEpisode, transcribeAudio } from "../scripts/render-service.mjs";
+import { completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, renderEpisode, stillMotionFilter, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -100,6 +100,30 @@ test("local renderer keeps image shots visible after generated clips", { timeout
   assert.ok(Math.abs(finalPixel[0] - greenPixel[0]) + Math.abs(finalPixel[1] - greenPixel[1]) + Math.abs(finalPixel[2] - greenPixel[2]) > 25, `Expected final still to replace the preceding clip; green=${greenPixel}, final=${finalPixel}`);
 });
 
+test("still motion filter maps shot motion to a non-resetting zoompan", () => {
+  const push = stillMotionFilter("Slow push-in", 1080, 1920, 3, 0);
+  assert.ok(push.includes("zoompan=z='1+0.14*on/90'"));
+  assert.ok(!push.includes("mod("));
+  assert.ok(push.includes("scale=3240:5760"));
+  const drift = stillMotionFilter("Slow drift", 1080, 1920, 3, 1);
+  assert.ok(drift.includes("z='1.12'"));
+  assert.ok(drift.includes("x='(iw-iw/zoom)*(1-on/90)'"));
+  const pull = stillMotionFilter("Slow pull-out", 1080, 1920, 3, 0);
+  assert.ok(pull.includes("z='1.14-0.14*on/90'"));
+  const rise = stillMotionFilter("Slow rise", 1080, 1920, 3, 0);
+  assert.ok(rise.includes("y='(ih-ih/zoom)*on/90'"));
+  const sink = stillMotionFilter("Slow sink", 1080, 1920, 3, 0);
+  assert.ok(sink.includes("y='(ih-ih/zoom)*(1-on/90)'"));
+  const diagonal = stillMotionFilter("Diagonal drift", 1080, 1920, 3, 0);
+  assert.ok(diagonal.includes("x='(iw-iw/zoom)*on/90'") && diagonal.includes("y='(ih-ih/zoom)*on/90'"));
+  const subject = stillMotionFilter("Push to subject", 1080, 1920, 3, 0);
+  assert.ok(subject.includes("z='1+0.16*on/90'") && subject.includes("y='(ih-ih/zoom)/3'"));
+  const subtle = stillMotionFilter("Static", 1080, 1920, 3, 0);
+  assert.ok(subtle.includes("z='1+0.04*on/90'"));
+  const fallback = stillMotionFilter(undefined, 1080, 1920, 3, 2);
+  assert.ok(fallback.includes("z='1.14-0.14*on/90'"));
+});
+
 test("provider status reports configuration without exposing secrets", () => {
   const environment = {
     IMAGE_PROVIDER:"volcengine", IMAGE_MODEL:"seedream-test",
@@ -150,6 +174,35 @@ test("Volcengine image adapter sends a vertical Seedream request", async () => {
   assert.equal(image, "https://example.test/seedream.png");
 });
 
+test("image adapters use the selected screen ratio", async () => {
+  let volcengineRequest; let openaiRequest;
+  const volcengineFetch = async (_url, options) => {
+    volcengineRequest = JSON.parse(options.body);
+    return new Response(JSON.stringify({ data:[{ url:"https://example.test/landscape.png" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const openaiFetch = async (_url, options) => {
+    openaiRequest = JSON.parse(options.body);
+    return new Response(JSON.stringify({ data:[{ b64_json:"AA==" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateImage({ kind:"volcengine", endpoint:"https://example.test", model:"seedream", apiKey:"key", prompt:"Scene", screenRatio:"16:9" }, { fetchImpl:volcengineFetch });
+  await generateImage({ kind:"openai", endpoint:"https://example.test/images", model:"gpt-image", apiKey:"key", prompt:"Scene", screenRatio:"1:1" }, { fetchImpl:openaiFetch });
+  assert.equal(volcengineRequest.size, "2560x1440");
+  assert.match(volcengineRequest.prompt, /16:9 screen ratio/);
+  assert.equal(openaiRequest.size, "1024x1024");
+});
+
+test("Volcengine Agent Plan image adapter accepts the documented API base URL", async () => {
+  let requestUrl = ""; let request;
+  const fetchImpl = async (url, options) => {
+    requestUrl = url; request = options;
+    return new Response(JSON.stringify({ data:[{ url:"https://example.test/plan-image.png" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateImage({ kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedream-5.0-lite", apiKey:"plan-test", prompt:"A vertical cinematic scene" }, { fetchImpl });
+  const payload = JSON.parse(request.body);
+  assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/plan/v3/images/generations");
+  assert.equal(payload.model, "doubao-seedream-5.0-lite");
+});
+
 test("Volcengine video adapter creates and polls an image-to-video task", async () => {
   const requests = []; let poll = 0;
   const fetchImpl = async (url, options = {}) => {
@@ -166,9 +219,50 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
   assert.equal(payload.content[1].role, "first_frame"); assert.equal(payload.content[1].image_url.url, png);
   assert.match(payload.content[0].text, /Rain streams diagonally/);
   assert.match(payload.content[0].text, /Camera direction override: Slow push-in/);
-  assert.match(payload.content[0].text, /--ratio 9:16 --dur 3 --resolution 720p/);
+  assert.doesNotMatch(payload.content[0].text, /--ratio|--dur|--resolution/);
+  assert.equal(payload.duration, 3); assert.equal(payload.ratio, "9:16"); assert.equal(payload.resolution, "720p");
+  assert.equal(payload.generate_audio, false); assert.equal(payload.watermark, false);
   assert.equal(requests[2].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-test-123");
   assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
+});
+
+test("Volcengine Agent Plan video adapter accepts the documented base URL and model name", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ id:"plan-video-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ id:"plan-video-task", status:"succeeded", content:{ video_url:"https://example.test/plan-video.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedance-2.0", apiKey:"plan-test", image:png, duration:5 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(requests[0].url, "https://ark.cn-beijing.volces.com/api/plan/v3/contents/generations/tasks");
+  assert.equal(requests[1].url, "https://ark.cn-beijing.volces.com/api/plan/v3/contents/generations/tasks/plan-video-task");
+  assert.equal(payload.model, "doubao-seedance-2.0");
+  assert.equal(payload.duration, 5); assert.equal(payload.ratio, "9:16"); assert.equal(payload.generate_audio, false);
+});
+
+test("Volcengine video adapter uses the selected screen ratio", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ id:"square-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ id:"square-task", status:"succeeded", content:{ video_url:"https://example.test/square.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateVideo({ videoKind:"volcengine", endpoint:"https://example.test", model:"seedance", apiKey:"key", image:png, screenRatio:"1:1" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.ratio, "1:1");
+  assert.match(payload.content[0].text, /Square 1:1 screen ratio/);
+});
+
+test("video provider connection test uses the task-list API for Agent Plan", async () => {
+  let requestUrl = "";
+  const fetchImpl = async (url) => {
+    requestUrl = url;
+    return new Response(JSON.stringify({ items:[], total:0 }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await testProviderConnection({ target:"video", videoKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedance-2.0", apiKey:"plan-test" }, { fetchImpl });
+  assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/plan/v3/contents/generations/tasks?page_num=1&page_size=1");
+  assert.equal(result.ok, true);
 });
 
 test("session video model and endpoint are retained when the API key comes from the provider environment", async () => {
@@ -237,6 +331,60 @@ test("Volcengine text adapter uses Ark chat completions", async () => {
   assert.deepEqual(payload.thinking, { type:"disabled" });
   assert.equal(payload.max_tokens, 8000);
   assert.equal(content, '{"ok":true}');
+});
+
+test("Volcengine Agent Plan text adapter accepts the documented API base URL", async () => {
+  let requestUrl = ""; let request;
+  const fetchImpl = async (url, options) => {
+    requestUrl = url; request = options;
+    return new Response(JSON.stringify({ choices:[{ message:{ content:'{"ok":true}' } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await completeText({ textKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"ark-code-latest", apiKey:"plan-test" }, [{ role:"user", content:"Return JSON" }], { fetchImpl });
+  const payload = JSON.parse(request.body);
+  assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions");
+  assert.equal(payload.model, "ark-code-latest");
+  assert.deepEqual(Object.keys(payload).sort(), ["messages", "model"]);
+});
+
+test("Agent Plan text connection test calls chat completions instead of models", async () => {
+  let requestUrl = ""; let request;
+  const fetchImpl = async (url, options) => {
+    requestUrl = url; request = options;
+    return new Response(JSON.stringify({ choices:[{ message:{ content:"OK" } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await testProviderConnection({ target:"text", textKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"ark-code-latest", apiKey:"plan-test" }, { fetchImpl });
+  const payload = JSON.parse(request.body);
+  assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/plan/v3/chat/completions");
+  assert.equal(request.method, "POST");
+  assert.deepEqual(Object.keys(payload).sort(), ["messages", "model"]);
+  assert.equal(result.ok, true);
+});
+
+test("Agent Plan storyboard planning repairs malformed JSON once", async () => {
+  const requests = [];
+  const repaired = { shots:[{
+    narration:"A complete line.", chinese:"完整的一句。", type:"Opening", duration:3,
+    prompt:"A cinematic vertical scene with no text or watermark",
+    videoPrompt:"The subject moves naturally in one stable continuous shot",
+    motion:"Slow drift",
+  }] };
+  const fetchImpl = async (_url, options) => {
+    const payload = JSON.parse(options.body); requests.push(payload);
+    const content = requests.length === 1
+      ? '{"shots":[{"narration":"A complete line.","chinese":"完整的一句。","type":"Opening"'
+      : JSON.stringify(repaired);
+    return new Response(JSON.stringify({ choices:[{ message:{ content } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const shots = await planEpisode({
+    textKind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3",
+    model:"ark-code-latest", apiKey:"plan-test", script:"A complete line.", audioDuration:3,
+  }, { fetchImpl });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].max_tokens, 8000);
+  assert.match(requests[1].messages[0].content, /Repair malformed or truncated JSON/);
+  assert.equal(requests[1].max_tokens, 8000);
+  assert.equal(shots[0].narration, "A complete line.");
+  assert.equal(shots[0].end, 3);
 });
 
 test("storyboard planning uses the transcript as an 82-second master timeline", async () => {

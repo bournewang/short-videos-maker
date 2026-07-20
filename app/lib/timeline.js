@@ -9,9 +9,16 @@ export function formatTime(seconds) {
 
 const allowedTypes = new Set(["Opening", "Narrative", "Climax", "Map", "Timeline", "Emotion"]);
 
+export const SHOT_MOTIONS = ["Slow push-in", "Slow pull-out", "Slow drift", "Slow rise", "Slow sink", "Diagonal drift", "Push to subject", "Static"];
+const motionRotation = ["Slow push-in", "Slow drift", "Slow pull-out", "Slow rise", "Slow sink", "Diagonal drift"];
+
+export function shotMotion(value, index = 0) {
+  return SHOT_MOTIONS.includes(value) ? value : motionRotation[index % motionRotation.length];
+}
+
 export function defaultVideoPrompt(shot = {}, index = 0) {
   const narration = String(shot?.narration || shot?.text || shot?.voiceover || "the planned action").trim();
-  const motion = ["Slow push-in", "Slow drift", "Static"].includes(shot?.motion) ? shot.motion : (index % 2 ? "Slow drift" : "Slow push-in");
+  const motion = shotMotion(shot?.motion, index);
   return `${motion}. Animate the visible subject naturally to express: ${narration}. Add restrained environmental motion and realistic parallax. Preserve identity, anatomy, composition, lighting, and scene continuity in one continuous shot; no cuts, new subjects, text, logos, flicker, warping, or morphing.`;
 }
 
@@ -19,13 +26,36 @@ function transcriptionWords(transcription) {
   if (!Array.isArray(transcription?.segments)) return [];
   return transcription.segments.flatMap((segment) => {
     if (Array.isArray(segment?.words) && segment.words.length) {
-      return segment.words.map((word) => ({ start:Number(word?.start), end:Number(word?.end) }));
+      return segment.words.map((word) => ({ start:Number(word?.start), end:Number(word?.end), text:String(word?.word || "").trim() }));
     }
     const parts = String(segment?.text || "").trim().split(/\s+/).filter(Boolean);
     const start = Number(segment?.start); const end = Number(segment?.end);
     if (!parts.length || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
-    return parts.map((_, index) => ({ start:start + (end - start) * index / parts.length, end:start + (end - start) * (index + 1) / parts.length }));
+    return parts.map((text, index) => ({ start:start + (end - start) * index / parts.length, end:start + (end - start) * (index + 1) / parts.length, text }));
   }).filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end >= word.start);
+}
+
+export function scriptSectionForDuration(script, transcription, start, end, totalDuration = 0) {
+  const scriptWords = String(script || "").trim().split(/\s+/).filter(Boolean);
+  const rangeStart = Math.max(0, Number(start) || 0);
+  const rangeEnd = Math.max(rangeStart, Number(end) || 0);
+  const timedWords = transcriptionWords(transcription);
+  if (timedWords.length) {
+    const first = timedWords.findIndex((word) => (word.start + word.end) / 2 >= rangeStart && (word.start + word.end) / 2 < rangeEnd);
+    if (first < 0) return "";
+    let last = first;
+    while (last + 1 < timedWords.length && (timedWords[last + 1].start + timedWords[last + 1].end) / 2 < rangeEnd) last += 1;
+    if (!scriptWords.length) return timedWords.slice(first, last + 1).map((word) => word.text).filter(Boolean).join(" ");
+    const scriptStart = Math.floor(first * scriptWords.length / timedWords.length);
+    const scriptEnd = Math.max(scriptStart + 1, Math.ceil((last + 1) * scriptWords.length / timedWords.length));
+    return scriptWords.slice(scriptStart, scriptEnd).join(" ");
+  }
+  if (!scriptWords.length) return "";
+  const duration = Math.max(rangeEnd, Number(totalDuration) || 0);
+  if (!duration) return scriptWords.join(" ");
+  const scriptStart = Math.min(scriptWords.length, Math.floor(rangeStart / duration * scriptWords.length));
+  const scriptEnd = Math.min(scriptWords.length, Math.max(scriptStart + 1, Math.ceil(rangeEnd / duration * scriptWords.length)));
+  return scriptWords.slice(scriptStart, scriptEnd).join(" ");
 }
 
 function timestampBoundaries(shots, transcription, target) {
@@ -57,8 +87,9 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     const contentFormat = String(options.contentFormat || "short-form video");
     const visualStyle = String(options.visualStyle || "photorealistic");
     const creativeDirection = String(options.creativeDirection || "").trim();
-    const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong mobile composition, coherent subjects and setting, vertical 9:16 frame, subtitle-safe lower area, no text, no watermark.`;
-    const motion = ["Slow push-in", "Slow drift", "Static"].includes(item?.motion) ? item.motion : (index % 2 ? "Slow drift" : "Slow push-in");
+    const screenRatio = String(options.screenRatio || "9:16");
+    const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong composition for a ${screenRatio} frame, coherent subjects and setting, subtitle-safe lower area, no text, no watermark.`;
+    const motion = shotMotion(item?.motion, index);
     return {
       type,
       duration,

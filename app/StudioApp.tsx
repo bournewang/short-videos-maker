@@ -4,8 +4,8 @@
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
 import { clearProjectCache, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
-import { formatTime } from "./lib/timeline";
-import { VIDEO_RESOLUTIONS, videoResolution } from "./lib/video";
+import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
+import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution } from "./lib/video";
 
 type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
@@ -83,6 +83,7 @@ export default function StudioApp() {
   const [previewUrl, setPreviewUrl] = useState("");
   const [downloadUrl, setDownloadUrl] = useState("");
   const [downloadResolution, setDownloadResolution] = useState("1080");
+  const [screenRatio, setScreenRatio] = useState("9:16");
   const [provider, setProvider] = useState<ProviderSettings>({
     kind: "openai", endpoint: "https://api.openai.com/v1/images/generations", model: "gpt-image-1",
     apiKey: "", videoKind:"volcengine", videoEndpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", videoModel:"doubao-seedance-2-0-260128", videoApiKey:"", videoConcurrency:2,
@@ -101,9 +102,11 @@ export default function StudioApp() {
   const cacheEpoch = useRef(0);
   const activeManualVideoIds = useRef(new Set<string>());
   const [activeManualVideoCount, setActiveManualVideoCount] = useState(0);
+  const activeManualImageIds = useRef(new Set<string>());
+  const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, ...overrides };
+    return { stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, screenRatio, ...overrides };
   }
 
   function persistProject(snapshot = projectSnapshot()) {
@@ -137,7 +140,7 @@ export default function StudioApp() {
         setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
         const savedBgmVolume = Number(parsed.bgmVolume);
         setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || mode); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
-        setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080"));
+        setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(normalizeScreenRatio(parsed.screenRatio));
         setStage(["episode","storyboard","captions","export"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
         setMessage(`Recovered locally saved episode · ${parsed.shots?.length || 0} shots.`);
       }
@@ -150,7 +153,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution]);
+  }, [stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, screenRatio]);
 
   async function refreshProviderStatus() {
     try {
@@ -179,7 +182,7 @@ export default function StudioApp() {
     localStorage.removeItem("chronicle-studio-project"); localStorage.removeItem("chronicle-studio-project-v2"); localStorage.removeItem("chronicle-studio-project-v3"); localStorage.removeItem(STORAGE_KEY);
     void clearProjectCache().catch(() => {});
     allowSave.current = false; setTitle(""); setScript(""); setContentFormat("Documentary"); setVisualStyle("Photorealistic"); setCreativeDirection(""); setShots([]); setSelectedId("");
-    setAudioName(""); setAudioData(""); setAudioDuration(0); setDenoiseNarration(true); setTranscription(null); setBgm(""); setBgmVolume(8); setPreviewUrl(""); setDownloadUrl("");
+    setAudioName(""); setAudioData(""); setAudioDuration(0); setDenoiseNarration(true); setTranscription(null); setBgm(""); setBgmVolume(8); setPreviewUrl(""); setDownloadUrl(""); setScreenRatio("9:16");
     setMode("Review then batch"); setStage("episode"); setMessage("New empty episode created.");
   }
 
@@ -190,7 +193,7 @@ export default function StudioApp() {
     if (!provider.textApiKey && !providerStatus.text.configured) { setMessage("Configure a text AI provider before analyzing the script."); setSettingsOpen(true); return; }
     setBusy("AI is planning the episode");
     try {
-      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey, script, contentFormat, visualStyle, creativeDirection, audioDuration, transcription }) });
+      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey, script, contentFormat, visualStyle, creativeDirection, screenRatio, audioDuration, transcription }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Planning failed");
       const planned:Shot[] = data.shots.map((shot:Partial<Shot>, index:number) => ({ ...shot, id:`shot-${Date.now()}-${index}`, index, status:"planned", locked:false, image:"", variants:[], provider:"", seed:"", video:"", videoStatus:"idle", videoProvider:"" })) as Shot[];
       persistProject(projectSnapshot({ shots:planned, selectedId:planned[0]?.id || "", stage:"storyboard", previewUrl:"", downloadUrl:"" }));
@@ -261,7 +264,7 @@ export default function StudioApp() {
   async function requestShotImage(shot: Shot) {
     updateShot(shot.id, { status:"generating" });
     try {
-      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt: shot.prompt }) });
+      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt: shot.prompt, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
       updateShot(shot.id, { image, variants: [...shot.variants, image], status:"generated", provider:provider.model, video:"", videoStatus:"idle", videoProvider:"" });
       return { ok:true, shot };
@@ -273,11 +276,21 @@ export default function StudioApp() {
 
   async function generateOne(shot: Shot) {
     if (shot.locked || busy || !imageProviderReady()) return;
-    setBusy(`Generating shot ${shot.index + 1}`);
+    const concurrency = Math.max(1, Math.min(6, Math.floor(provider.imageConcurrency) || 3));
+    if (!canStartConcurrentJob(activeManualImageIds.current, shot.id, concurrency)) {
+      setMessage(activeManualImageIds.current.has(shot.id) ? `Shot ${shot.index + 1} is already generating.` : `All ${concurrency} parallel image slots are currently in use.`);
+      return;
+    }
+    activeManualImageIds.current.add(shot.id);
+    setActiveManualImageCount(activeManualImageIds.current.size);
+    setMessage(`Generating shot ${shot.index + 1} · ${activeManualImageIds.current.size}/${concurrency} slots active.`);
     try {
       const result = await requestShotImage(shot);
       setMessage(result.ok ? `Shot ${shot.index + 1} generated.` : result.error || "Generation failed");
-    } finally { setBusy(""); }
+    } finally {
+      activeManualImageIds.current.delete(shot.id);
+      setActiveManualImageCount(activeManualImageIds.current.size);
+    }
   }
 
   async function generateBatch(source: Shot[], successMessage: string) {
@@ -334,7 +347,7 @@ export default function StudioApp() {
     if (!shot.image) return { ok:false, shot, error:"Generate the storyboard image first" };
     updateShot(shot.id, { videoStatus:"generating" });
     try {
-      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, videoPrompt:shot.videoPrompt, image:shot.image, motion:shot.motion, duration:shot.duration }) });
+      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, videoPrompt:shot.videoPrompt, image:shot.image, motion:shot.motion, duration:shot.duration, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Video generation failed");
       updateShot(shot.id, { video:data.video, videoStatus:"generated", videoProvider:provider.videoModel });
       return { ok:true, shot };
@@ -406,7 +419,7 @@ export default function StudioApp() {
     if (!audioData) { setMessage("Upload the recorded narration before building the video."); setStage("episode"); return; }
     if (!shots.length) { setMessage("Analyze the script before building the video."); setStage("episode"); return; }
     if (shots.some((shot) => !shot.image && !shot.video)) { setMessage("Generate a visual asset for every storyboard shot before building the video."); setStage("storyboard"); return; }
-    const preset = videoResolution(resolution);
+    const preset = videoResolution(resolution, screenRatio);
     if (target === "preview") setPreviewUrl(""); else setDownloadUrl("");
     setBusy(`Rendering ${preset.label} ${target}`);
     try {
@@ -426,8 +439,21 @@ export default function StudioApp() {
     await renderVideo("download", downloadResolution);
   }
 
+  function changeScreenRatio(value:string) {
+    const next = normalizeScreenRatio(value);
+    if (next === screenRatio) return;
+    touchProject(); setScreenRatio(next); setPreviewUrl(""); setDownloadUrl("");
+    setShots((current) => current.map((shot) => ({ ...shot, prompt:promptForScreenRatio(shot.prompt, next), videoPrompt:promptForScreenRatio(shot.videoPrompt, next) })));
+    setMessage(`Screen ratio changed to ${next} and shot prompts were updated. Existing assets are preserved; regenerate them to apply the new framing.`);
+  }
+
+  const manualImageLimit = Math.max(1, Math.min(6, Math.floor(provider.imageConcurrency) || 3));
   const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(provider.videoConcurrency) || 2));
-  const activityLabel = busy || (activeManualVideoCount ? `Animating clips · ${activeManualVideoCount}/${manualVideoLimit} manual jobs active` : "");
+  const manualActivity = [
+    activeManualImageCount ? `Generating images · ${activeManualImageCount}/${manualImageLimit}` : "",
+    activeManualVideoCount ? `Animating clips · ${activeManualVideoCount}/${manualVideoLimit}` : "",
+  ].filter(Boolean).join(" · ");
+  const activityLabel = busy || (manualActivity ? `${manualActivity} manual jobs active` : "");
 
   return (
     <main className="studio-shell">
@@ -448,12 +474,12 @@ export default function StudioApp() {
         </header>
 
         {stage === "episode" && <EpisodePanel script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
-        {stage === "storyboard" && <Storyboard shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualVideoCount={activeManualVideoCount} videoConcurrency={provider.videoConcurrency} />}
+        {stage === "storyboard" && <Storyboard script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} />}
         {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
-        {stage === "export" && <ExportPanel shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} buildPreview={() => renderVideo("preview", "720")} prepareDownload={prepareDownload} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { setDownloadResolution(value); setDownloadUrl(""); }} busy={busy} />}
+        {stage === "export" && <ExportPanel shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} buildPreview={() => renderVideo("preview", "720")} prepareDownload={prepareDownload} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { setDownloadResolution(value); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
       </section>
 
-      <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} shots · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · 9:16</span></div>
+      <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} shots · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
@@ -466,21 +492,36 @@ function EpisodePanel({ script, setScript, contentFormat, setContentFormat, visu
         <label className="upload-card"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Narration attached" : "Add recorded narration"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
 }
 
-function Storyboard({ shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualVideoCount, videoConcurrency }: any) {
-  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>Your production shots will appear here after AI analysis.</p></div></div><div className="empty-state"><span>01</span><h2>No storyboard yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
+function motionPreviewClass(motion: string, index: number) {
+  const kinds: Record<string, string> = { "Slow push-in":"kb-push", "Slow pull-out":"kb-pull", "Slow rise":"kb-rise", "Slow sink":"kb-sink", "Push to subject":"kb-subject", "Static":"kb-static" };
+  if (motion === "Slow drift") return index % 2 ? "kb-drift-b" : "kb-drift-a";
+  if (motion === "Diagonal drift") return index % 2 ? "kb-diag-b" : "kb-diag-a";
+  return kinds[motion] || "kb-push";
+}
+
+function RatioSelect({ screenRatio, setScreenRatio }:any) {
+  return <label className="ratio-select"><span>Screen ratio</span><select value={screenRatio} onChange={(event)=>setScreenRatio(event.target.value)}>{Object.entries(SCREEN_RATIOS).map(([value, option]) => <option key={value} value={value}>{value} · {option.label}</option>)}</select></label>;
+}
+
+function Storyboard({ script, transcription, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio }: any) {
+  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>Your production shots will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No storyboard yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
+  const manualImageLimit = Math.max(1, Math.min(6, Math.floor(Number(imageConcurrency)) || 3));
+  const manualImageSlotFull = activeManualImageCount >= manualImageLimit;
   const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(Number(videoConcurrency)) || 2));
   const manualVideoSlotFull = activeManualVideoCount >= manualVideoLimit;
   const otherWorkBusy = Boolean(busy);
-  const batchActionsBusy = otherWorkBusy || activeManualVideoCount > 0;
-  return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated</p></div><div className="story-actions"><button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Animate all shots"}</button></div></div>
+  const batchActionsBusy = otherWorkBusy || activeManualImageCount > 0 || activeManualVideoCount > 0;
+  const currentScript = selected ? scriptSectionForDuration(script, transcription, selected.start, selected.end, totalDuration) : "";
+  return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated</p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/><button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Animate all shots"}</button></div></div>
     <div className="story-grid"><div className="shot-list">{shots.map((shot: Shot) => <button key={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
       <div className="thumb">{shot.image ? <img src={shot.image} alt="Generated shot"/> : <span>{String(shot.index + 1).padStart(2,'0')}</span>}{shot.video && <i className="clip-badge">CLIP</i>}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? "animating" : shot.video ? "clip ready" : shot.status}</span></button>)}</div>
-      {selected && <div className="inspector"><div className="phone-frame"><div className="phone-canvas">{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview"/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>Awaiting image</b></div>}<div className="preview-captions"><b>{selected.narration}</b><span>{selected.chinese}</span></div></div></div>
+      {selected && <div className="inspector"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>Awaiting image</b></div>}<div className="preview-captions"><b>{selected.narration}</b><span>{selected.chinese}</span></div></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">SHOT {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
+          <div className="current-script" aria-live="polite"><div><span>Script in this shot</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
           <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoProvider:''})}/></label>
           <label className="field"><span>Video prompt</span><textarea rows={5} value={selected.videoPrompt || ""} onChange={(e) => updateShot(selected.id,{videoPrompt:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}/><small>Created during AI analysis; describes subject action, environmental movement, and continuity from the generated first frame.</small></label>
-          <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min="0.6" max="8" step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}><option>Slow push-in</option><option>Slow drift</option><option>Static</option></select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
-          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || !!busy || selected.videoStatus === "generating"}>{selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !selected.image || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Animating…" : selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div></div></div>}
+          <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min="0.6" max="8" step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}>{SHOT_MOTIONS.map((motion) => <option key={motion}>{motion}</option>)}</select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
+          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || selected.status === "generating" || selected.videoStatus === "generating" || otherWorkBusy || manualImageSlotFull}>{selected.status === "generating" ? "Generating…" : selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !selected.image || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Animating…" : selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div></div></div>}
     </div></div>;
 }
 
@@ -495,19 +536,25 @@ function Captions({ script, shots, updateShot, translateAll, audioName, audioDat
       <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/><textarea className="chinese" value={shot.chinese} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/></div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>No captions yet</h2><p>AI-generated bilingual lines appear after script analysis.</p></div>}</div></div></div>;
 }
 
-function ExportPanel({ shots, approved, duration, audioName, bgm, buildPreview, prepareDownload, previewUrl, downloadUrl, downloadResolution, setDownloadResolution, busy }: any) {
+function ExportPanel({ shots, approved, duration, audioName, bgm, buildPreview, prepareDownload, previewUrl, downloadUrl, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
   const ready = Boolean(shots.length && audioName && shots.every((shot:Shot) => shot.image || shot.video));
-  const selected = videoResolution(downloadResolution);
+  const selected = videoResolution(downloadResolution, screenRatio);
+  const preview = videoResolution("720", screenRatio);
   return <div className="panel export-panel"><div className="section-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Build a 720p review copy, inspect the finished video, then choose the download resolution.</p></div></div><div className="export-grid">
-    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">720P PREVIEW</span><h2>Review the final cut</h2></div><span>720 × 1280</span></div><div className={`video-preview ${previewUrl ? "ready" : ""}`}>{previewUrl ? <video controls playsInline src={previewUrl} aria-label="720p video preview"/> : <div><b>Preview not built</b><span>Check timing, subtitles, framing, motion, narration, and BGM before downloading.</span></div>}</div><button className="primary large full" onClick={buildPreview} disabled={!!busy || !ready}>{busy || (previewUrl ? "Rebuild 720p preview" : "Build 720p preview")}</button></div>
-    <div className="export-side"><div className="export-card feature"><span className="eyebrow">DOWNLOAD</span><h2>Choose output quality</h2><label className="field"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => <option key={value} value={value}>{preset.label} · {preset.width} × {preset.height}</option>)}</select></label><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>30 fps</b>Frame rate</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 video</span></div><button className="primary large full" onClick={prepareDownload} disabled={!!busy || !ready}>{busy || `Prepare ${selected.label} download`}</button>{downloadUrl && <a className="download" href={downloadUrl} download>Download {selected.label} MP4</a>}</div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>Storyboard <b>{shots.length} shots</b></div><div className={shots.length && shots.every((s:Shot)=>s.image)?'ok':'warn'}>Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length} generated</b></div><div className={shots.some((s:Shot)=>s.video)?'ok':'warn'}>Animated clips <b>{shots.filter((s:Shot)=>s.video).length}/{shots.length} generated</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Generated clips are concatenated in storyboard order; unfinished shots retain the subtle still-image motion fallback.</small></div></div>
+    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">720P PREVIEW</span><h2>Review the final cut</h2></div><span>{preview.width} × {preview.height} · {screenRatio}</span></div><div className={`video-preview ${previewUrl ? "ready" : ""}`}>{previewUrl ? <video controls playsInline src={previewUrl} aria-label="720p video preview" style={{ aspectRatio:screenRatio.replace(':',' / ') }}/> : <div><b>Preview not built</b><span>Check timing, subtitles, framing, motion, narration, and BGM before downloading.</span></div>}</div><button className="primary large full" onClick={buildPreview} disabled={!!busy || !ready}>{busy || (previewUrl ? "Rebuild 720p preview" : "Build 720p preview")}</button></div>
+    <div className="export-side"><div className="export-card feature"><span className="eyebrow">DOWNLOAD</span><h2>Choose output quality</h2><label className="field"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Screen ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><button className="primary large full" onClick={prepareDownload} disabled={!!busy || !ready}>{busy || `Prepare ${selected.label} download`}</button>{downloadUrl && <a className="download" href={downloadUrl} download>Download {selected.label} MP4</a>}</div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>Storyboard <b>{shots.length} shots</b></div><div className={shots.length && shots.every((s:Shot)=>s.image)?'ok':'warn'}>Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length} generated</b></div><div className={shots.some((s:Shot)=>s.video)?'ok':'warn'}>Animated clips <b>{shots.filter((s:Shot)=>s.video).length}/{shots.length} generated</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Generated clips are concatenated in storyboard order; unfinished shots retain the subtle still-image motion fallback.</small></div></div>
   </div></div>;
 }
 
 function Settings({ provider, setProvider, status, refreshStatus, close }: any) {
   const set = (patch:any) => setProvider((current:ProviderSettings)=>({...current,...patch}));
-  const chooseImageProvider = (kind:string) => set(kind === "volcengine" ? { kind, endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128", apiKey:"" } : kind === "sdwebui" ? { kind, endpoint:"http://127.0.0.1:7860", model:"Local checkpoint", apiKey:"" } : { kind, endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1", apiKey:"" });
-  const chooseTextProvider = (textKind:string) => set(textKind === "volcengine" ? { textKind, textEndpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", textModel:"doubao-seed-2-1-turbo-260628", textApiKey:"" } : { textKind, textEndpoint:"https://api.openai.com/v1/chat/completions", textModel:"gpt-4.1-mini", textApiKey:"" });
+  const isPlanEndpoint = (endpoint:string) => endpoint.includes("/api/plan/v3");
+  const imageProviderChoice = provider.kind === "volcengine" && isPlanEndpoint(provider.endpoint) ? "volcengine-plan" : provider.kind;
+  const textProviderChoice = provider.textKind === "volcengine" && isPlanEndpoint(provider.textEndpoint) ? "volcengine-plan" : provider.textKind;
+  const videoProviderChoice = isPlanEndpoint(provider.videoEndpoint) ? "plan" : "api";
+  const chooseImageProvider = (choice:string) => set(choice === "volcengine-plan" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedream-5.0-lite", apiKey:"" } : choice === "volcengine" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128", apiKey:"" } : choice === "sdwebui" ? { kind:choice, endpoint:"http://127.0.0.1:7860", model:"Local checkpoint", apiKey:"" } : { kind:choice, endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1", apiKey:"" });
+  const chooseVideoProvider = (choice:string) => set(choice === "plan" ? { videoEndpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", videoModel:"doubao-seedance-2.0", videoApiKey:"" } : { videoEndpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", videoModel:"doubao-seedance-2-0-260128", videoApiKey:"" });
+  const chooseTextProvider = (choice:string) => set(choice === "volcengine-plan" ? { textKind:"volcengine", textEndpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", textModel:"ark-code-latest", textApiKey:"" } : choice === "volcengine" ? { textKind:"volcengine", textEndpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", textModel:"doubao-seed-2-1-turbo-260628", textApiKey:"" } : { textKind:"openai", textEndpoint:"https://api.openai.com/v1/chat/completions", textModel:"gpt-4.1-mini", textApiKey:"" });
   const [testing, setTesting] = useState("");
   const [testResult, setTestResult] = useState("");
   async function testConnection(target:string) {
@@ -524,8 +571,8 @@ function Settings({ provider, setProvider, status, refreshStatus, close }: any) 
   }
   return <div className="modal-backdrop" onMouseDown={(e)=>{if(e.target===e.currentTarget)close();}}><div className="modal"><div className="modal-head"><div><span className="eyebrow">LOCAL CONFIGURATION</span><h2>AI providers</h2></div><button onClick={close} aria-label="Close settings">×</button></div><p>For durable setup, add keys to <code>.env.local</code> and restart the app. Fields below are optional session-only overrides.</p>
     <div className={`provider-status ${status.image.configured ? "connected" : ""}`}><span>{status.image.configured ? "●" : "○"}</span><div><b>Image generation</b><small>{status.image.configured ? `${status.image.model} · key loaded from .env.local` : "No environment key loaded"}</small></div></div>
-    <label className="field"><span>Image provider</span><select value={provider.kind} onChange={(e)=>chooseImageProvider(e.target.value)}><option value="openai">OpenAI-compatible images API</option><option value="volcengine">Volcengine Ark · Seedream</option><option value="sdwebui">Local Stable Diffusion WebUI</option></select></label><label className="field"><span>Endpoint</span><input value={provider.endpoint} onChange={(e)=>set({endpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model</span><input value={provider.model} placeholder={provider.kind === "volcengine" ? "Ark Seedream model ID" : "Model ID"} onChange={(e)=>set({model:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.apiKey} placeholder={status.image.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({apiKey:e.target.value})}/></label></div><label className="field"><span>Parallel image jobs</span><input type="number" min="1" max="6" step="1" value={provider.imageConcurrency} onChange={(e)=>set({imageConcurrency:Math.max(1,Math.min(6,Number(e.target.value)||1))})}/><small>3 is recommended. Lower this if your provider reports rate limits.</small></label><button className="ghost test-button" onClick={()=>testConnection("image")} disabled={!!testing}>{testing === "image" ? "Testing…" : "Test image provider"}</button>
-    <hr/><div className={`provider-status ${status.video?.configured ? "connected" : ""}`}><span>{status.video?.configured ? "●" : "○"}</span><div><b>Video generation · Volcengine Ark</b><small>{status.video?.configured ? `${status.video.model} · key loaded from .env.local` : "Required to turn storyboard images into video clips"}</small></div></div><label className="field"><span>Video task endpoint</span><input value={provider.videoEndpoint} onChange={(e)=>set({videoEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Seedance model / endpoint ID</span><input value={provider.videoModel} placeholder="doubao-seedance-2-0-260128" onChange={(e)=>set({videoModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.videoApiKey} placeholder={status.video?.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({videoApiKey:e.target.value})}/></label></div><label className="field"><span>Parallel video jobs</span><input type="number" min="1" max="4" step="1" value={provider.videoConcurrency} onChange={(e)=>set({videoConcurrency:Math.max(1,Math.min(4,Number(e.target.value)||1))})}/><small>2 is recommended. Ark video generation is asynchronous and may take several minutes per clip.</small></label><button className="ghost test-button" onClick={()=>testConnection("video")} disabled={!!testing}>{testing === "video" ? "Testing…" : "Test video provider"}</button>
+    <label className="field"><span>Image provider</span><select value={imageProviderChoice} onChange={(e)=>chooseImageProvider(e.target.value)}><option value="openai">OpenAI-compatible images API</option><option value="volcengine">Volcengine Ark · Seedream · pay as you go</option><option value="volcengine-plan">Volcengine Agent Plan · Seedream</option><option value="sdwebui">Local Stable Diffusion WebUI</option></select></label><label className="field"><span>Endpoint or API base URL</span><input value={provider.endpoint} onChange={(e)=>set({endpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model</span><input value={provider.model} placeholder={provider.kind === "volcengine" ? "Ark Seedream model name or ID" : "Model ID"} onChange={(e)=>set({model:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.apiKey} placeholder={status.image.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({apiKey:e.target.value})}/></label></div><label className="field"><span>Parallel image jobs</span><input type="number" min="1" max="6" step="1" value={provider.imageConcurrency} onChange={(e)=>set({imageConcurrency:Math.max(1,Math.min(6,Number(e.target.value)||1))})}/><small>3 is recommended. Lower this if your provider reports rate limits.</small></label><button className="ghost test-button" onClick={()=>testConnection("image")} disabled={!!testing}>{testing === "image" ? "Testing…" : "Test image provider"}</button>
+    <hr/><div className={`provider-status ${status.video?.configured ? "connected" : ""}`}><span>{status.video?.configured ? "●" : "○"}</span><div><b>Video generation · Volcengine Ark</b><small>{status.video?.configured ? `${status.video.model} · key loaded from .env.local` : "Required to turn storyboard images into video clips"}</small></div></div><label className="field"><span>Volcengine video access</span><select value={videoProviderChoice} onChange={(e)=>chooseVideoProvider(e.target.value)}><option value="api">Pay-as-you-go API</option><option value="plan">Agent Plan subscription</option></select></label><label className="field"><span>Video task endpoint or API base URL</span><input value={provider.videoEndpoint} onChange={(e)=>set({videoEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Seedance model / endpoint ID</span><input value={provider.videoModel} placeholder={videoProviderChoice === "plan" ? "doubao-seedance-2.0" : "doubao-seedance-2-0-260128"} onChange={(e)=>set({videoModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.videoApiKey} placeholder={status.video?.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({videoApiKey:e.target.value})}/></label></div><label className="field"><span>Parallel video jobs</span><input type="number" min="1" max="4" step="1" value={provider.videoConcurrency} onChange={(e)=>set({videoConcurrency:Math.max(1,Math.min(4,Number(e.target.value)||1))})}/><small>2 is recommended. Ark video generation is asynchronous and may take several minutes per clip.</small></label><button className="ghost test-button" onClick={()=>testConnection("video")} disabled={!!testing}>{testing === "video" ? "Testing…" : "Test video provider"}</button>
     <hr/><div className="provider-status connected"><span>●</span><div><b>Local speech-to-text</b><small>Audio is sent only to the configured local service.</small></div></div><label className="field"><span>Transcription service URL</span><input value={provider.transcriptionEndpoint} placeholder="http://localhost:8000/v1/transcriptions" onChange={(e)=>set({transcriptionEndpoint:e.target.value})}/></label><label className="field"><span>Audio language</span><input value={provider.transcriptionLanguage} placeholder="en" onChange={(e)=>set({transcriptionLanguage:e.target.value})}/></label>
-    <hr/><div className={`provider-status ${status.text.configured ? "connected" : ""}`}><span>{status.text.configured ? "●" : "○"}</span><div><b>Storyboard and translation provider</b><small>{status.text.configured ? `${status.text.model} · key loaded from .env.local` : "Required for AI planning and translation"}</small></div></div><label className="field"><span>Text provider</span><select value={provider.textKind} onChange={(e)=>chooseTextProvider(e.target.value)}><option value="openai">OpenAI-compatible chat API</option><option value="volcengine">Volcengine Ark · Doubao</option></select></label><label className="field"><span>Chat completions endpoint</span><input value={provider.textEndpoint} onChange={(e)=>set({textEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model / endpoint ID</span><input value={provider.textModel} placeholder={provider.textKind === "volcengine" ? "Enter an activated Ark model or ep-… ID" : "Model ID"} onChange={(e)=>set({textModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.textApiKey} placeholder={status.text.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({textApiKey:e.target.value})}/></label></div><button className="ghost test-button" onClick={()=>testConnection("text")} disabled={!!testing}>{testing === "text" ? "Testing…" : "Test storyboard provider"}</button>{testResult&&<div className="connection-result" role="status">{testResult}</div>}<button className="primary full" onClick={close}>Save session settings</button></div></div>;
+    <hr/><div className={`provider-status ${status.text.configured ? "connected" : ""}`}><span>{status.text.configured ? "●" : "○"}</span><div><b>Storyboard and translation provider</b><small>{status.text.configured ? `${status.text.model} · key loaded from .env.local` : "Required for AI planning and translation"}</small></div></div><label className="field"><span>Text provider</span><select value={textProviderChoice} onChange={(e)=>chooseTextProvider(e.target.value)}><option value="openai">OpenAI-compatible chat API</option><option value="volcengine">Volcengine Ark · Doubao · pay as you go</option><option value="volcengine-plan">Volcengine Agent Plan · OpenAI-compatible chat</option></select></label><label className="field"><span>Chat endpoint or API base URL</span><input value={provider.textEndpoint} onChange={(e)=>set({textEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model / endpoint ID</span><input value={provider.textModel} placeholder={textProviderChoice === "volcengine-plan" ? "ark-code-latest" : provider.textKind === "volcengine" ? "Enter an activated Ark model or ep-… ID" : "Model ID"} onChange={(e)=>set({textModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.textApiKey} placeholder={status.text.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({textApiKey:e.target.value})}/></label></div><button className="ghost test-button" onClick={()=>testConnection("text")} disabled={!!testing}>{testing === "text" ? "Testing…" : "Test storyboard provider"}</button>{testResult&&<div className="connection-result" role="status">{testResult}</div>}<button className="primary full" onClick={close}>Save session settings</button></div></div>;
 }

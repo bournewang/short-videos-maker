@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { formatTime, normalizePlannedShots } from "../app/lib/timeline.js";
+import { formatTime, normalizePlannedShots, scriptSectionForDuration } from "../app/lib/timeline.js";
 
 test("AI shot timing is normalized to the narration duration", () => {
   const shots = normalizePlannedShots([
@@ -47,6 +47,20 @@ test("word timestamps place shot changes inside real pauses", () => {
   assert.equal(shots[0].end, 3.5);
   assert.equal(shots[1].start, 3.5);
   assert.equal(shots[1].end, 8);
+});
+
+test("the storyboard script section follows the selected shot time range", () => {
+  const script = "One two, three four five.";
+  const transcription = { segments:[{ start:0, end:5, text:script, words:[
+    { start:0, end:.8, word:"One" }, { start:1, end:1.8, word:"two" }, { start:2, end:2.8, word:"three" },
+    { start:3, end:3.8, word:"four" }, { start:4, end:4.8, word:"five" },
+  ] }] };
+  assert.equal(scriptSectionForDuration(script, transcription, 1.9, 4, 5), "three four");
+  assert.equal(scriptSectionForDuration(script, transcription, 5, 6, 6), "");
+});
+
+test("the storyboard script section falls back to proportional script words", () => {
+  assert.equal(scriptSectionForDuration("one two three four five six", null, 2, 4, 6), "three four");
 });
 
 test("invalid AI plans are rejected", () => {

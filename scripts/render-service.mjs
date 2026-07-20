@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizePlannedShots } from "../app/lib/timeline.js";
+import { normalizeScreenRatio, promptForScreenRatio } from "../app/lib/video.js";
 import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -112,6 +113,7 @@ function resolveVideoProvider(data = {}) {
     image:data.image,
     motion:data.motion,
     duration:data.duration,
+    screenRatio:data.screenRatio,
   };
 }
 
@@ -125,6 +127,7 @@ function resolveImageProvider(data = {}) {
     model:data.model || configured.model,
     apiKey:data.apiKey || configured.apiKey,
     prompt:data.prompt,
+    screenRatio:data.screenRatio,
   };
 }
 
@@ -141,6 +144,7 @@ function resolveTextProvider(data = {}) {
     contentFormat: data.contentFormat,
     visualStyle: data.visualStyle,
     creativeDirection: data.creativeDirection,
+    screenRatio: data.screenRatio,
     audioDuration: data.audioDuration,
     transcription: data.transcription,
   };
@@ -315,6 +319,28 @@ function subtitles(shots, width, height) {
   return header + shots.map((shot) => `Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Main,,0,0,0,,${assText(shot.narration)}\\N{\\c&H9FD7F2&}${assText(shot.chinese)}`).join("\n");
 }
 
+// Ken Burns-style motion for still shots. The zoom ramps across the whole shot
+// (never resets mid-clip) and the source is supersampled 3x before zoompan so
+// the crop window moves in sub-output-pixel steps (no jitter).
+export function stillMotionFilter(motion, width, height, duration, index = 0) {
+  const frames = Math.max(1, Math.round((Number(duration) || 2) * 30));
+  const hiRes = `scale=${width * 3}:${height * 3}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709,crop=${width * 3}:${height * 3}`;
+  const kinds = { "Slow push-in":"push", "Slow pull-out":"pull", "Slow drift":"drift", "Slow rise":"rise", "Slow sink":"sink", "Diagonal drift":"diagonal", "Push to subject":"push-subject", "Static":"static" };
+  const rotation = ["push", "drift", "pull", "rise", "sink", "diagonal"];
+  const kind = kinds[motion] || rotation[index % rotation.length];
+  const cx = "iw/2-(iw/zoom/2)"; const cy = "ih/2-(ih/zoom/2)";
+  let zoom = "1.12"; let x = cx; let y = cy;
+  if (kind === "push") zoom = `1+0.14*on/${frames}`;
+  else if (kind === "pull") zoom = `1.14-0.14*on/${frames}`;
+  else if (kind === "drift") x = index % 2 ? `(iw-iw/zoom)*(1-on/${frames})` : `(iw-iw/zoom)*on/${frames}`;
+  else if (kind === "rise") y = `(ih-ih/zoom)*on/${frames}`;
+  else if (kind === "sink") y = `(ih-ih/zoom)*(1-on/${frames})`;
+  else if (kind === "diagonal") { x = index % 2 ? `(iw-iw/zoom)*(1-on/${frames})` : `(iw-iw/zoom)*on/${frames}`; y = `(ih-ih/zoom)*on/${frames}`; }
+  else if (kind === "push-subject") { zoom = `1+0.16*on/${frames}`; y = "(ih-ih/zoom)/3"; }
+  else zoom = `1+0.04*on/${frames}`;
+  return `${hiRes},zoompan=z='${zoom}':x='${x}':y='${y}':d=1:s=${width}x${height}:fps=30,setsar=1,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709`;
+}
+
 export async function renderEpisode(payload, options = {}) {
   if (!Array.isArray(payload.shots) || !payload.shots.length) throw new Error("At least one shot is required");
   if (payload.shots.length > 80) throw new Error("The MVP supports up to 80 shots per episode");
@@ -335,7 +361,7 @@ export async function renderEpisode(payload, options = {}) {
     if (payload.shots[i].video) {
       await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
     } else {
-      const stillMotion = `${scale},zoompan=z='1+0.00025*mod(on,120)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=${width}x${height}:fps=30,${normalizedFormat}`;
+      const stillMotion = stillMotionFilter(payload.shots[i].motion, width, height, duration, i);
       await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
     }
     shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment }); cursor += duration;
@@ -377,24 +403,42 @@ export async function generateImage(data, options = {}) {
   if (!data.endpoint) throw new Error("Provider endpoint is required");
   if (!data.model && data.kind !== "sdwebui") throw new Error("Provider model or endpoint ID is required");
   const fetchImpl = options.fetchImpl || fetch;
+  const screenRatio = normalizeScreenRatio(data.screenRatio);
+  const prompt = promptForScreenRatio(data.prompt, screenRatio);
+  const sdSize = screenRatio === "16:9" ? { width:1344, height:768 } : screenRatio === "1:1" ? { width:1024, height:1024 } : { width:768, height:1344 };
   if (data.kind === "sdwebui") {
     const endpoint = data.endpoint.includes("txt2img") ? data.endpoint : `${data.endpoint.replace(/\/$/,"")}/sdapi/v1/txt2img`;
-    const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ prompt:data.prompt, negative_prompt:"text, watermark, logo, low quality, distorted anatomy, duplicate subjects", width:768, height:1344, steps:28 }) });
+    const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ prompt, negative_prompt:"text, watermark, logo, low quality, distorted anatomy, duplicate subjects", ...sdSize, steps:28 }) });
     const result = await response.json(); if (!response.ok) throw new Error(result.error || `Provider returned ${response.status}`); if (!result.images?.[0]) throw new Error("Provider returned no image");
     return `data:image/png;base64,${result.images[0]}`;
   }
+  const volcengineSize = screenRatio === "16:9" ? "2560x1440" : screenRatio === "1:1" ? "1920x1920" : "1440x2560";
+  const openaiSize = screenRatio === "16:9" ? "1536x1024" : screenRatio === "1:1" ? "1024x1024" : "1024x1536";
   const requestBody = data.kind === "volcengine"
-    ? { model:data.model, prompt:data.prompt, size:"1440x2560", response_format:"url", watermark:false }
-    : { model:data.model, prompt:data.prompt, size:"1024x1536", n:1, response_format:"b64_json" };
-  const response = await fetchImpl(data.endpoint, { method:"POST", headers:{"Content-Type":"application/json",...(data.apiKey?{Authorization:`Bearer ${data.apiKey}`}:{})}, body:JSON.stringify(requestBody) });
+    ? { model:data.model, prompt, size:volcengineSize, response_format:"url", watermark:false }
+    : { model:data.model, prompt, size:openaiSize, n:1, response_format:"b64_json" };
+  const endpoint = data.kind === "volcengine" ? providerEndpoint(data.endpoint, "images/generations") : data.endpoint;
+  const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json",...(data.apiKey?{Authorization:`Bearer ${data.apiKey}`}:{})}, body:JSON.stringify(requestBody) });
   const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); const item = result.data?.[0]; if (!item) throw new Error("Provider returned no image");
   return item.b64_json ? `data:image/png;base64,${item.b64_json}` : item.url;
 }
 
-function videoTasksEndpoint(endpoint) {
-  const base = String(endpoint || "").replace(/\/$/, "");
+function providerEndpoint(endpoint, pathSuffix) {
+  const base = String(endpoint || "").replace(/\/+$/, "");
   if (!base) return "";
-  return /\/contents\/generations\/tasks$/.test(base) ? base : `${base}/contents/generations/tasks`;
+  return base.endsWith(`/${pathSuffix}`) ? base : `${base}/${pathSuffix}`;
+}
+
+function videoTasksEndpoint(endpoint) {
+  return providerEndpoint(endpoint, "contents/generations/tasks");
+}
+
+function textCompletionsEndpoint(endpoint) {
+  return providerEndpoint(endpoint, "chat/completions");
+}
+
+function isVolcenginePlanEndpoint(endpoint) {
+  return /\/api\/plan\/v3(?:\/|$)/.test(String(endpoint || ""));
 }
 
 function providerError(result, status) {
@@ -410,11 +454,12 @@ export async function generateVideo(data, options = {}) {
   const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || Number(process.env.VIDEO_POLL_INTERVAL_MS) || 5000);
   const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.VIDEO_REQUEST_TIMEOUT_MS) || 15 * 60 * 1000);
   const endpoint = videoTasksEndpoint(data.endpoint);
-  const duration = Math.max(2, Math.min(15, Math.ceil(Number(data.duration) || 5)));
+  const screenRatio = normalizeScreenRatio(data.screenRatio);
+  const duration = Math.max(2, Math.min(12, Math.ceil(Number(data.duration) || 5)));
   const image = await providerImageUrl(data.image);
   const direction = String(data.motion || "Slow push-in").trim();
-  const motionPrompt = String(data.videoPrompt || data.prompt || "Animate this storyboard frame naturally with coherent subject and environmental motion").trim();
-  const prompt = `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects. --ratio 9:16 --dur ${duration} --resolution 720p --generate_audio false --watermark false`;
+  const motionPrompt = promptForScreenRatio(data.videoPrompt || data.prompt || "Animate this storyboard frame naturally with coherent subject and environmental motion", screenRatio);
+  const prompt = `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects.`;
   const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
   const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
     model:data.model,
@@ -422,6 +467,11 @@ export async function generateVideo(data, options = {}) {
       { type:"text", text:prompt },
       { type:"image_url", image_url:{ url:image }, role:"first_frame" },
     ],
+    duration,
+    ratio:screenRatio,
+    resolution:"720p",
+    generate_audio:false,
+    watermark:false,
   }) });
   const created = await createdResponse.json();
   if (!createdResponse.ok) throw new Error(providerError(created, createdResponse.status));
@@ -448,8 +498,13 @@ export async function completeText(data, messages, options = {}) {
   if (!data.endpoint || !data.apiKey || !data.model) throw new Error("Text endpoint, API key, and model or endpoint ID are required");
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.TEXT_REQUEST_TIMEOUT_MS) || 120000);
-  const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${data.apiKey}`}, body:JSON.stringify({ model:data.model, temperature:options.temperature ?? .2, max_tokens:options.maxTokens ?? 8000, response_format:{type:"json_object"}, ...(data.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages }) };
-  const callProvider = () => fetchImpl(data.endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
+  const endpoint = data.kind === "volcengine" ? textCompletionsEndpoint(data.endpoint) : data.endpoint;
+  const requestedMaxTokens = Number(options.maxTokens);
+  const payload = data.kind === "volcengine" && isVolcenginePlanEndpoint(endpoint)
+    ? { model:data.model, messages, ...(Number.isFinite(requestedMaxTokens) && requestedMaxTokens > 0 ? { max_tokens:Math.floor(requestedMaxTokens) } : {}) }
+    : { model:data.model, temperature:options.temperature ?? .2, max_tokens:options.maxTokens ?? 8000, response_format:{type:"json_object"}, ...(data.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages };
+  const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${data.apiKey}`}, body:JSON.stringify(payload) };
+  const callProvider = () => fetchImpl(endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
   let response;
   try { response = await callProvider(); }
   catch (error) {
@@ -469,24 +524,48 @@ export async function completeText(data, messages, options = {}) {
   return result.choices?.[0]?.message?.content || "{}";
 }
 
+function parseProviderJson(raw) {
+  let source = String(raw || "").trim();
+  source = source.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+  const objectStart = source.indexOf("{");
+  const objectEnd = source.lastIndexOf("}");
+  if (objectStart >= 0) source = objectEnd > objectStart ? source.slice(objectStart, objectEnd + 1) : source.slice(objectStart);
+  return JSON.parse(source);
+}
+
+async function parseOrRepairProviderJson(raw, config, options, expectedShape) {
+  try { return parseProviderJson(raw); }
+  catch (initialError) {
+    const repaired = await completeText(config, [
+      { role:"system", content:`Repair malformed or truncated JSON. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation. Preserve the supplied schema and all complete data. Escape quotes, backslashes, and line breaks inside strings. If the input ends in an incomplete trailing array item, discard only that item and close the remaining arrays and objects. The required top-level shape is ${expectedShape}.` },
+      { role:"user", content:String(raw || "") },
+    ], { temperature:0, maxTokens:8000, fetchImpl:options.fetchImpl });
+    try { return parseProviderJson(repaired); }
+    catch (repairError) {
+      throw new Error(`Text provider returned invalid JSON (${initialError.message}); automatic repair also failed (${repairError.message})`);
+    }
+  }
+}
+
 async function translate(data) {
   if (!Array.isArray(data.lines)) throw new Error("Subtitle lines are required");
-  const raw = await completeText(data, [{role:"system",content:"Translate English short-video subtitles into concise, natural Simplified Chinese. Preserve names, numbers, dates, tone, and factual meaning. Return only JSON with a translations array in the same order."},{role:"user",content:JSON.stringify({lines:data.lines})}], { temperature:.2 });
-  const parsed = JSON.parse(raw.replace(/^```json\s*|\s*```$/g,"")); if (!Array.isArray(parsed.translations)) throw new Error("Translation provider returned an unexpected format"); return parsed.translations;
+  const raw = await completeText(data, [{role:"system",content:"Translate English short-video subtitles into concise, natural Simplified Chinese. Preserve names, numbers, dates, tone, and factual meaning. Return one compact RFC 8259 JSON object with a translations array in the same order. Do not use Markdown. Escape all quotes, backslashes, and line breaks inside strings."},{role:"user",content:JSON.stringify({lines:data.lines})}], { temperature:.2, maxTokens:8000 });
+  const parsed = await parseOrRepairProviderJson(raw, resolveTextProvider(data), {}, "an object with a translations array"); if (!Array.isArray(parsed.translations)) throw new Error("Translation provider returned an unexpected format"); return parsed.translations;
 }
 
 export async function planEpisode(data, options = {}) {
   const config = resolveTextProvider(data);
   if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
   if (!String(config.script || "").trim()) throw new Error("A script is required");
-  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return JSON only with a shots array. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 45 words, faithful to the narration, content format, visual style, and creative direction, with subject, setting, composition, lighting, vertical 9:16 framing, subtitle-safe lower area, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (Slow push-in, Slow drift, or Static). The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 45 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, subtitle-safe lower area, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
   const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
   const minimumShotCount = narrationDuration ? Math.ceil(narrationDuration / 4) : null;
   const targetShotCount = narrationDuration ? Math.ceil(narrationDuration / 3.3) : null;
-  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, fetchImpl:options.fetchImpl });
-  const parsed = JSON.parse(raw.replace(/^```json\s*|\s*```$/g,""));
-  return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, transcription:config.transcription });
+  const screenRatio = normalizeScreenRatio(config.screenRatio);
+  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
+  const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a shots array");
+  return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, screenRatio, transcription:config.transcription });
 }
 
 function modelsEndpoint(endpoint, kind) {
@@ -494,17 +573,27 @@ function modelsEndpoint(endpoint, kind) {
     const base = endpoint.replace(/\/sdapi\/v1\/txt2img\/?$/, "").replace(/\/$/, "");
     return `${base}/sdapi/v1/sd-models`;
   }
-  return endpoint.replace(/\/(images\/generations|chat\/completions|contents\/generations\/tasks)\/?$/, "/models");
+  const base = String(endpoint || "").replace(/\/+$/, "");
+  if (/\/models$/.test(base)) return base;
+  if (/\/(images\/generations|chat\/completions|contents\/generations\/tasks)$/.test(base)) return base.replace(/\/(images\/generations|chat\/completions|contents\/generations\/tasks)$/, "/models");
+  return `${base}/models`;
 }
 
-async function testProviderConnection(data) {
+export async function testProviderConnection(data, options = {}) {
   const target = data.target === "text" ? "text" : data.target === "video" ? "video" : "image";
   const config = target === "text" ? resolveTextProvider(data) : target === "video" ? resolveVideoProvider(data) : resolveImageProvider(data);
   if (!config.endpoint) throw new Error("Provider endpoint is required");
   if (target === "text" && !config.apiKey) throw new Error("No translation API key is configured");
   if (target === "video" && !config.apiKey) throw new Error("No video API key is configured");
   if (target === "image" && config.kind !== "sdwebui" && !config.apiKey) throw new Error("No image API key is configured");
-  const response = await fetch(modelsEndpoint(config.endpoint, config.kind), { headers: config.apiKey ? { Authorization:`Bearer ${config.apiKey}` } : {} });
+  const fetchImpl = options.fetchImpl || fetch;
+  const planText = target === "text" && config.kind === "volcengine" && isVolcenginePlanEndpoint(config.endpoint);
+  const endpoint = planText ? textCompletionsEndpoint(config.endpoint) : target === "video" ? `${videoTasksEndpoint(config.endpoint)}?page_num=1&page_size=1` : modelsEndpoint(config.endpoint, config.kind);
+  const response = await fetchImpl(endpoint, planText ? {
+    method:"POST",
+    headers:{ "Content-Type":"application/json", Authorization:`Bearer ${config.apiKey}` },
+    body:JSON.stringify({ model:config.model, messages:[{ role:"user", content:"Reply with OK." }] }),
+  } : { headers: config.apiKey ? { Authorization:`Bearer ${config.apiKey}` } : {} });
   if (!response.ok) {
     let detail = "";
     try { const result = await response.json(); detail = result.error?.message || result.error || result.message || ""; } catch { /* status is enough */ }
