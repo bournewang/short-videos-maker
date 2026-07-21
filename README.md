@@ -14,7 +14,7 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The command starts both the editor and its local rendering/provider bridge. Episode data and inspectable intermediate state are saved in browser storage. Generated provider images are copied into `.shortform/assets/`, and completed exports are written under `.shortform/exports/`.
+Open [http://localhost:3000](http://localhost:3000). The command starts both the editor and its local rendering/provider bridge. Episode data and inspectable intermediate state are saved in browser storage. Use **Episodes** to reopen or delete earlier local episodes; creating a new episode keeps the existing history. Generated provider images are copied into `.shortform/assets/`, and completed exports are written under `.shortform/exports/`.
 
 The local rendering bridge runs in Node watch mode during development. Changes to audio processing or server routes automatically restart port `4317`; after pulling older code or changing the startup script itself, restart `npm run dev` once.
 
@@ -50,7 +50,7 @@ For a subscribed **Volcengine Agent Plan**, select the Agent Plan preset in Prov
 
 1. In **Episode**, paste a script and upload narration. The app transcribes the audio locally, then uses those timings when the configured AI provider plans the storyboard.
 2. In **Storyboard**, review AI-generated timing, bilingual lines, separate image and video prompts, generate the real images, then choose **Animate all shots** to create Volcengine video clips. The animation request uses the motion-specific prompt planned during **Analyze with AI**, with the generated image as its exact first frame.
-3. In **Audio & captions**, edit English and Chinese lines and optionally upload a licensed BGM track.
+3. In **Storyboard**, customize subtitle font, size, colors, alignment, position, background, and outline against the live shot preview. In **Audio & captions**, edit English and Chinese lines and optionally choose a licensed BGM track.
 4. In **Export**, normalize and concatenate generated clips in storyboard order, mix narration/BGM, burn captions, and render the finished H.264 MP4 locally. Shots without a generated clip retain the subtle still-image motion fallback.
 
 Provider settings supports OpenAI-compatible images, Volcengine Ark Seedream and Seedance, and local Stable Diffusion WebUI. Storyboard planning and translation support OpenAI-compatible chat APIs and Volcengine Ark Doubao. Session keys remain in memory; environment keys stay inside the local provider bridge. Export requires recorded narration and at least one generated visual asset for every shot.

@@ -3,7 +3,8 @@
 
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
-import { clearProjectCache, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
+import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
+import { DEFAULT_SUBTITLE_STYLE, SUBTITLE_FONTS, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
 import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution } from "./lib/video";
 
@@ -11,7 +12,8 @@ type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
   type: string; narration: string; chinese: string; prompt: string; videoPrompt: string; status: string;
   locked: boolean; image: string; variants: string[]; provider: string; seed: string; motion: string;
-  video: string; videoStatus: string; videoProvider: string;
+  imageStatus: string; imageError: string;
+  video: string; videoStatus: string; videoError: string; videoProvider: string;
 };
 
 type ProviderSettings = {
@@ -24,6 +26,12 @@ type ProviderSettings = {
 type Transcription = {
   text:string; language:string; languageProbability:number | null; duration:number; durationAfterVad:number;
   segments:Array<{ id:number; start:number; end:number; text:string; words:Array<{ start:number; end:number; word:string; probability:number | null }> }>;
+};
+
+type SubtitleStyle = ReturnType<typeof normalizeSubtitleStyle>;
+
+type EpisodeSummary = {
+  id:string; title:string; savedAt:number; shotCount:number; duration:number; hasNarration:boolean; stage:string;
 };
 
 type ProviderStatus = {
@@ -61,6 +69,7 @@ function readAudioDuration(file: File): Promise<number> {
 }
 
 export default function StudioApp() {
+  const [episodeId, setEpisodeId] = useState(() => createEpisodeId());
   const [stage, setStage] = useState("episode");
   const [title, setTitle] = useState("");
   const [script, setScript] = useState("");
@@ -76,7 +85,11 @@ export default function StudioApp() {
   const [transcription, setTranscription] = useState<Transcription | null>(null);
   const [bgm, setBgm] = useState("");
   const [bgmVolume, setBgmVolume] = useState(8);
+  const [subtitleStyle, setSubtitleStyle] = useState<SubtitleStyle>(() => normalizeSubtitleStyle());
   const [mode, setMode] = useState("Review then batch");
+  const [episodesOpen, setEpisodesOpen] = useState(false);
+  const [episodeHistory, setEpisodeHistory] = useState<EpisodeSummary[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("Ready");
@@ -100,22 +113,43 @@ export default function StudioApp() {
   const allowSave = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cacheEpoch = useRef(0);
+  const episodeIdRef = useRef(episodeId);
   const activeManualVideoIds = useRef(new Set<string>());
   const [activeManualVideoCount, setActiveManualVideoCount] = useState(0);
   const activeManualImageIds = useRef(new Set<string>());
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, downloadResolution, screenRatio, ...overrides };
   }
 
   function persistProject(snapshot = projectSnapshot()) {
     const epoch = cacheEpoch.current;
     try {
-      const safeShots = (snapshot.shots as Shot[] || []).map((shot) => ({ ...shot, image:"", variants:[], video:"", videoStatus:"idle", status:shot.status === "generated" ? "planned" : shot.status }));
+      const safeShots = (snapshot.shots as Shot[] || []).map((shot) => ({ ...shot, image:"", variants:[], imageStatus:"idle", imageError:"", video:"", videoStatus:"idle", videoError:"", status:shot.status === "generated" ? "planned" : shot.status }));
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...snapshot, audioData:"", previewUrl:"", downloadUrl:"", shots:safeShots }));
     } catch { /* IndexedDB remains the primary local cache */ }
-    void writeProjectCache(snapshot).then(() => { if (epoch !== cacheEpoch.current) void clearProjectCache().catch(() => {}); }).catch(() => { /* lightweight localStorage fallback is already saved */ });
+    return writeProjectCache(snapshot).then(() => {
+      if (epoch !== cacheEpoch.current) return activateProjectCache(episodeIdRef.current);
+    }).catch(() => { /* lightweight localStorage fallback is already saved */ });
+  }
+
+  function applyProjectState(parsed:any, recoveryMessage = "") {
+    const id = String(parsed.id || "").trim() && parsed.id !== "legacy-active" ? String(parsed.id) : createEpisodeId();
+    episodeIdRef.current = id; setEpisodeId(id);
+    allowSave.current = true;
+    setTitle(parsed.title || ""); setScript(parsed.script || "");
+    setContentFormat(parsed.contentFormat || "Documentary"); setVisualStyle(parsed.visualStyle || "Photorealistic");
+    setCreativeDirection(parsed.creativeDirection || ""); setShots(parsed.shots || []); setSelectedId(parsed.shots?.[0]?.id || "");
+    setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
+    const savedBgmVolume = Number(parsed.bgmVolume);
+    setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || "Review then batch"); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
+    setSubtitleStyle(normalizeSubtitleStyle(parsed.subtitleStyle));
+    setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(normalizeScreenRatio(parsed.screenRatio));
+    setStage(["episode","storyboard","captions","export"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
+    if (recoveryMessage) setMessage(recoveryMessage);
+    if (id !== parsed.id) void writeProjectCache({ ...parsed, id }).catch(() => {});
+    return id;
   }
 
   useEffect(() => {
@@ -133,16 +167,7 @@ export default function StudioApp() {
       if (cancelled) return;
       initialized.current = true;
       if (parsed) {
-        allowSave.current = true;
-        setTitle(parsed.title || ""); setScript(parsed.script || "");
-        setContentFormat(parsed.contentFormat || contentFormat); setVisualStyle(parsed.visualStyle || visualStyle);
-        setCreativeDirection(parsed.creativeDirection || ""); setShots(parsed.shots || []); setSelectedId(parsed.selectedId || parsed.shots?.[0]?.id || "");
-        setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
-        const savedBgmVolume = Number(parsed.bgmVolume);
-        setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || mode); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
-        setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(normalizeScreenRatio(parsed.screenRatio));
-        setStage(["episode","storyboard","captions","export"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
-        setMessage(`Recovered locally saved episode · ${parsed.shots?.length || 0} shots.`);
+        applyProjectState(parsed, `Recovered locally saved episode · ${parsed.shots?.length || 0} shots.`);
       }
     })();
     return () => { cancelled = true; };
@@ -153,7 +178,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, mode, previewUrl, downloadUrl, downloadResolution, screenRatio]);
+  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, downloadResolution, screenRatio]);
 
   async function refreshProviderStatus() {
     try {
@@ -176,14 +201,57 @@ export default function StudioApp() {
 
   function touchProject() { allowSave.current = true; }
 
-  function newEpisode() {
+  function goToStage(nextStage:string) {
+    if (nextStage === "storyboard" && stage !== "storyboard") setSelectedId(shots[0]?.id || "");
+    setStage(nextStage);
+  }
+
+  async function refreshEpisodeHistory() {
+    setHistoryLoading(true);
+    try { setEpisodeHistory(await listProjectCaches() as EpisodeSummary[]); }
+    catch { setMessage("Could not read the local episode library."); }
+    finally { setHistoryLoading(false); }
+  }
+
+  async function openEpisodeLibrary() {
+    setEpisodesOpen(true);
+    if (allowSave.current) await persistProject();
+    await refreshEpisodeHistory();
+  }
+
+  async function newEpisode(keepCurrent = true) {
+    if (keepCurrent && allowSave.current) await persistProject();
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    localStorage.removeItem("chronicle-studio-project"); localStorage.removeItem("chronicle-studio-project-v2"); localStorage.removeItem("chronicle-studio-project-v3"); localStorage.removeItem(STORAGE_KEY);
-    void clearProjectCache().catch(() => {});
-    allowSave.current = false; setTitle(""); setScript(""); setContentFormat("Documentary"); setVisualStyle("Photorealistic"); setCreativeDirection(""); setShots([]); setSelectedId("");
-    setAudioName(""); setAudioData(""); setAudioDuration(0); setDenoiseNarration(true); setTranscription(null); setBgm(""); setBgmVolume(8); setPreviewUrl(""); setDownloadUrl(""); setScreenRatio("9:16");
-    setMode("Review then batch"); setStage("episode"); setMessage("New empty episode created.");
+    const id = createEpisodeId();
+    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), mode:"Review then batch", previewUrl:"", downloadUrl:"", downloadResolution:"1080", screenRatio:"9:16" };
+    applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
+    setEpisodesOpen(false);
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* IndexedDB is the primary cache */ }
+    await writeProjectCache(blank).catch(() => {});
+  }
+
+  async function openSavedEpisode(id:string) {
+    if (id === episodeId) { setEpisodesOpen(false); return; }
+    if (allowSave.current) await persistProject();
+    const parsed = await readProjectCache(id).catch(() => null);
+    if (!parsed) { setMessage("That saved episode could not be opened."); await refreshEpisodeHistory(); return; }
+    cacheEpoch.current += 1;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    applyProjectState(parsed, `Opened ${parsed.title || "Untitled episode"} · ${parsed.shots?.length || 0} shots.`);
+    await activateProjectCache(id).catch(() => {});
+    setEpisodesOpen(false);
+  }
+
+  async function removeSavedEpisode(summary:EpisodeSummary) {
+    if (!window.confirm(`Delete “${summary.title}” from this device? This cannot be undone.`)) return;
+    cacheEpoch.current += 1;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    const deleted = await deleteProjectCache(summary.id).then(() => true).catch(() => { setMessage("Could not delete the saved episode."); return false; });
+    if (!deleted) return;
+    if (summary.id === episodeId) { await newEpisode(false); return; }
+    setMessage(`${summary.title} deleted from local history.`);
+    await refreshEpisodeHistory();
   }
 
   async function analyze() {
@@ -195,7 +263,7 @@ export default function StudioApp() {
     try {
       const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey, script, contentFormat, visualStyle, creativeDirection, screenRatio, audioDuration, transcription }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Planning failed");
-      const planned:Shot[] = data.shots.map((shot:Partial<Shot>, index:number) => ({ ...shot, id:`shot-${Date.now()}-${index}`, index, status:"planned", locked:false, image:"", variants:[], provider:"", seed:"", video:"", videoStatus:"idle", videoProvider:"" })) as Shot[];
+      const planned:Shot[] = data.shots.map((shot:Partial<Shot>, index:number) => ({ ...shot, id:`shot-${Date.now()}-${index}`, index, status:"planned", locked:false, image:"", variants:[], imageStatus:"idle", imageError:"", provider:"", seed:"", video:"", videoStatus:"idle", videoError:"", videoProvider:"" })) as Shot[];
       persistProject(projectSnapshot({ shots:planned, selectedId:planned[0]?.id || "", stage:"storyboard", previewUrl:"", downloadUrl:"" }));
       setPreviewUrl(""); setDownloadUrl("");
       setShots(planned); setSelectedId(planned[0]?.id || ""); setStage("storyboard");
@@ -256,21 +324,27 @@ export default function StudioApp() {
     setMessage(path ? `${track?.label || "Background music"} selected.` : "Background music disabled.");
   }
 
+  function changeSubtitleStyle(patch:Partial<SubtitleStyle> | SubtitleStyle) {
+    touchProject(); setPreviewUrl(""); setDownloadUrl("");
+    setSubtitleStyle((current) => normalizeSubtitleStyle({ ...current, ...patch }));
+  }
+
   function imageProviderReady() {
     if (provider.kind === "sdwebui" || provider.apiKey || providerStatus.image.configured) return true;
     setMessage("Configure an image AI provider before generating shots."); setSettingsOpen(true); return false;
   }
 
   async function requestShotImage(shot: Shot) {
-    updateShot(shot.id, { status:"generating" });
+    updateShot(shot.id, { status:"generating", imageStatus:"generating", imageError:"" });
     try {
       const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt: shot.prompt, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
-      updateShot(shot.id, { image, variants: [...shot.variants, image], status:"generated", provider:provider.model, video:"", videoStatus:"idle", videoProvider:"" });
+      updateShot(shot.id, { image, variants: [...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" });
       return { ok:true, shot };
     } catch (error) {
-      updateShot(shot.id, { status:"planned" });
-      return { ok:false, shot, error:error instanceof Error ? error.message : "Generation failed" };
+      const reason = error instanceof Error ? error.message : "Generation failed";
+      updateShot(shot.id, { status:"planned", imageStatus:"failed", imageError:reason });
+      return { ok:false, shot, error:reason };
     }
   }
 
@@ -301,6 +375,8 @@ export default function StudioApp() {
     const concurrency = Math.max(1, Math.min(6, Math.floor(provider.imageConcurrency) || 3));
     const workerCount = Math.min(concurrency, pending.length);
     const failures: string[] = [];
+    const pendingIds = new Set(pending.map((shot) => shot.id));
+    setShots((current) => current.map((shot) => pendingIds.has(shot.id) ? { ...shot, imageStatus:"queued", imageError:"" } : shot));
     setBusy(`Generating images · 0/${pending.length} · ${workerCount} parallel`);
     try {
       await mapWithConcurrency(pending, concurrency, async (shot:Shot) => {
@@ -345,15 +421,16 @@ export default function StudioApp() {
 
   async function requestShotVideo(shot:Shot) {
     if (!shot.image) return { ok:false, shot, error:"Generate the storyboard image first" };
-    updateShot(shot.id, { videoStatus:"generating" });
+    updateShot(shot.id, { videoStatus:"generating", videoError:"" });
     try {
       const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, videoPrompt:shot.videoPrompt, image:shot.image, motion:shot.motion, duration:shot.duration, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Video generation failed");
-      updateShot(shot.id, { video:data.video, videoStatus:"generated", videoProvider:provider.videoModel });
+      updateShot(shot.id, { video:data.video, videoStatus:"generated", videoError:"", videoProvider:provider.videoModel });
       return { ok:true, shot };
     } catch (error) {
-      updateShot(shot.id, { videoStatus:"idle" });
-      return { ok:false, shot, error:error instanceof Error ? error.message : "Video generation failed" };
+      const reason = error instanceof Error ? error.message : "Video generation failed";
+      updateShot(shot.id, { videoStatus:"failed", videoError:reason });
+      return { ok:false, shot, error:reason };
     }
   }
 
@@ -387,6 +464,8 @@ export default function StudioApp() {
     touchProject();
     const concurrency = Math.max(1, Math.min(4, Math.floor(provider.videoConcurrency) || 2));
     const failures:string[] = [];
+    const pendingIds = new Set(pending.map((shot) => shot.id));
+    setShots((current) => current.map((shot) => pendingIds.has(shot.id) ? { ...shot, videoStatus:"queued", videoError:"" } : shot));
     setBusy(`Animating clips · 0/${pending.length} · Volcengine may take several minutes`);
     try {
       await mapWithConcurrency(pending, concurrency, async (shot:Shot) => {
@@ -415,28 +494,23 @@ export default function StudioApp() {
     finally { setBusy(""); }
   }
 
-  async function renderVideo(target:"preview" | "download", resolution:string) {
+  async function renderVideo(resolution:string) {
     if (!audioData) { setMessage("Upload the recorded narration before building the video."); setStage("episode"); return; }
     if (!shots.length) { setMessage("Analyze the script before building the video."); setStage("episode"); return; }
-    if (shots.some((shot) => !shot.image && !shot.video)) { setMessage("Generate a visual asset for every storyboard shot before building the video."); setStage("storyboard"); return; }
+    if (shots.some((shot) => !shot.image)) { setMessage("Generate an image for every storyboard shot before building the video. Animated clips are optional."); goToStage("storyboard"); return; }
     const preset = videoResolution(resolution, screenRatio);
-    if (target === "preview") setPreviewUrl(""); else setDownloadUrl("");
-    setBusy(`Rendering ${preset.label} ${target}`);
+    setPreviewUrl(""); setDownloadUrl("");
+    setBusy(`Building ${preset.label} video`);
     try {
-      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, shots, narrationData: audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, width:preset.width, height:preset.height }) });
+      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, shots, narrationData: audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, width:preset.width, height:preset.height }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Render failed");
+      const requestedStyle = normalizeSubtitleStyle(subtitleStyle); const renderedStyle = data.subtitleStyle ? normalizeSubtitleStyle(data.subtitleStyle) : null;
+      if (!renderedStyle || JSON.stringify(renderedStyle) !== JSON.stringify(requestedStyle)) throw new Error("The render service is outdated and did not apply the current subtitle style. Restart npm run dev, then rebuild the video");
       const url = `${SERVICE}${data.url}`;
-      if (target === "preview") setPreviewUrl(url); else setDownloadUrl(url);
-      setMessage(`${preset.label} ${target} ready in ${data.seconds.toFixed(1)} seconds.`);
+      setPreviewUrl(url); setDownloadUrl(url);
+      setMessage(`${preset.label} video built in ${data.seconds.toFixed(1)} seconds and ready to download.`);
     } catch (error) { setMessage(error instanceof Error ? `${error.message}. Start the local render service with “npm run render-service”.` : "Render failed"); }
     finally { setBusy(""); }
-  }
-
-  async function prepareDownload() {
-    if (downloadResolution === "720" && previewUrl) {
-      setDownloadUrl(previewUrl); setMessage("The 720p preview is ready to download."); return;
-    }
-    await renderVideo("download", downloadResolution);
   }
 
   function changeScreenRatio(value:string) {
@@ -461,7 +535,7 @@ export default function StudioApp() {
         <div className="brand"><div className="brand-mark">S</div><div><strong>Shortform</strong><span>STUDIO</span></div></div>
         <nav aria-label="Production stages">
           {[['episode','01','Episode'],['storyboard','02','Storyboard'],['captions','03','Audio & captions'],['export','04','Build & Preview']].map(([id, n, label]) => (
-            <button key={id} onClick={() => setStage(id)} className={stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
+            <button key={id} onClick={() => goToStage(id)} className={stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
           ))}
         </nav>
         <div className="sidebar-foot"><span className="local-dot"/>Local workspace<div>Nothing leaves this device until a provider is called.</div></div>
@@ -470,24 +544,36 @@ export default function StudioApp() {
       <section className="workspace">
         <header className="topbar">
           <div><span className="eyebrow">CURRENT EPISODE</span><input className="title-input" value={title} placeholder="Untitled episode" onChange={(e) => { touchProject(); setTitle(e.target.value); }} aria-label="Episode title" /></div>
-          <div className="top-actions"><span className="save-state">● Saved locally</span><button className="ghost" onClick={newEpisode}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
+          <div className="top-actions"><span className="save-state">● Saved locally</span><button className="ghost episodes-button" onClick={() => void openEpisodeLibrary()} disabled={!!activityLabel}>Episodes</button><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
         </header>
 
-        {stage === "episode" && <EpisodePanel script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
-        {stage === "storyboard" && <Storyboard script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} />}
+        {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
+        {stage === "storyboard" && <Storyboard script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
         {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
-        {stage === "export" && <ExportPanel shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} buildPreview={() => renderVideo("preview", "720")} prepareDownload={prepareDownload} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { setDownloadResolution(value); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
+        {stage === "export" && <ExportPanel shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
       </section>
 
       <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} shots · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
+      {episodesOpen && <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} close={() => setEpisodesOpen(false)} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
 }
 
-function EpisodePanel({ script, setScript, contentFormat, setContentFormat, visualStyle, setVisualStyle, creativeDirection, setCreativeDirection, mode, setMode, touchProject, audioName, transcription, handleAudio, analyze, busy }: any) {
+function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode, close }:any) {
+  return <div className="modal-backdrop" onMouseDown={(event)=>{if(event.target===event.currentTarget)close();}}><div className="modal episode-library"><div className="modal-head"><div><span className="eyebrow">LOCAL WORKSPACE</span><h2>Episodes</h2></div><button onClick={close} aria-label="Close episode library">×</button></div><div className="episode-library-intro"><p>Every episode is saved locally on this device, including its script, narration, storyboard, captions, and generated assets.</p><button className="primary" onClick={newEpisode}>New episode</button></div>
+    {loading ? <div className="episode-library-empty">Loading saved episodes…</div> : episodes.length ? <div className="episode-history">{episodes.map((episode:EpisodeSummary) => <article key={episode.id} className={episode.id === currentId ? "current" : ""}><button className="episode-open" onClick={() => openEpisode(episode.id)}><span className="episode-title"><b>{episode.title}</b>{episode.id === currentId && <em>Current</em>}</span><span className="episode-meta"><time>{formatEpisodeDate(episode.savedAt)}</time><i>{episode.shotCount} shots</i><i>{formatTime(episode.duration)}</i><i>{episode.hasNarration ? "Narration attached" : "No narration"}</i></span></button><button className="episode-delete" onClick={() => deleteEpisode(episode)} aria-label={`Delete ${episode.title}`}>Delete</button></article>)}</div> : <div className="episode-library-empty"><b>No saved episodes yet</b><span>Start a new episode and it will appear here automatically.</span></div>}
+  </div></div>;
+}
+
+function formatEpisodeDate(savedAt:number) {
+  if (!savedAt) return "Not saved yet";
+  return new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(savedAt));
+}
+
+function EpisodePanel({ title, setTitle, script, setScript, contentFormat, setContentFormat, visualStyle, setVisualStyle, creativeDirection, setCreativeDirection, mode, setMode, touchProject, audioName, transcription, handleAudio, analyze, busy }: any) {
   return <div className="panel intake-panel"><div className="section-head"><div><span className="eyebrow">SOURCE MATERIAL</span><h1>Create an episode</h1><p>Add the finished script and recorded narration. AI will build the timed bilingual storyboard.</p></div><button className="primary large" onClick={analyze} disabled={!!busy}>{busy || "Analyze with AI"}</button></div>
-    <div className="intake-grid"><label className="field span-2"><span>English script</span><textarea value={script} placeholder="Paste the exact English narration script here…" onChange={(e) => { touchProject(); setScript(e.target.value); }} rows={13}/><small>{script.trim() ? script.trim().split(/\s+/).length : 0} words</small></label>
+    <div className="intake-grid"><label className="field episode-title-field"><span>Episode title</span><input value={title} placeholder="Give this episode a recognizable title…" onChange={(e) => { touchProject(); setTitle(e.target.value); }} autoComplete="off"/></label><label className="field span-2"><span>English script</span><textarea value={script} placeholder="Paste the exact English narration script here…" onChange={(e) => { touchProject(); setScript(e.target.value); }} rows={13}/><small>{script.trim() ? script.trim().split(/\s+/).length : 0} words</small></label>
       <div className="stack"><label className="field"><span>Content format</span><select value={contentFormat} onChange={(e) => { touchProject(); setContentFormat(e.target.value); }}><option>Documentary</option><option>Educational explainer</option><option>Narrative story</option><option>News recap</option><option>Product story</option><option>History documentary</option><option>Other</option></select></label><label className="field"><span>Visual style</span><select value={visualStyle} onChange={(e) => { touchProject(); setVisualStyle(e.target.value); }}><option>Photorealistic</option><option>Cinematic illustration</option><option>Editorial collage</option><option>3D animation</option><option>Anime</option><option>Minimal graphic</option></select></label><label className="field"><span>Creative direction</span><input value={creativeDirection} placeholder="Audience, mood, setting, visual constraints…" onChange={(e) => { touchProject(); setCreativeDirection(e.target.value); }}/></label><label className="field"><span>Generation mode</span><select value={mode} onChange={(e) => { touchProject(); setMode(e.target.value); }}><option>Plan only</option><option>Review then batch</option><option>Fully automatic</option></select></label>
         <label className="upload-card"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Narration attached" : "Add recorded narration"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
 }
@@ -503,8 +589,50 @@ function RatioSelect({ screenRatio, setScreenRatio }:any) {
   return <label className="ratio-select"><span>Screen ratio</span><select value={screenRatio} onChange={(event)=>setScreenRatio(event.target.value)}>{Object.entries(SCREEN_RATIOS).map(([value, option]) => <option key={value} value={value}>{value} · {option.label}</option>)}</select></label>;
 }
 
-function Storyboard({ script, transcription, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio }: any) {
-  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>Your production shots will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No storyboard yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
+function SubtitleOverlay({ shot, subtitleStyle, baseFontSize = 9 }:any) {
+  const style = normalizeSubtitleStyle(subtitleStyle); const fontSize = baseFontSize * style.fontScale / 100;
+  const shadow = style.outline ? `0 0 ${style.outline}px ${style.backgroundColor}, 0 1px ${Math.max(1, style.outline)}px ${style.backgroundColor}` : "none";
+  return <div className="preview-captions" style={{ bottom:`${style.position}%`, backgroundColor:subtitleCssBackground(style), fontFamily:style.fontFamily, fontWeight:style.bold ? 700 : 400, textAlign:style.alignment, textShadow:shadow }}><b style={{ color:style.englishColor, fontSize:`${fontSize}px`, fontWeight:"inherit" }}>{shot?.narration || "Your English subtitle appears here"}</b>{(shot?.chinese || !shot) && <span style={{ color:style.chineseColor, fontSize:`${fontSize}px` }}>{shot?.chinese || "中文字幕显示在这里"}</span>}</div>;
+}
+
+function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle }:any) {
+  return <section className="subtitle-style-dock" aria-label="Subtitle style"><div className="subtitle-dock-title"><span className="eyebrow">SUBTITLES</span><b>Style</b></div><div className="subtitle-dock-controls">
+    <label className="dock-select"><span>Font</span><select value={subtitleStyle.fontFamily} onChange={(event)=>setSubtitleStyle({ fontFamily:event.target.value })}>{SUBTITLE_FONTS.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
+    <label className="dock-select alignment"><span>Align</span><select value={subtitleStyle.alignment} onChange={(event)=>setSubtitleStyle({ alignment:event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
+    <label className="dock-range"><span>Size</span><input aria-label="Subtitle text size" type="range" min="70" max="160" step="5" value={subtitleStyle.fontScale} onChange={(event)=>setSubtitleStyle({ fontScale:Number(event.target.value) })}/><output>{subtitleStyle.fontScale}%</output></label>
+    <label className="dock-range"><span>Position</span><input aria-label="Subtitle bottom position" type="range" min="3" max="35" step="1" value={subtitleStyle.position} onChange={(event)=>setSubtitleStyle({ position:Number(event.target.value) })}/><output>{subtitleStyle.position}%</output></label>
+    <label className="dock-color" title="English text color"><span>EN</span><input aria-label="English subtitle color" type="color" value={subtitleStyle.englishColor} onChange={(event)=>setSubtitleStyle({ englishColor:event.target.value })}/></label>
+    <label className="dock-color" title="Chinese text color"><span>中文</span><input aria-label="Chinese subtitle color" type="color" value={subtitleStyle.chineseColor} onChange={(event)=>setSubtitleStyle({ chineseColor:event.target.value })}/></label>
+    <label className="dock-color" title="Subtitle background color"><span>BG</span><input aria-label="Subtitle background color" type="color" value={subtitleStyle.backgroundColor} onChange={(event)=>setSubtitleStyle({ backgroundColor:event.target.value })}/></label>
+    <label className="dock-range"><span>BG alpha</span><input aria-label="Subtitle background opacity" type="range" min="0" max="100" step="5" value={subtitleStyle.backgroundOpacity} onChange={(event)=>setSubtitleStyle({ backgroundOpacity:Number(event.target.value) })}/><output>{subtitleStyle.backgroundOpacity}%</output></label>
+    <label className="dock-range outline"><span>Outline</span><input aria-label="Subtitle outline size" type="range" min="0" max="5" step="0.5" value={subtitleStyle.outline} onChange={(event)=>setSubtitleStyle({ outline:Number(event.target.value) })}/><output>{subtitleStyle.outline}px</output></label>
+    <label className="dock-toggle"><input type="checkbox" checked={subtitleStyle.bold} onChange={(event)=>setSubtitleStyle({ bold:event.target.checked })}/><span>Bold</span></label>
+    <button type="button" className="ghost dock-reset" onClick={() => setSubtitleStyle(DEFAULT_SUBTITLE_STYLE)}>Reset</button>
+  </div></section>;
+}
+
+function Storyboard({ script, transcription, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio, subtitleStyle, setSubtitleStyle }: any) {
+  const shotListRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!shots.length) return;
+    const handleKeyDown = (event:KeyboardEvent) => {
+      if ((event.key !== "ArrowUp" && event.key !== "ArrowDown") || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+      const currentIndex = Math.max(0, shots.findIndex((shot:Shot) => shot.id === selected?.id));
+      const nextIndex = Math.max(0, Math.min(shots.length - 1, currentIndex + (event.key === "ArrowDown" ? 1 : -1)));
+      if (nextIndex === currentIndex) return;
+      event.preventDefault();
+      setSelectedId(shots[nextIndex].id);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [shots, selected?.id, setSelectedId]);
+  useEffect(() => {
+    const selectedRow = Array.from(shotListRef.current?.querySelectorAll<HTMLElement>("[data-shot-id]") || []).find((row) => row.dataset.shotId === selected?.id);
+    selectedRow?.scrollIntoView({ block:"nearest" });
+  }, [selected?.id]);
+  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>Your production shots will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No storyboard yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
   const manualImageLimit = Math.max(1, Math.min(6, Math.floor(Number(imageConcurrency)) || 3));
   const manualImageSlotFull = activeManualImageCount >= manualImageLimit;
   const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(Number(videoConcurrency)) || 2));
@@ -512,17 +640,37 @@ function Storyboard({ script, transcription, shots, selected, setSelectedId, upd
   const otherWorkBusy = Boolean(busy);
   const batchActionsBusy = otherWorkBusy || activeManualImageCount > 0 || activeManualVideoCount > 0;
   const currentScript = selected ? scriptSectionForDuration(script, transcription, selected.start, selected.end, totalDuration) : "";
-  return <div className="panel storyboard-panel"><div className="section-head compact"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated</p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/><button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Animate all shots"}</button></div></div>
-    <div className="story-grid"><div className="shot-list">{shots.map((shot: Shot) => <button key={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
+  return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>Storyboard</h1><p>{shots.length} shots aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} animated <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/><button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button><button className="primary" onClick={generateAllVideos} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Animate all shots"}</button></div></div>
+    <div className={`story-grid ratio-${screenRatio.replace(':','-')}`}><div className="shot-list" ref={shotListRef} aria-keyshortcuts="ArrowUp ArrowDown">{shots.map((shot: Shot) => <button key={shot.id} data-shot-id={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
       <div className="thumb">{shot.image ? <img src={shot.image} alt="Generated shot"/> : <span>{String(shot.index + 1).padStart(2,'0')}</span>}{shot.video && <i className="clip-badge">CLIP</i>}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? "animating" : shot.video ? "clip ready" : shot.status}</span></button>)}</div>
-      {selected && <div className="inspector"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>Awaiting image</b></div>}<div className="preview-captions"><b>{selected.narration}</b><span>{selected.chinese}</span></div></div></div>
+      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>Awaiting image</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">SHOT {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
           <div className="current-script" aria-live="polite"><div><span>Script in this shot</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
-          <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoProvider:''})}/></label>
-          <label className="field"><span>Video prompt</span><textarea rows={5} value={selected.videoPrompt || ""} onChange={(e) => updateShot(selected.id,{videoPrompt:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}/><small>Created during AI analysis; describes subject action, environmental movement, and continuity from the generated first frame.</small></label>
-          <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min="0.6" max="8" step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoProvider:''})}>{SHOT_MOTIONS.map((motion) => <option key={motion}>{motion}</option>)}</select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
-          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || selected.status === "generating" || selected.videoStatus === "generating" || otherWorkBusy || manualImageSlotFull}>{selected.status === "generating" ? "Generating…" : selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !selected.image || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Animating…" : selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div></div></div>}
-    </div></div>;
+          <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/></label>
+          <label className="field"><span>Video prompt</span><textarea rows={7} value={selected.videoPrompt || ""} onChange={(e) => updateShot(selected.id,{videoPrompt:e.target.value,video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/><small>Created during AI analysis; describes subject action, environmental movement, and continuity from the generated first frame.</small></label>
+          <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min="0.6" max="8" step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoError:'',videoProvider:''})}>{SHOT_MOTIONS.map((motion) => <option key={motion}>{motion}</option>)}</select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
+          <div className="shot-generation-actions"><button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || selected.status === "generating" || selected.videoStatus === "generating" || otherWorkBusy || manualImageSlotFull}>{selected.status === "generating" ? "Generating…" : selected.image ? "Create another image" : "Generate image"}</button><button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || !selected.image || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Animating…" : selected.video ? "Regenerate Volcengine clip" : "Animate with Volcengine"}</button></div><GenerationTaskManager shot={selected} generateOne={generateOne} generateOneVideo={generateOneVideo} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={imageConcurrency} videoConcurrency={videoConcurrency}/></div></div>}
+    </div><SubtitleStyleControls subtitleStyle={subtitleStyle} setSubtitleStyle={setSubtitleStyle}/></div>;
+}
+
+function taskStatusLabel(status:string) {
+  return status === "generated" ? "Completed" : status === "generating" ? "Generating" : status === "queued" ? "Queued" : status === "failed" ? "Failed" : "Not started";
+}
+
+function GenerationTaskManager({ shot, generateOne, generateOneVideo, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency }:any) {
+  const imageLimit = Math.max(1, Math.min(6, Math.floor(Number(imageConcurrency)) || 3));
+  const videoLimit = Math.max(1, Math.min(4, Math.floor(Number(videoConcurrency)) || 2));
+  const tasks = [
+    { key:`${shot.id}-image`, shot, kind:"Image", status:shot.imageStatus || (shot.status === "generating" ? "generating" : shot.image ? "generated" : "idle"), error:shot.imageError, provider:shot.provider, retry:() => generateOne(shot), disabled:Boolean(busy) || shot.locked || shot.status === "generating" || activeManualImageCount >= imageLimit },
+    { key:`${shot.id}-video`, shot, kind:"Video", status:shot.videoStatus || (shot.video ? "generated" : "idle"), error:shot.videoError, provider:shot.videoProvider, retry:() => generateOneVideo(shot), disabled:Boolean(busy) || shot.locked || !shot.image || shot.videoStatus === "generating" || activeManualVideoCount >= videoLimit },
+  ];
+  const active = tasks.filter((task:any) => task.status === "queued" || task.status === "generating").length;
+  const failed = tasks.filter((task:any) => task.status === "failed").length;
+  const completed = tasks.filter((task:any) => task.status === "generated").length;
+  const summary = failed ? `${failed} failed` : active ? `${active} active` : `${completed}/${tasks.length} ready`;
+  return <section className="generation-manager compact-generation-manager" aria-labelledby="generation-manager-title"><div className="compact-task-head"><div><span className="eyebrow">GENERATION TASKS</span><b id="generation-manager-title">Shot {String(shot.index + 1).padStart(2,"0")}</b></div><span className={failed ? "has-failures" : ""}>{summary}</span></div>
+    <div className="compact-task-list" role="list" aria-label={`Shot ${shot.index + 1} generation tasks`}>{tasks.map((task:any) => { const detail = task.status === "failed" ? task.error || "The provider did not return a reason." : task.status === "queued" ? "Waiting for a slot" : task.status === "generating" ? "Provider request in progress" : task.status === "generated" ? task.provider || "Saved locally" : task.kind === "Video" && !task.shot.image ? "Needs an image first" : "Ready"; return <div className={`compact-task-row task-${task.status}`} role="listitem" key={task.key}><b>{task.kind}</b><i className={`task-status status-${task.status}`}>{task.status === "generating" && <span className="spinner"/>}{taskStatusLabel(task.status)}</i><span className="compact-task-detail" title={task.error || ""}>{detail}</span>{task.status === "failed" && <button className="ghost task-retry" onClick={task.retry} disabled={task.disabled}>Retry</button>}</div>; })}</div>
+  </section>;
 }
 
 function Captions({ script, shots, updateShot, translateAll, audioName, audioData, transcription, denoiseNarration, setDenoiseNarration, bgm, selectBgm, bgmVolume, setBgmVolume }: any) {
@@ -530,19 +678,31 @@ function Captions({ script, shots, updateShot, translateAll, audioName, audioDat
   useEffect(() => {
     if (bgmPreviewRef.current) bgmPreviewRef.current.volume = Math.max(0, Math.min(.2, bgmVolume / 100));
   }, [bgm, bgmVolume]);
-  return <div className="panel"><div className="section-head"><div><span className="eyebrow">SOUND & LANGUAGE</span><h1>Audio and captions</h1><p>English narration with editable Chinese subtitle drafts.</p></div><button className="primary" onClick={translateAll}>Translate all lines</button></div>
+  return <div className="panel"><div className="section-head"><div><span className="eyebrow">SOUND & LANGUAGE</span><h1>Audio and captions</h1><p>Edit English and Chinese lines while subtitle appearance is controlled from Storyboard.</p></div><button className="primary" onClick={translateAll}>Translate all lines</button></div>
     <div className="audio-grid"><div className="audio-card"><h3>Narration</h3><div className="narration-source"><b>{audioName || "No spoken audio attached"}</b><span>{script.trim() ? `${script.trim().split(/\s+/).length} script words reused from Episode` : "Add the narration script in Episode"}</span>{transcription && <small>Local timing ready · {transcription.segments.length} segments</small>}{audioData && <audio controls preload="metadata" src={audioData}/>}</div>
       <label className="denoise-option"><input type="checkbox" checked={denoiseNarration} onChange={(event) => setDenoiseNarration(event.target.checked)}/><span><b>De-noise narration</b><small>Apply light local background-noise reduction during export.</small></span></label><h3>Background music</h3><p className="helper-copy">Choose a built-in track. It will be looped and trimmed beneath narration.</p><div className="bgm-options">{BGM_TRACKS.map((track) => <button type="button" key={track.id} className={bgm === track.path ? "chosen" : ""} onClick={() => selectBgm(track.path)}><b>{track.label}</b><span>{track.artist}</span></button>)}</div>{bgm && <><label className="bgm-volume"><span><b>Music volume</b><output>{bgmVolume}%</output></span><input type="range" min="0" max="20" step="1" value={bgmVolume} onChange={(event) => setBgmVolume(Number(event.target.value))}/></label><audio className="bgm-preview" controls preload="metadata" src={bgm} ref={bgmPreviewRef} onVolumeChange={(event) => { const ceiling = Math.max(0, Math.min(.2, bgmVolume / 100)); if (event.currentTarget.volume > ceiling) event.currentTarget.volume = ceiling; }}/></>}</div>
-      <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/><textarea className="chinese" value={shot.chinese} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/></div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>No captions yet</h2><p>AI-generated bilingual lines appear after script analysis.</p></div>}</div></div></div>;
+      <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} aria-label={`English caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/><textarea className="chinese" value={shot.chinese} aria-label={`Chinese caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/></div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>No captions yet</h2><p>AI-generated bilingual lines appear after script analysis.</p></div>}</div></div></div>;
 }
 
-function ExportPanel({ shots, approved, duration, audioName, bgm, buildPreview, prepareDownload, previewUrl, downloadUrl, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
-  const ready = Boolean(shots.length && audioName && shots.every((shot:Shot) => shot.image || shot.video));
+function ExportPanel({ shots, approved, duration, audioName, bgm, build, previewUrl, downloadUrl, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
+  const imagesReady = Boolean(shots.length && shots.every((shot:Shot) => shot.image));
+  const ready = Boolean(imagesReady && audioName);
   const selected = videoResolution(downloadResolution, screenRatio);
-  const preview = videoResolution("720", screenRatio);
-  return <div className="panel export-panel"><div className="section-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Build a 720p review copy, inspect the finished video, then choose the download resolution.</p></div></div><div className="export-grid">
-    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">720P PREVIEW</span><h2>Review the final cut</h2></div><span>{preview.width} × {preview.height} · {screenRatio}</span></div><div className={`video-preview ${previewUrl ? "ready" : ""}`}>{previewUrl ? <video controls playsInline src={previewUrl} aria-label="720p video preview" style={{ aspectRatio:screenRatio.replace(':',' / ') }}/> : <div><b>Preview not built</b><span>Check timing, subtitles, framing, motion, narration, and BGM before downloading.</span></div>}</div><button className="primary large full" onClick={buildPreview} disabled={!!busy || !ready}>{busy || (previewUrl ? "Rebuild 720p preview" : "Build 720p preview")}</button></div>
-    <div className="export-side"><div className="export-card feature"><span className="eyebrow">DOWNLOAD</span><h2>Choose output quality</h2><label className="field"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Screen ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><button className="primary large full" onClick={prepareDownload} disabled={!!busy || !ready}>{busy || `Prepare ${selected.label} download`}</button>{downloadUrl && <a className="download" href={downloadUrl} download>Download {selected.label} MP4</a>}</div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>Storyboard <b>{shots.length} shots</b></div><div className={shots.length && shots.every((s:Shot)=>s.image)?'ok':'warn'}>Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length} generated</b></div><div className={shots.some((s:Shot)=>s.video)?'ok':'warn'}>Animated clips <b>{shots.filter((s:Shot)=>s.video).length}/{shots.length} generated</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Generated clips are concatenated in storyboard order; unfinished shots retain the subtle still-image motion fallback.</small></div></div>
+  const videoUrl = previewUrl || downloadUrl;
+  const previewRef = useRef<HTMLVideoElement | null>(null);
+  useEffect(() => {
+    const video = previewRef.current;
+    if (!videoUrl || !video) return;
+    video.currentTime = 0;
+    video.muted = false;
+    void video.play().catch(() => {
+      video.muted = true;
+      void video.play().catch(() => {});
+    });
+  }, [videoUrl]);
+  return <div className="panel export-panel"><div className="section-head export-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Uses the global screen ratio selected in Storyboard. Choose a resolution, build once, then preview or download that exact video.</p></div><label className="output-select"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label></div><div className="export-grid">
+    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">CURRENT VIDEO</span><h2>Review the final cut</h2></div><span>{selected.width} × {selected.height} · {screenRatio}</span></div><div className="build-video-stage"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{videoUrl ? <video key={videoUrl} ref={previewRef} controls autoPlay playsInline src={videoUrl} aria-label={`${selected.label} video preview`}/> : <div className="empty-visual"><span>▶</span><b>Video not built</b></div>}</div></div></div><div className="build-actions"><button className="primary large" onClick={build} disabled={!!busy || !ready}>{busy || "Build"}</button>{videoUrl ? <a className="ghost large" href={videoUrl} download>Download</a> : <button className="ghost large" disabled>Download</button>}</div></div>
+    <div className="export-side"><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>Storyboard <b>{shots.length} shots</b></div><div className={imagesReady?'ok':'warn'}>Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length} generated</b></div><div className="optional">Animated clips <b>Optional · {shots.filter((s:Shot)=>s.video).length}/{shots.length}</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Every generated image receives subtle local motion. When a shot has an animated clip, that clip is used instead.</small></div></div>
   </div></div>;
 }
 

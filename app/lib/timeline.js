@@ -88,14 +88,14 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     const visualStyle = String(options.visualStyle || "photorealistic");
     const creativeDirection = String(options.creativeDirection || "").trim();
     const screenRatio = String(options.screenRatio || "9:16");
-    const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong composition for a ${screenRatio} frame, coherent subjects and setting, subtitle-safe lower area, no text, no watermark.`;
+    const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong composition for a ${screenRatio} frame, coherent subjects and setting, no text, no watermark.`;
     const motion = shotMotion(item?.motion, index);
     return {
       type,
       duration,
       narration,
       chinese: String(item?.chinese || "").trim(),
-      prompt: String(item?.prompt || fallbackPrompt).trim(),
+      prompt: sanitizeImagePrompt(item?.prompt || fallbackPrompt),
       videoPrompt: String(item?.videoPrompt || defaultVideoPrompt({ ...item, narration, motion }, index)).trim(),
       motion,
     };
@@ -119,4 +119,13 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     cursor = end;
     return result;
   });
+}
+
+export function sanitizeImagePrompt(value) {
+  return String(value || "")
+    .replace(/\bsubtitle[-\s]?safe\s+lower(?:\s+(?:area|third|zone))?\b/gi, "")
+    .replace(/,\s*,/g, ",")
+    .replace(/\s+([,.;])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }

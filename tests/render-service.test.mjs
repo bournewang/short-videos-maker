@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, renderEpisode, stillMotionFilter, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { buildSubtitleAss, completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -21,6 +21,14 @@ function probe(file) {
     const child = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", file]);
     let stdout = ""; let stderr = ""; child.stdout.on("data", (d) => stdout += d); child.stderr.on("data", (d) => stderr += d);
     child.on("close", (code) => code === 0 ? resolve(Number(stdout.trim())) : reject(new Error(stderr)));
+  });
+}
+
+function probeVideoSize(file) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffprobe", ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", file]);
+    let stdout = ""; let stderr = ""; child.stdout.on("data", (d) => stdout += d); child.stderr.on("data", (d) => stderr += d);
+    child.on("close", (code) => { const [width, height] = stdout.trim().split("x").map(Number); if (code !== 0) { reject(new Error(stderr)); return; } resolve({ width, height }); });
   });
 }
 
@@ -53,14 +61,41 @@ function samplePixel(file, at) {
   });
 }
 
+function pngDimensions(value) {
+  const data = Buffer.from(String(value).split(",")[1], "base64");
+  assert.equal(data.subarray(1, 4).toString(), "PNG");
+  return { width:data.readUInt32BE(16), height:data.readUInt32BE(20) };
+}
+
+test("subtitle ASS uses the editable episode style", () => {
+  const ass = buildSubtitleAss([{ start:0, end:1.25, narration:"English {line}", chinese:"中文" }], 1080, 1920, {
+    fontFamily:"Georgia", fontScale:150, englishColor:"#112233", chineseColor:"#abcdef", backgroundColor:"#123456",
+    backgroundOpacity:80, position:25, alignment:"left", bold:false, outline:3.5,
+  });
+  assert.match(ass, /Style: Main,Georgia,81,&H00332211,&H000000FF,&H00563412,&HFF000000,0,0,0,0,100,100,0,0,1,3\.5,0,1,70,70,480,1/);
+  assert.match(ass, /Style: Box,Arial,1,&H33563412,&H33563412,&H33563412,&H33563412/);
+  assert.match(ass, /Dialogue: 0,0:00:00\.00,0:00:01\.25,Box,,0,0,0,,\{\\an7\\pos\(70,1185\)\\p1\}m 0 0 l 940 0 l 940 300 l 0 300\{\\p0\}/);
+  assert.match(ass, /English （line）\\N\{\\c&HEFCDAB&\}中文/);
+  assert.doesNotMatch(buildSubtitleAss([{ start:0, end:1, narration:"No box" }], 1080, 1920, { backgroundOpacity:0 }), /,Box,,/);
+});
+
 test("local renderer produces a playable vertical MP4", { timeout: 120000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "shortform-test-")); const output = path.join(dir, "episode.mp4");
-  const result = await renderEpisode({ title:"Test", width:360, height:640, bgmPreset:"None", narrationData:narrationWav(), voicePreset:"documentary", shots:[
+  const result = await renderEpisode({ title:"Test", width:360, height:640, bgmPreset:"None", narrationData:narrationWav(), voicePreset:"documentary", subtitleStyle:{ fontScale:125, chineseColor:"#00ff00", backgroundOpacity:70, alignment:"right" }, shots:[
     { duration:.8, image:png, narration:"The prototype starts before dawn.", chinese:"原型机在黎明前启动。" },
     { duration:.8, image:png, narration:"The test finishes successfully.", chinese:"测试顺利完成。" },
   ] }, { id:`test-${Date.now()}`, output });
   const info = await stat(output); const duration = await probe(output);
   assert.ok(info.size > 5000); assert.ok(duration >= 1.5 && duration <= 1.8); assert.equal(result.duration, 1.6);
+  assert.equal(result.subtitleStyle.fontScale, 125); assert.equal(result.subtitleStyle.chineseColor, "#00ff00"); assert.equal(result.subtitleStyle.backgroundOpacity, 70); assert.equal(result.subtitleStyle.alignment, "right");
+});
+
+test("local renderer preserves a landscape output canvas", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-landscape-test-")); const output = path.join(dir, "episode.mp4");
+  await renderEpisode({ width:640, height:360, narrationData:narrationWav(.8), voicePreset:"original", shots:[
+    { duration:.7, image:png, narration:"A landscape frame.", chinese:"横屏画面。" },
+  ] }, { id:`landscape-${Date.now()}`, output });
+  assert.deepEqual(await probeVideoSize(output), { width:640, height:360 });
 });
 
 test("local renderer mixes a selected built-in BGM", { timeout: 120000 }, async () => {
@@ -122,6 +157,14 @@ test("still motion filter maps shot motion to a non-resetting zoompan", () => {
   assert.ok(subtle.includes("z='1+0.04*on/90'"));
   const fallback = stillMotionFilter(undefined, 1080, 1920, 3, 2);
   assert.ok(fallback.includes("z='1.14-0.14*on/90'"));
+});
+
+test("render dimensions preserve landscape, square, and portrait export ratios", () => {
+  assert.deepEqual(renderDimensions({ width:1920, height:1080 }), { width:1920, height:1080 });
+  assert.deepEqual(renderDimensions({ width:1080, height:1080 }), { width:1080, height:1080 });
+  assert.deepEqual(renderDimensions({ width:1080, height:1920 }), { width:1080, height:1920 });
+  assert.deepEqual(renderDimensions({ width:640, height:360 }), { width:640, height:360 });
+  assert.deepEqual(renderDimensions({ width:480, height:480 }), { width:480, height:480 });
 });
 
 test("provider status reports configuration without exposing secrets", () => {
@@ -203,6 +246,13 @@ test("Volcengine Agent Plan image adapter accepts the documented API base URL", 
   assert.equal(payload.model, "doubao-seedream-5.0-lite");
 });
 
+test("video first frames are cropped to the selected screen ratio before submission", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-video-frame-test-"));
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "16:9", { workDir:dir })), { width:1280, height:720 });
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "9:16", { workDir:dir })), { width:720, height:1280 });
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "1:1", { workDir:dir })), { width:960, height:960 });
+});
+
 test("Volcengine video adapter creates and polls an image-to-video task", async () => {
   const requests = []; let poll = 0;
   const fetchImpl = async (url, options = {}) => {
@@ -216,7 +266,7 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
   assert.equal(requests[0].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks");
   assert.equal(requests[0].options.headers.Authorization, "Bearer ark-test");
   assert.equal(payload.model, "doubao-seedance-2-0-260128");
-  assert.equal(payload.content[1].role, "first_frame"); assert.equal(payload.content[1].image_url.url, png);
+  assert.equal(payload.content[1].role, "first_frame"); assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:720, height:1280 });
   assert.match(payload.content[0].text, /Rain streams diagonally/);
   assert.match(payload.content[0].text, /Camera direction override: Slow push-in/);
   assert.doesNotMatch(payload.content[0].text, /--ratio|--dur|--resolution/);
@@ -251,6 +301,7 @@ test("Volcengine video adapter uses the selected screen ratio", async () => {
   await generateVideo({ videoKind:"volcengine", endpoint:"https://example.test", model:"seedance", apiKey:"key", image:png, screenRatio:"1:1" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
   const payload = JSON.parse(requests[0].options.body);
   assert.equal(payload.ratio, "1:1");
+  assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:960, height:960 });
   assert.match(payload.content[0].text, /Square 1:1 screen ratio/);
 });
 
@@ -392,7 +443,7 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   const providerShots = Array.from({ length:21 }, (_, index) => ({
     narration:`Timed narration ${index + 1}.`, chinese:`定时旁白 ${index + 1}。`,
     type:index === 0 ? "Opening" : "Narrative", duration:3.9,
-    prompt:`Photorealistic timed scene ${index + 1}, vertical 9:16, subtitle-safe lower area, no text, no watermark`,
+    prompt:`Photorealistic timed scene ${index + 1}, vertical 9:16, no text, no watermark`,
     videoPrompt:`The subject in timed scene ${index + 1} moves naturally while the camera drifts slowly`, motion:"Slow drift",
   }));
   const fetchImpl = async (_url, options) => {
@@ -407,6 +458,7 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   assert.equal(planningInput.minimumShotCount, 21);
   assert.equal(planningInput.targetShotCount, 25);
   assert.match(providerPayload.messages[0].content, /videoPrompt/);
+  assert.doesNotMatch(providerPayload.messages[0].content, /subtitle[- ]?safe|safe lower/i);
   assert.deepEqual(planningInput.localTranscriptionSegments, [{ start:.4, end:82, text:"The complete timed narration." }]);
   assert.match(shots[0].videoPrompt, /moves naturally/);
   assert.equal(shots.at(-1).end, 82);

@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { normalizePlannedShots } from "../app/lib/timeline.js";
 import { normalizeScreenRatio, promptForScreenRatio } from "../app/lib/video.js";
 import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
+import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } from "../app/lib/subtitle-style.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workRoot = path.join(root, ".shortform");
@@ -269,6 +270,24 @@ async function providerImageUrl(value) {
   return value;
 }
 
+export async function prepareProviderImage(value, screenRatio, options = {}) {
+  const ratio = normalizeScreenRatio(screenRatio);
+  const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:960, height:960 } : { width:720, height:1280 };
+  const workDir = options.workDir || assetRoot;
+  const id = options.id || randomUUID();
+  await mkdir(workDir, { recursive:true });
+  const sourceValue = await providerImageUrl(value);
+  const source = await saveMedia(sourceValue, path.join(workDir, `${id}-source`), options.fetchImpl || fetch);
+  const output = path.join(workDir, `${id}-${ratio.replace(":", "x")}.png`);
+  const filter = `scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=increase,crop=${dimensions.width}:${dimensions.height},setsar=1`;
+  try {
+    await run("ffmpeg", ["-y", "-i", source, "-frames:v", "1", "-vf", filter, "-compression_level", "6", output]);
+    return `data:image/png;base64,${(await readFile(output)).toString("base64")}`;
+  } finally {
+    await Promise.all([unlink(source).catch(() => {}), unlink(output).catch(() => {})]);
+  }
+}
+
 function run(command, args) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: root, stdio: ["ignore", "ignore", "pipe"] }); let stderr = "";
@@ -313,10 +332,28 @@ function assTime(value) {
 
 function assText(value) { return String(value || "").replace(/\\/g, "\\\\").replace(/[\r\n]+/g, " ").replace(/\{/g, "（").replace(/\}/g, "）"); }
 
-function subtitles(shots, width, height) {
-  const fontSize = Math.round(height * .028); const marginV = Math.round(height * .08);
-  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,Arial,${fontSize},&H00FFFFFF,&H000000FF,&H00131313,&H9A000000,-1,0,0,0,100,100,0,0,3,2,0,2,70,70,${marginV},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
-  return header + shots.map((shot) => `Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Main,,0,0,0,,${assText(shot.narration)}\\N{\\c&H9FD7F2&}${assText(shot.chinese)}`).join("\n");
+export function buildSubtitleAss(shots, width, height, value = {}) {
+  const style = normalizeSubtitleStyle(value);
+  const fontSize = Math.max(10, Math.round(height * .028 * style.fontScale / 100));
+  const marginV = Math.round(height * style.position / 100); const marginH = Math.round(width * .065);
+  const alignment = { left:1, center:2, right:3 }[style.alignment];
+  const primary = subtitleAssColor(style.englishColor); const chinese = subtitleAssOverrideColor(style.chineseColor);
+  const outline = subtitleAssColor(style.backgroundColor); const background = subtitleAssColor(style.backgroundColor, style.backgroundOpacity);
+  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontFamily},${fontSize},${primary},&H000000FF,${outline},&HFF000000,${style.bold ? -1 : 0},0,0,0,100,100,0,0,1,${style.outline},0,${alignment},${marginH},${marginH},${marginV},1\nStyle: Box,Arial,1,${background},${background},${background},${background},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
+  const events = shots.flatMap((shot) => {
+    const englishText = assText(shot.narration); const chineseText = assText(shot.chinese);
+    const text = [englishText, chineseText ? `{\\c${chinese}}${chineseText}` : ""].filter(Boolean).join("\\N");
+    const lines = Math.max(1, Number(Boolean(englishText)) + Number(Boolean(chineseText)));
+    const paddingY = Math.max(4, Math.round(fontSize * .55)); const lineHeight = Math.round(fontSize * 1.3);
+    const boxHeight = lines * lineHeight + paddingY * 2; const boxWidth = width - marginH * 2;
+    const boxBottom = Math.min(height, height - marginV + paddingY); const boxTop = Math.max(0, boxBottom - boxHeight);
+    const box = `{\\an7\\pos(${marginH},${boxTop})\\p1}m 0 0 l ${boxWidth} 0 l ${boxWidth} ${boxHeight} l 0 ${boxHeight}{\\p0}`;
+    return [
+      ...(style.backgroundOpacity > 0 ? [`Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Box,,0,0,0,,${box}`] : []),
+      `Dialogue: 1,${assTime(shot.start)},${assTime(shot.end)},Main,,0,0,0,,${text}`,
+    ];
+  });
+  return header + events.join("\n");
 }
 
 // Ken Burns-style motion for still shots. The zoom ramps across the whole shot
@@ -341,12 +378,19 @@ export function stillMotionFilter(motion, width, height, duration, index = 0) {
   return `${hiRes},zoompan=z='${zoom}':x='${x}':y='${y}':d=1:s=${width}x${height}:fps=30,setsar=1,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709`;
 }
 
+export function renderDimensions(payload = {}) {
+  return {
+    width:Math.min(1920, Math.max(360, Math.round(Number(payload.width) || 1080))),
+    height:Math.min(1920, Math.max(360, Math.round(Number(payload.height) || 1920))),
+  };
+}
+
 export async function renderEpisode(payload, options = {}) {
   if (!Array.isArray(payload.shots) || !payload.shots.length) throw new Error("At least one shot is required");
   if (payload.shots.length > 80) throw new Error("The MVP supports up to 80 shots per episode");
   const started = Date.now(); const id = options.id || randomUUID(); const jobDir = path.join(workRoot, "jobs", id);
   await mkdir(jobDir, { recursive: true }); await mkdir(exportRoot, { recursive: true });
-  const width = Math.min(1080, Math.max(360, Number(payload.width) || 1080)); const height = Math.min(1920, Math.max(640, Number(payload.height) || 1920));
+  const { width, height } = renderDimensions(payload); const subtitleStyle = normalizeSubtitleStyle(payload.subtitleStyle);
   const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
   let cursor = 0; const shots = [];
   for (let i = 0; i < payload.shots.length; i += 1) {
@@ -375,7 +419,7 @@ export async function renderEpisode(payload, options = {}) {
     customBgm = path.join(bgmRoot, filename);
     await readFile(customBgm);
   }
-  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, subtitles(shots, width, height));
+  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle));
   const concatFile = path.join(jobDir, "segments.txt");
   const quoteConcat = (value) => value.replace(/'/g, "'\\''");
   await writeFile(concatFile, shots.map((shot) => `file '${quoteConcat(shot.segment)}'`).join("\n"));
@@ -395,7 +439,7 @@ export async function renderEpisode(payload, options = {}) {
   else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
   await run("ffmpeg", args);
-  return { id, output, url: `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length };
+  return { id, output, url: `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
 }
 
 export async function generateImage(data, options = {}) {
@@ -456,7 +500,7 @@ export async function generateVideo(data, options = {}) {
   const endpoint = videoTasksEndpoint(data.endpoint);
   const screenRatio = normalizeScreenRatio(data.screenRatio);
   const duration = Math.max(2, Math.min(12, Math.ceil(Number(data.duration) || 5)));
-  const image = await providerImageUrl(data.image);
+  const image = await prepareProviderImage(data.image, screenRatio, { fetchImpl:options.imageFetchImpl });
   const direction = String(data.motion || "Slow push-in").trim();
   const motionPrompt = promptForScreenRatio(data.videoPrompt || data.prompt || "Animate this storyboard frame naturally with coherent subject and environmental motion", screenRatio);
   const prompt = `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects.`;
@@ -557,7 +601,7 @@ export async function planEpisode(data, options = {}) {
   const config = resolveTextProvider(data);
   if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
   if (!String(config.script || "").trim()) throw new Error("A script is required");
-  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 45 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, subtitle-safe lower area, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const system = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 45 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: first five seconds 0.8–1.5 seconds per shot; ordinary narration 2–3; climaxes 1.5–2.5; maps and timelines 3–5; emotional turns 3–4; avoid static images over 4 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
   const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
   const minimumShotCount = narrationDuration ? Math.ceil(narrationDuration / 4) : null;

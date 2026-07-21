@@ -33,7 +33,13 @@ test("fallback prompts use episode-level creative settings", () => {
   assert.match(shot.prompt, /Anime Narrative story/i);
   assert.match(shot.prompt, /Neon city at night/i);
   assert.match(shot.videoPrompt, /camera follows the runner/i);
+  assert.doesNotMatch(shot.prompt, /subtitle[- ]?safe|safe lower/i);
   assert.doesNotMatch(shot.prompt, /historical|period clothing/i);
+});
+
+test("image prompts remove subtitle-safe lower-area instructions", () => {
+  const [shot] = normalizePlannedShots([{ narration:"A runner crosses the finish line.", prompt:"Cinematic runner, subtitle-safe lower area, dramatic stadium lights, no text" }], 2);
+  assert.equal(shot.prompt, "Cinematic runner, dramatic stadium lights, no text");
 });
 
 test("word timestamps place shot changes inside real pauses", () => {
