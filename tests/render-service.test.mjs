@@ -458,6 +458,9 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   assert.equal(planningInput.minimumShotCount, 21);
   assert.equal(planningInput.targetShotCount, 25);
   assert.match(providerPayload.messages[0].content, /videoPrompt/);
+  assert.match(providerPayload.messages[0].content, /every image prompt must explicitly name the most accurate era or date and location/i);
+  assert.match(providerPayload.messages[0].content, /period-accurate background/i);
+  assert.match(providerPayload.messages[0].content, /Never mix eras or include anachronisms/i);
   assert.doesNotMatch(providerPayload.messages[0].content, /subtitle[- ]?safe|safe lower/i);
   assert.deepEqual(planningInput.localTranscriptionSegments, [{ start:.4, end:82, text:"The complete timed narration." }]);
   assert.match(shots[0].videoPrompt, /moves naturally/);

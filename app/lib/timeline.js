@@ -9,6 +9,9 @@ export function formatTime(seconds) {
 
 const allowedTypes = new Set(["Opening", "Narrative", "Climax", "Map", "Timeline", "Emotion"]);
 
+const historicalFormat = /\b(?:history|historical)\b/i;
+const historicalAccuracy = "Match the exact historical era in the narration: use a period-accurate background, architecture, clothing, objects, and technology; no anachronisms or mixed eras.";
+
 export const SHOT_MOTIONS = ["Slow push-in", "Slow pull-out", "Slow drift", "Slow rise", "Slow sink", "Diagonal drift", "Push to subject", "Static"];
 const motionRotation = ["Slow push-in", "Slow drift", "Slow pull-out", "Slow rise", "Slow sink", "Diagonal drift"];
 
@@ -89,13 +92,15 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     const creativeDirection = String(options.creativeDirection || "").trim();
     const screenRatio = String(options.screenRatio || "9:16");
     const fallbackPrompt = `${visualStyle} ${contentFormat} scene depicting: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Strong composition for a ${screenRatio} frame, coherent subjects and setting, no text, no watermark.`;
+    const prompt = sanitizeImagePrompt(item?.prompt || fallbackPrompt);
+    const needsHistoricalAccuracy = historicalFormat.test(`${contentFormat} ${creativeDirection}`) && !/\b(?:no anachronisms?|period[- ]accurate|historically accurate)\b/i.test(prompt);
     const motion = shotMotion(item?.motion, index);
     return {
       type,
       duration,
       narration,
       chinese: String(item?.chinese || "").trim(),
-      prompt: sanitizeImagePrompt(item?.prompt || fallbackPrompt),
+      prompt: needsHistoricalAccuracy ? `${prompt.replace(/[.\s]+$/, "")}. ${historicalAccuracy}` : prompt,
       videoPrompt: String(item?.videoPrompt || defaultVideoPrompt({ ...item, narration, motion }, index)).trim(),
       motion,
     };

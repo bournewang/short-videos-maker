@@ -37,6 +37,20 @@ test("fallback prompts use episode-level creative settings", () => {
   assert.doesNotMatch(shot.prompt, /historical|period clothing/i);
 });
 
+test("history image prompts enforce an era-accurate background", () => {
+  const [shot] = normalizePlannedShots([{ narration:"In 1453, defenders watched the walls of Constantinople.", prompt:"Cinematic defenders overlooking a city at dawn, no text" }], 3, { contentFormat:"History documentary" });
+  assert.match(shot.prompt, /exact historical era/i);
+  assert.match(shot.prompt, /period-accurate background/i);
+  assert.match(shot.prompt, /architecture, clothing, objects, and technology/i);
+  assert.match(shot.prompt, /no anachronisms or mixed eras/i);
+});
+
+test("history prompts do not duplicate an existing historical accuracy constraint", () => {
+  const prompt = "1453 Constantinople, period-accurate Theodosian walls and Ottoman clothing, no anachronisms, no text";
+  const [shot] = normalizePlannedShots([{ narration:"The siege began.", prompt }], 2, { contentFormat:"History documentary" });
+  assert.equal(shot.prompt, prompt);
+});
+
 test("image prompts remove subtitle-safe lower-area instructions", () => {
   const [shot] = normalizePlannedShots([{ narration:"A runner crosses the finish line.", prompt:"Cinematic runner, subtitle-safe lower area, dramatic stadium lights, no text" }], 2);
   assert.equal(shot.prompt, "Cinematic runner, dramatic stadium lights, no text");
