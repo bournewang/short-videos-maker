@@ -44,6 +44,16 @@ test("cached subtitle styles are normalized", () => {
   });
 });
 
+test("cached long-scene settings and video-only scenes are preserved", () => {
+  const cached = normalizeCachedProject({ productionMode:"long-scenes", longClipDuration:12, shots:[
+    { narration:"A complete direct video scene.", status:"generated", image:"", video:"https://example.test/scene.mp4", videoStatus:"generated" },
+  ] });
+  assert.equal(cached.productionMode, "long-scenes");
+  assert.equal(cached.longClipDuration, 12);
+  assert.equal(cached.shots[0].status, "generated");
+  assert.equal(cached.shots[0].videoStatus, "generated");
+});
+
 test("invalid project cache values are ignored", () => {
   assert.equal(normalizeCachedProject(null), null);
   assert.equal(normalizeCachedProject("invalid"), null);

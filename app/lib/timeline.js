@@ -25,6 +25,15 @@ export function defaultVideoPrompt(shot = {}, index = 0) {
   return `${motion}. Animate the visible subject naturally to express: ${narration}. Add restrained environmental motion and realistic parallax. Preserve identity, anatomy, composition, lighting, and scene continuity in one continuous shot; no cuts, new subjects, text, logos, flicker, warping, or morphing.`;
 }
 
+function defaultLongVideoPrompt(shot = {}, index = 0, options = {}) {
+  const narration = String(shot?.narration || shot?.text || shot?.voiceover || "the planned action").trim();
+  const motion = shotMotion(shot?.motion, index);
+  const contentFormat = String(options.contentFormat || "short-form video");
+  const visualStyle = String(options.visualStyle || "photorealistic");
+  const creativeDirection = String(options.creativeDirection || "").trim();
+  return `${visualStyle} ${contentFormat} scene illustrating the complete narration: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Stage the action as a coherent sequence of visual beats in one continuous scene. ${motion} camera movement, natural subject and environmental motion, stable identity and anatomy, consistent setting and lighting; no cuts, text, logos, flicker, warping, morphing, or unrelated subjects.`;
+}
+
 function transcriptionWords(transcription) {
   if (!Array.isArray(transcription?.segments)) return [];
   return transcription.segments.flatMap((segment) => {
@@ -61,7 +70,7 @@ export function scriptSectionForDuration(script, transcription, start, end, tota
   return scriptWords.slice(scriptStart, scriptEnd).join(" ");
 }
 
-function timestampBoundaries(shots, transcription, target) {
+function timestampBoundaries(shots, transcription, target, options = {}) {
   const words = transcriptionWords(transcription);
   if (words.length < 2 || shots.length < 2 || target < shots.length * .6) return null;
   const counts = shots.map((shot) => Math.max(1, shot.narration.split(/\s+/).filter(Boolean).length));
@@ -71,8 +80,11 @@ function timestampBoundaries(shots, transcription, target) {
     consumed += counts[index - 1];
     const wordIndex = Math.max(1, Math.min(words.length - 1, Math.round(words.length * consumed / total)));
     const candidate = (words[wordIndex - 1].end + words[wordIndex].start) / 2;
-    const minimum = boundaries.at(-1) + .6;
-    const maximum = target - (shots.length - index) * .6;
+    const remainingShots = shots.length - index;
+    const minimumDuration = Math.max(.6, Number(options.minimumDuration) || .6);
+    const maximumDuration = Math.max(minimumDuration, Number(options.maximumDuration) || target);
+    const minimum = Math.max(boundaries.at(-1) + minimumDuration, target - remainingShots * maximumDuration);
+    const maximum = Math.min(boundaries.at(-1) + maximumDuration, target - remainingShots * minimumDuration);
     boundaries.push(Math.max(minimum, Math.min(maximum, candidate)));
   }
   boundaries.push(target);
@@ -83,10 +95,12 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   if (!Array.isArray(input) || !input.length) throw new Error("The planning provider returned no shots");
   const usable = input.slice(0, 80).filter((item) => String(item?.narration || item?.text || item?.voiceover || "").trim());
   if (!usable.length) throw new Error("The planning provider returned no usable narrated shots");
+  const longScenes = options.productionMode === "long-scenes";
+  const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(options.targetClipDuration) || 10)));
   const source = usable.map((item, index) => {
     const narration = String(item?.narration || item?.text || item?.voiceover || "").trim();
     const type = allowedTypes.has(item?.type) ? item.type : (index === 0 ? "Opening" : "Narrative");
-    const duration = Math.max(.6, Math.min(8, Number(item?.duration) || 2.5));
+    const duration = Math.max(.6, Math.min(longScenes ? 12 : 8, Number(item?.duration) || (longScenes ? targetClipDuration : 2.5)));
     const contentFormat = String(options.contentFormat || "short-form video");
     const visualStyle = String(options.visualStyle || "photorealistic");
     const creativeDirection = String(options.creativeDirection || "").trim();
@@ -101,21 +115,24 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
       narration,
       chinese: String(item?.chinese || "").trim(),
       prompt: needsHistoricalAccuracy ? `${prompt.replace(/[.\s]+$/, "")}. ${historicalAccuracy}` : prompt,
-      videoPrompt: String(item?.videoPrompt || defaultVideoPrompt({ ...item, narration, motion }, index)).trim(),
+      videoPrompt: String(item?.videoPrompt || (longScenes ? defaultLongVideoPrompt({ ...item, narration, motion }, index, options) : defaultVideoPrompt({ ...item, narration, motion }, index))).trim(),
       motion,
     };
   });
   const rawTotal = source.reduce((sum, shot) => sum + shot.duration, 0);
   const transcriptionDuration = Number(options.transcription?.duration);
   const target = Math.max(Number(audioDuration) || transcriptionDuration || rawTotal, source.length * .6);
-  const boundaries = timestampBoundaries(source, options.transcription, target);
+  if (longScenes && target > source.length * 12 + .01) throw new Error("The planning provider returned too few long scenes to stay within the 12-second video limit");
+  const longMinimumDuration = longScenes && target >= source.length * 6 ? 6 : .6;
+  const boundaries = timestampBoundaries(source, options.transcription, target, longScenes ? { minimumDuration:longMinimumDuration, maximumDuration:12 } : {});
   if (boundaries) return source.map((shot, index) => {
     const start = Number(boundaries[index].toFixed(2));
     const end = Number(boundaries[index + 1].toFixed(2));
     return { ...shot, index, start, end, duration:Number((end - start).toFixed(2)) };
   });
   const remaining = target - source.length * .6;
-  const allocated = source.map((shot) => .6 + remaining * (shot.duration / rawTotal));
+  let allocated = source.map((shot) => .6 + remaining * (shot.duration / rawTotal));
+  if (longScenes && allocated.some((duration) => duration < longMinimumDuration || duration > 12)) allocated = source.map(() => target / source.length);
   let cursor = 0;
   return source.map((shot, index) => {
     const start = Number(cursor.toFixed(2));

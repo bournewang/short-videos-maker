@@ -13,6 +13,7 @@ export function createEpisodeId() {
 
 export function normalizeCachedProject(value) {
   if (!value || typeof value !== "object") return null;
+  const longScenes = value.productionMode === "long-scenes";
   const shots = Array.isArray(value.shots) ? value.shots.map((shot, index) => {
     const image = String(shot?.image || "");
     const video = String(shot?.video || "");
@@ -32,10 +33,16 @@ export function normalizeCachedProject(value) {
       videoStatus,
       videoError:videoStatus === "failed" ? String(shot?.videoError || (interruptedVideo ? "Video generation was interrupted when the project closed." : "Video generation failed.")) : "",
       videoProvider:String(shot?.videoProvider || ""),
-      status:shot?.status === "generating" || (shot?.status === "generated" && !image) ? "planned" : (shot?.status || "planned"),
+      status:shot?.status === "generating" || (shot?.status === "generated" && !image && !longScenes) ? "planned" : (shot?.status || "planned"),
     };
   }) : [];
-  return { ...value, subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle), shots };
+  return {
+    ...value,
+    productionMode:longScenes ? "long-scenes" : "short-shots",
+    longClipDuration:Math.max(6, Math.min(12, Math.round(Number(value.longClipDuration) || 10))),
+    subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle),
+    shots,
+  };
 }
 
 function openDatabase() {

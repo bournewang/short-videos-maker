@@ -37,6 +37,21 @@ test("fallback prompts use episode-level creative settings", () => {
   assert.doesNotMatch(shot.prompt, /historical|period clothing/i);
 });
 
+test("long scenes use the adjustable target duration and direct video prompt fallback", () => {
+  const [scene] = normalizePlannedShots([{ narration:"The engineer enters the lab and activates the prototype." }], 10, {
+    productionMode:"long-scenes", targetClipDuration:10, contentFormat:"Educational explainer", visualStyle:"Cinematic illustration", creativeDirection:"Warm practical lighting",
+  });
+  assert.equal(scene.duration, 10);
+  assert.match(scene.videoPrompt, /complete narration/i);
+  assert.match(scene.videoPrompt, /coherent sequence of visual beats/i);
+  assert.match(scene.videoPrompt, /Warm practical lighting/i);
+});
+
+test("long scene source durations are limited to the provider maximum", () => {
+  const [scene] = normalizePlannedShots([{ narration:"A continuous scene.", duration:30 }], 0, { productionMode:"long-scenes", targetClipDuration:12 });
+  assert.equal(scene.duration, 12);
+});
+
 test("history image prompts enforce an era-accurate background", () => {
   const [shot] = normalizePlannedShots([{ narration:"In 1453, defenders watched the walls of Constantinople.", prompt:"Cinematic defenders overlooking a city at dawn, no text" }], 3, { contentFormat:"History documentary" });
   assert.match(shot.prompt, /exact historical era/i);

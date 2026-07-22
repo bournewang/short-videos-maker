@@ -276,6 +276,23 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
   assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
 });
 
+test("Volcengine video adapter creates a direct text-to-video long scene without an image", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ id:"text-video-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ id:"text-video-task", status:"succeeded", duration:"10", content:{ video_url:"https://example.test/long-scene.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.example.test", model:"seedance", apiKey:"key", generationMode:"long-scenes", videoPrompt:"An engineer enters the laboratory, crosses to the prototype, and activates its blue control lights", motion:"Slow drift", duration:10, screenRatio:"9:16" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.content.length, 1);
+  assert.equal(payload.content[0].type, "text");
+  assert.match(payload.content[0].text, /Generate the full scene directly/i);
+  assert.doesNotMatch(payload.content[0].text, /supplied image|exact first frame/i);
+  assert.equal(payload.duration, 10);
+  assert.equal(result.videoUrl, "https://example.test/long-scene.mp4");
+});
+
 test("Volcengine Agent Plan video adapter accepts the documented base URL and model name", async () => {
   const requests = [];
   const fetchImpl = async (url, options = {}) => {
@@ -466,4 +483,28 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   assert.match(shots[0].videoPrompt, /moves naturally/);
   assert.equal(shots.at(-1).end, 82);
   assert.equal(Number(shots.reduce((sum, shot) => sum + shot.duration, 0).toFixed(2)), 82);
+});
+
+test("long-scene planning uses the selected 6-12 second target and direct video prompts", async () => {
+  let providerPayload;
+  const providerScenes = Array.from({ length:8 }, (_, index) => ({
+    narration:`Long narration section ${index + 1}.`, chinese:`长旁白片段 ${index + 1}。`, type:index === 0 ? "Opening" : "Narrative", duration:10.25,
+    videoPrompt:`A detailed continuous text-to-video scene ${index + 1} with two sequential visual beats and stable subjects`, motion:"Slow drift",
+  }));
+  const fetchImpl = async (_url, options) => {
+    providerPayload = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ shots:providerScenes }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"A complete 82-second narration.", audioDuration:82, productionMode:"long-scenes", longClipDuration:10 }, { fetchImpl });
+  const planningInput = JSON.parse(providerPayload.messages[1].content);
+  assert.equal(planningInput.productionMode, "long-scenes");
+  assert.equal(planningInput.targetClipDurationSeconds, 10);
+  assert.equal(planningInput.minimumShotCount, 7);
+  assert.equal(planningInput.targetShotCount, 8);
+  assert.equal(planningInput.maximumShotCount, 13);
+  assert.match(providerPayload.messages[0].content, /direct text-to-video generation/i);
+  assert.match(providerPayload.messages[0].content, /between 6 and 12 seconds/i);
+  assert.match(providerPayload.messages[0].content, /Do not refer to a supplied image or first frame/i);
+  assert.equal(shots.length, 8);
+  assert.equal(shots.at(-1).end, 82);
 });
