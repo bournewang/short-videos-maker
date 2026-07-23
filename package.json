@@ -11,7 +11,7 @@
     "render-service": "node scripts/render-service.mjs",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
-    "test": "npm run build && node --test tests/timeline.test.mjs tests/render-service.test.mjs tests/rendered-html.test.mjs tests/concurrency.test.mjs tests/video.test.mjs tests/audio.test.mjs tests/project-cache.test.mjs",
+    "test": "npm run build && node --test tests/timeline.test.mjs tests/render-service.test.mjs tests/rendered-html.test.mjs tests/concurrency.test.mjs tests/video.test.mjs tests/audio.test.mjs tests/project-cache.test.mjs tests/subtitles.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },
