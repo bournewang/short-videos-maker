@@ -1,5 +1,6 @@
 import { defaultVideoPrompt, sanitizeImagePrompt } from "./timeline.js";
 import { normalizeSubtitleStyle } from "./subtitle-style.js";
+import { normalizeScreenRatio, videoResolution } from "./video.js";
 
 const DATABASE_NAME = "shortform-studio-cache";
 const STORE_NAME = "projects";
@@ -14,6 +15,39 @@ export function createEpisodeId() {
 export function normalizeCachedProject(value) {
   if (!value || typeof value !== "object") return null;
   const longScenes = value.productionMode === "long-scenes";
+  const covers = Array.isArray(value.covers) ? value.covers.flatMap((cover, index) => {
+    const path = String(cover?.path || "");
+    const url = String(cover?.url || "");
+    if (!path && !url) return [];
+    return [{
+      id:String(cover?.id || `saved-cover-${index}`),
+      path,
+      url,
+      screenRatio:normalizeScreenRatio(cover?.screenRatio),
+      prompt:String(cover?.prompt || ""),
+      provider:String(cover?.provider || ""),
+      createdAt:Math.max(0, Number(cover?.createdAt) || 0),
+    }];
+  }) : [];
+  const videoBuilds = Array.isArray(value.videoBuilds) ? value.videoBuilds.flatMap((build, index) => {
+    const path = String(build?.path || "");
+    const url = String(build?.url || "");
+    if (!path && !url) return [];
+    const screenRatio = normalizeScreenRatio(build?.screenRatio);
+    const resolution = String(build?.resolution || "1080");
+    const dimensions = videoResolution(resolution, screenRatio);
+    return [{
+      id:String(build?.id || `saved-build-${index}`),
+      path,
+      url,
+      screenRatio,
+      resolution,
+      width:Math.max(1, Math.round(Number(build?.width) || dimensions.width)),
+      height:Math.max(1, Math.round(Number(build?.height) || dimensions.height)),
+      duration:Math.max(0, Number(build?.duration) || 0),
+      createdAt:Math.max(0, Number(build?.createdAt) || 0),
+    }];
+  }) : [];
   const shots = Array.isArray(value.shots) ? value.shots.map((shot, index) => {
     const image = String(shot?.image || "");
     const video = String(shot?.video || "");
@@ -42,6 +76,9 @@ export function normalizeCachedProject(value) {
     productionMode:longScenes ? "long-scenes" : value.productionMode === "mixed" ? "mixed" : "short-shots",
     longClipDuration:Math.max(6, Math.min(12, Math.round(Number(value.longClipDuration) || 10))),
     subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle),
+    coverPrompt:String(value.coverPrompt || ""),
+    covers,
+    videoBuilds,
     shots,
   };
 }

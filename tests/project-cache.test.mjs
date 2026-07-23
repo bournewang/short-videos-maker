@@ -44,6 +44,32 @@ test("cached subtitle styles are normalized", () => {
   });
 });
 
+test("cached video builds retain each ratio, render path, and download URL", () => {
+  const cached = normalizeCachedProject({ videoBuilds:[
+    { id:"landscape", path:"/renders/landscape.mp4", url:"http://127.0.0.1:4317/renders/landscape.mp4", screenRatio:"16:9", resolution:"1080", width:1920, height:1080, duration:42, createdAt:100 },
+    { id:"vertical", path:"/renders/vertical.mp4", url:"http://127.0.0.1:4317/renders/vertical.mp4", screenRatio:"9:16", resolution:"720", width:720, height:1280, duration:42, createdAt:200 },
+    { id:"invalid" },
+  ], shots:[] });
+  assert.equal(cached.videoBuilds.length, 2);
+  assert.equal(cached.videoBuilds[0].screenRatio, "16:9");
+  assert.equal(cached.videoBuilds[0].path, "/renders/landscape.mp4");
+  assert.equal(cached.videoBuilds[1].url, "http://127.0.0.1:4317/renders/vertical.mp4");
+  assert.deepEqual(cached.videoBuilds.map((build) => [build.width, build.height]), [[1920,1080],[720,1280]]);
+});
+
+test("cached generated covers retain ratio, prompt, and local asset path", () => {
+  const cached = normalizeCachedProject({ coverPrompt:"High contrast portrait", covers:[
+    { id:"cover-one", path:"/assets/cover-one.png", url:"http://127.0.0.1:4317/assets/cover-one.png", screenRatio:"16:9", prompt:"Dramatic landscape cover", provider:"seedream", createdAt:300 },
+    { id:"invalid" },
+  ], shots:[] });
+  assert.equal(cached.coverPrompt, "High contrast portrait");
+  assert.equal(cached.covers.length, 1);
+  assert.deepEqual(cached.covers[0], {
+    id:"cover-one", path:"/assets/cover-one.png", url:"http://127.0.0.1:4317/assets/cover-one.png",
+    screenRatio:"16:9", prompt:"Dramatic landscape cover", provider:"seedream", createdAt:300,
+  });
+});
+
 test("cached long-scene settings and video-only scenes are preserved", () => {
   const cached = normalizeCachedProject({ productionMode:"long-scenes", longClipDuration:12, shots:[
     { narration:"A complete direct video scene.", status:"generated", image:"", video:"https://example.test/scene.mp4", videoStatus:"generated" },
