@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -373,6 +373,16 @@ test("generated provider images are copied into the local intermediate asset sto
   assert.ok(info.size > 0);
   assert.match(result.path, /\.shortform\/assets\/cache-test-\d+\.png$/);
   assert.match(result.url, /^http:\/\/127\.0\.0\.1:4317\/assets\/cache-test-\d+\.png$/);
+});
+
+test("generated provider images are cropped to the selected cover ratio before caching", async () => {
+  const result = await persistGeneratedImage(png, { id:`ratio-cache-test-${Date.now()}`, screenRatio:"16:9" });
+  try {
+    assert.deepEqual(await probeVideoSize(result.path), { width:1280, height:720 });
+    assert.match(result.path, /-16x9\.png$/);
+  } finally {
+    await unlink(result.path).catch(() => {});
+  }
 });
 
 test("generated provider videos are copied into the local intermediate asset store", async () => {

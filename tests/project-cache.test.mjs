@@ -57,17 +57,23 @@ test("cached video builds retain each ratio, render path, and download URL", () 
   assert.deepEqual(cached.videoBuilds.map((build) => [build.width, build.height]), [[1920,1080],[720,1280]]);
 });
 
-test("cached generated covers retain ratio, prompt, and local asset path", () => {
-  const cached = normalizeCachedProject({ coverPrompt:"High contrast portrait", covers:[
+test("cached generated covers retain headline placement, ratio, prompt, and local asset path", () => {
+  const cached = normalizeCachedProject({ coverHeadline:"The truth about 1453", coverTitlePosition:"top-right", coverPrompt:"High contrast portrait", covers:[
     { id:"cover-one", path:"/assets/cover-one.png", url:"http://127.0.0.1:4317/assets/cover-one.png", screenRatio:"16:9", prompt:"Dramatic landscape cover", provider:"seedream", createdAt:300 },
     { id:"invalid" },
   ], shots:[] });
+  assert.equal(cached.coverHeadline, "The truth about 1453");
+  assert.equal(cached.coverTitlePosition, "top-right");
   assert.equal(cached.coverPrompt, "High contrast portrait");
   assert.equal(cached.covers.length, 1);
   assert.deepEqual(cached.covers[0], {
     id:"cover-one", path:"/assets/cover-one.png", url:"http://127.0.0.1:4317/assets/cover-one.png",
     screenRatio:"16:9", prompt:"Dramatic landscape cover", provider:"seedream", createdAt:300,
   });
+});
+
+test("invalid cover headline placement falls back to a safe lower position", () => {
+  assert.equal(normalizeCachedProject({ coverTitlePosition:"over-the-face", shots:[] }).coverTitlePosition, "bottom-left");
 });
 
 test("cached long-scene settings and video-only scenes are preserved", () => {

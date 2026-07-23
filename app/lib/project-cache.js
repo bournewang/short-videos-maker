@@ -76,6 +76,8 @@ export function normalizeCachedProject(value) {
     productionMode:longScenes ? "long-scenes" : value.productionMode === "mixed" ? "mixed" : "short-shots",
     longClipDuration:Math.max(6, Math.min(12, Math.round(Number(value.longClipDuration) || 10))),
     subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle),
+    coverHeadline:String(value.coverHeadline || ""),
+    coverTitlePosition:["top-left","top-center","top-right","middle-left","middle-center","middle-right","bottom-left","bottom-center","bottom-right"].includes(value.coverTitlePosition) ? value.coverTitlePosition : "bottom-left",
     coverPrompt:String(value.coverPrompt || ""),
     covers,
     videoBuilds,

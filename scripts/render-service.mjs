@@ -228,7 +228,23 @@ async function saveMedia(value, targetBase, fetchImpl = fetch) {
 export async function persistGeneratedImage(value, options = {}) {
   if (!value) throw new Error("Provider returned no image");
   await mkdir(assetRoot, { recursive:true });
-  const filename = await saveMedia(value, path.join(assetRoot, options.id || randomUUID()), options.fetchImpl || fetch);
+  const id = options.id || randomUUID();
+  const source = await saveMedia(value, path.join(assetRoot, id), options.fetchImpl || fetch);
+  let filename = source;
+  if (options.screenRatio) {
+    const ratio = normalizeScreenRatio(options.screenRatio);
+    const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
+    const output = path.join(assetRoot, `${id}-${ratio.replace(":", "x")}.png`);
+    const filter = `scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=increase,crop=${dimensions.width}:${dimensions.height},setsar=1`;
+    try {
+      await run("ffmpeg", ["-y", "-i", source, "-frames:v", "1", "-vf", filter, "-compression_level", "6", output]);
+      filename = output;
+      await unlink(source).catch(() => {});
+    } catch (error) {
+      await unlink(output).catch(() => {});
+      throw error;
+    }
+  }
   return {
     path:filename,
     url:`http://127.0.0.1:${port}/assets/${encodeURIComponent(path.basename(filename))}`,
@@ -685,8 +701,9 @@ export function createRenderServer() {
       }
       if (req.method === "POST" && url.pathname === "/render") { const result = await renderEpisode(await body(req)); json(res, 200, result); return; }
       if (req.method === "POST" && url.pathname === "/image/generate") {
-        const generated = await generateImage(await body(req, 2*1024*1024));
-        const cached = await persistGeneratedImage(generated);
+        const payload = await body(req, 2*1024*1024);
+        const generated = await generateImage(payload);
+        const cached = await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
         json(res, 200, { image:cached.url }); return;
       }
       if (req.method === "POST" && url.pathname === "/video/generate") {

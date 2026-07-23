@@ -59,6 +59,16 @@ const BGM_TRACKS = [
   { id:"paulyudin-history", label:"History Storytelling", artist:"Paul Yudin", path:"/bgm/paulyudin-documentary-history-storytelling-155326.mp3" },
   { id:"solarflex-documentary", label:"Documentary", artist:"Solarflex", path:"/bgm/solarflex-documentary-documentary-music-558248.mp3" },
 ];
+const COVER_TITLE_POSITIONS = [
+  { id:"top-left", label:"Top left" }, { id:"top-center", label:"Top center" }, { id:"top-right", label:"Top right" },
+  { id:"middle-left", label:"Middle left" }, { id:"middle-center", label:"Center" }, { id:"middle-right", label:"Middle right" },
+  { id:"bottom-left", label:"Bottom left" }, { id:"bottom-center", label:"Bottom center" }, { id:"bottom-right", label:"Bottom right" },
+] as const;
+
+function normalizeCoverTitlePosition(value:unknown) {
+  const position = String(value || "");
+  return COVER_TITLE_POSITIONS.some((option) => option.id === position) ? position : "bottom-left";
+}
 
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -102,10 +112,104 @@ function safeFileStem(value:string) {
   return String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase() || "shortform-video";
 }
 
-async function downloadRemoteFile(url:string, filename:string) {
+function wrapCoverText(context:CanvasRenderingContext2D, value:string, maxWidth:number) {
+  const text = value.trim().replace(/\s+/g, " ");
+  const spaced = /\s/.test(text);
+  const tokens = spaced ? text.split(/\s+/) : Array.from(text);
+  const separator = spaced ? " " : "";
+  const lines:string[] = [];
+  let line = "";
+  for (const token of tokens) {
+    const candidate = line ? `${line}${separator}${token}` : token;
+    if (!line || context.measureText(candidate).width <= maxWidth) line = candidate;
+    else { lines.push(line); line = token; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+async function downloadCoverFile(url:string, filename:string, headline:string, titlePosition:string, screenRatio:string) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Download failed (${response.status})`);
-  const objectUrl = URL.createObjectURL(await response.blob());
+  const sourceUrl = URL.createObjectURL(await response.blob());
+  const image = new Image();
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("Could not prepare the cover image"));
+    image.src = sourceUrl;
+  });
+  const canvas = document.createElement("canvas");
+  const ratio = normalizeScreenRatio(screenRatio);
+  const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
+  canvas.width = dimensions.width; canvas.height = dimensions.height;
+  const context = canvas.getContext("2d");
+  if (!context) { URL.revokeObjectURL(sourceUrl); throw new Error("Cover text rendering is unavailable"); }
+  const scale = Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+  const sourceWidth = canvas.width / scale; const sourceHeight = canvas.height / scale;
+  const sourceX = (image.naturalWidth - sourceWidth) / 2; const sourceY = (image.naturalHeight - sourceHeight) / 2;
+  context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+  const text = headline.trim();
+  if (text) {
+    const width = canvas.width; const height = canvas.height;
+    const [vertical, horizontal] = normalizeCoverTitlePosition(titlePosition).split("-");
+    const gradient = context.createLinearGradient(0, 0, 0, height);
+    if (vertical === "top") {
+      gradient.addColorStop(0, "rgba(0,0,0,.88)");
+      gradient.addColorStop(.45, "rgba(0,0,0,.18)");
+      gradient.addColorStop(.68, "rgba(0,0,0,0)");
+    } else if (vertical === "middle") {
+      gradient.addColorStop(0, "rgba(0,0,0,0)");
+      gradient.addColorStop(.28, "rgba(0,0,0,.18)");
+      gradient.addColorStop(.5, "rgba(0,0,0,.76)");
+      gradient.addColorStop(.72, "rgba(0,0,0,.18)");
+      gradient.addColorStop(1, "rgba(0,0,0,0)");
+    } else {
+      gradient.addColorStop(.32, "rgba(0,0,0,0)");
+      gradient.addColorStop(.58, "rgba(0,0,0,.42)");
+      gradient.addColorStop(1, "rgba(0,0,0,.9)");
+    }
+    context.fillStyle = gradient; context.fillRect(0, 0, width, height);
+    const maxWidth = width * .84;
+    let fontSize = Math.round(width * .085);
+    let lines:string[] = [];
+    do {
+      context.font = `800 ${fontSize}px Arial, sans-serif`;
+      lines = wrapCoverText(context, text, maxWidth);
+      if (lines.length <= 3) break;
+      fontSize -= Math.max(2, Math.round(width * .004));
+    } while (fontSize > width * .045);
+    lines = lines.slice(0, 3);
+    const lineHeight = fontSize * 1.06;
+    const x = horizontal === "center" ? width * .5 : horizontal === "right" ? width * .92 : width * .08;
+    const firstBaseline = vertical === "top"
+      ? height * .1 + fontSize
+      : vertical === "middle"
+        ? height * .5 - lineHeight * (lines.length - 1) * .5 + fontSize * .35
+        : height * .915 - lineHeight * (lines.length - 1);
+    const accentWidth = width * .13;
+    const accentX = horizontal === "center" ? x - accentWidth * .5 : horizontal === "right" ? x - accentWidth : x;
+    const strokeWidth = Math.max(5, fontSize * .12);
+    const textAscent = Math.max(fontSize * .82, context.measureText(lines[0] || text).actualBoundingBoxAscent || 0);
+    const accentHeight = Math.max(6, width * .008);
+    const accentGap = Math.max(8, fontSize * .18);
+    const accentY = Math.max(height * .025, firstBaseline - textAscent - strokeWidth * .5 - accentGap - accentHeight);
+    context.fillStyle = "#d7a552";
+    context.fillRect(accentX, accentY, accentWidth, accentHeight);
+    context.textBaseline = "alphabetic";
+    context.textAlign = horizontal === "center" ? "center" : horizontal === "right" ? "right" : "left";
+    context.lineJoin = "round";
+    context.strokeStyle = "rgba(0,0,0,.82)";
+    context.lineWidth = strokeWidth;
+    context.fillStyle = "#fffdf7";
+    lines.forEach((line, index) => {
+      const y = firstBaseline + index * lineHeight;
+      context.strokeText(line, x, y, maxWidth);
+      context.fillText(line, x, y, maxWidth);
+    });
+  }
+  URL.revokeObjectURL(sourceUrl);
+  const result = await new Promise<Blob>((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Could not create the cover download")), "image/png"));
+  const objectUrl = URL.createObjectURL(result);
   const link = document.createElement("a");
   link.href = objectUrl; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
@@ -140,6 +244,8 @@ export default function StudioApp() {
   const [message, setMessage] = useState("Ready");
   const [previewUrl, setPreviewUrl] = useState("");
   const [downloadUrl, setDownloadUrl] = useState("");
+  const [coverHeadline, setCoverHeadline] = useState("");
+  const [coverTitlePosition, setCoverTitlePosition] = useState("bottom-left");
   const [coverPrompt, setCoverPrompt] = useState("");
   const [covers, setCovers] = useState<CoverImage[]>([]);
   const [videoBuilds, setVideoBuilds] = useState<VideoBuild[]>([]);
@@ -168,7 +274,7 @@ export default function StudioApp() {
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
   function persistProject(snapshot = projectSnapshot()) {
@@ -193,6 +299,8 @@ export default function StudioApp() {
     const savedBgmVolume = Number(parsed.bgmVolume);
     setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || "Review then batch"); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
     setSubtitleStyle(normalizeSubtitleStyle(parsed.subtitleStyle));
+    setCoverHeadline(String(parsed.coverHeadline || ""));
+    setCoverTitlePosition(normalizeCoverTitlePosition(parsed.coverTitlePosition));
     setCoverPrompt(String(parsed.coverPrompt || ""));
     setCovers((Array.isArray(parsed.covers) ? parsed.covers : []).map((cover:CoverImage) => ({ ...cover, url:cover.url || (cover.path.startsWith("/") ? `${SERVICE}${cover.path}` : cover.path) })));
     const savedBuilds = Array.isArray(parsed.videoBuilds) ? parsed.videoBuilds : [];
@@ -231,7 +339,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio]);
+  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio]);
 
   async function refreshProviderStatus() {
     try {
@@ -286,7 +394,7 @@ export default function StudioApp() {
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     const id = createEpisodeId();
-    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), mode:"Review then batch", previewUrl:"", downloadUrl:"", coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
+    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* IndexedDB is the primary cache */ }
@@ -608,9 +716,8 @@ export default function StudioApp() {
 
   async function downloadCover(cover:CoverImage) {
     try {
-      let extension = ".png";
-      try { extension = new URL(cover.url).pathname.match(/\.(?:png|jpe?g|webp)$/i)?.[0]?.toLowerCase() || ".png"; } catch { /* PNG fallback */ }
-      await downloadRemoteFile(cover.url, `${safeFileStem(title)}-cover-${cover.screenRatio.replace(":","x")}${extension}`);
+      const headline = coverHeadline.trim() || title.trim() || "Watch this story";
+      await downloadCoverFile(cover.url, `${safeFileStem(title)}-cover-${cover.screenRatio.replace(":","x")}.png`, headline, coverTitlePosition, cover.screenRatio);
       setMessage(`${cover.screenRatio} cover downloaded.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Cover download failed"); }
   }
@@ -654,7 +761,7 @@ export default function StudioApp() {
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} audioData={audioData} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
-          {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} videoBuilds={videoBuilds} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
+          {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} videoBuilds={videoBuilds} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
         </>}
       </section>
 
@@ -832,7 +939,7 @@ function Captions({ script, shots, updateShot, translateAll, audioName, audioDat
       <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} aria-label={`English caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/><textarea className="chinese" value={shot.chinese} aria-label={`Chinese caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/></div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>No captions yet</h2><p>AI-generated bilingual lines appear after script analysis.</p></div>}</div></div></div>;
 }
 
-function ExportPanel({ title, productionMode, shots, approved, duration, audioName, bgm, build, previewUrl, downloadUrl, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, videoBuilds, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
+function ExportPanel({ title, productionMode, shots, approved, duration, audioName, bgm, build, previewUrl, downloadUrl, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, videoBuilds, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
   const longScenes = productionMode === "long-scenes";
   const coverage = visualCoverage(shots);
   const ready = Boolean(coverage.complete && audioName);
@@ -854,12 +961,13 @@ function ExportPanel({ title, productionMode, shots, approved, duration, audioNa
   return <div className="panel export-panel"><div className="section-head export-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Build each screen ratio you need. Every finished video is saved below with its render path, preview, and download.</p></div><label className="output-select"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label></div><div className="export-grid">
     <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">CURRENT VIDEO</span><h2>Review the final cut</h2></div><span>{selected.width} × {selected.height} · {screenRatio}</span></div><div className="build-video-stage"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{videoUrl ? <video key={videoUrl} ref={previewRef} controls autoPlay playsInline src={videoUrl} aria-label={`${selected.label} video preview`}/> : <div className="empty-visual"><span>▶</span><b>Video not built</b></div>}</div></div></div><div className="build-actions"><button className="primary large" onClick={build} disabled={!!busy || !ready}>{busy || "Build"}</button>{videoUrl ? <a className="ghost large" href={videoUrl} download>Download</a> : <button className="ghost large" disabled>Download</button>}</div></div>
     <div className="export-side"><div className="export-card subtitle-export-card"><span className="eyebrow">YOUTUBE</span><h2>Add subtitles</h2><p>Reach a broader audience by adding subtitle files to your video. These SRT tracks use the timing from your reviewed captions.</p><div className="subtitle-downloads"><button className="ghost" type="button" disabled={!hasEnglish} onClick={() => downloadSubtitleFile(title, shots, "english")}><b>English</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasChinese} onClick={() => downloadSubtitleFile(title, shots, "chinese")}><b>简体中文</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasEnglish && !hasChinese} onClick={() => downloadSubtitleFile(title, shots, "bilingual")}><b>Bilingual</b><span>Download .srt</span></button></div><small>For selectable YouTube captions, upload English and Chinese as separate language tracks. Use Bilingual to show both together.</small></div><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>{longScenes ? "Scene plan" : "Storyboard"} <b>{shots.length} {longScenes ? "scenes" : "shots"}</b></div><div className={coverage.complete?'ok':'warn'}>Visual coverage <b>{coverage.ready}/{coverage.total} ready</b></div><div className="optional">Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length}</b></div><div className="optional">{productionMode === "mixed" ? "Selected videos" : longScenes ? "Long clips" : "Animated clips"} <b>{productionMode === "mixed" ? `${shots.filter((s:Shot)=>s.video).length}/${shots.filter((s:Shot)=>s.videoRecommended).length} recommended` : `${shots.filter((s:Shot)=>s.video).length}/${shots.length}`}</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Each segment needs either an image or a video. When both exist, the generated video is used.</small></div></div>
-  </div><CoverStudio coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy}/>{videoBuilds.length > 0 && <section className="build-library"><div className="build-library-head"><div><span className="eyebrow">CREATED VIDEOS</span><h2>All builds</h2></div><span>{videoBuilds.length} saved {videoBuilds.length === 1 ? "video" : "videos"}</span></div><div className="build-library-grid">{videoBuilds.map((item:VideoBuild) => <article className="saved-build" key={item.id}><div className={`saved-build-preview ratio-${item.screenRatio.replace(':','-')}`}><video controls preload="metadata" src={item.url} aria-label={`${item.screenRatio} video built ${item.createdAt ? new Date(item.createdAt).toLocaleString() : ""}`}/></div><div className="saved-build-body"><div className="saved-build-title"><div><span>{item.screenRatio}</span><b>{item.width} × {item.height}</b></div><time>{item.createdAt ? new Date(item.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier build"}</time></div><code title={item.path || item.url}>{item.path || item.url}</code><a className="ghost" href={item.url} download>Download video</a></div></article>)}</div></section>}</div>;
+  </div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy}/>{videoBuilds.length > 0 && <section className="build-library"><div className="build-library-head"><div><span className="eyebrow">CREATED VIDEOS</span><h2>All builds</h2></div><span>{videoBuilds.length} saved {videoBuilds.length === 1 ? "video" : "videos"}</span></div><div className="build-library-grid">{videoBuilds.map((item:VideoBuild) => <article className="saved-build" key={item.id}><div className={`saved-build-preview ratio-${item.screenRatio.replace(':','-')}`}><video controls preload="metadata" src={item.url} aria-label={`${item.screenRatio} video built ${item.createdAt ? new Date(item.createdAt).toLocaleString() : ""}`}/></div><div className="saved-build-body"><div className="saved-build-title"><div><span>{item.screenRatio}</span><b>{item.width} × {item.height}</b></div><time>{item.createdAt ? new Date(item.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier build"}</time></div><code title={item.path || item.url}>{item.path || item.url}</code><a className="ghost" href={item.url} download>Download video</a></div></article>)}</div></section>}</div>;
 }
 
-function CoverStudio({ coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, screenRatio, busy }:any) {
+function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, screenRatio, busy }:any) {
   const currentCover = covers.find((cover:CoverImage) => cover.screenRatio === screenRatio);
-  return <section className="cover-studio"><div className="build-library-head"><div><span className="eyebrow">VIDEO COVER</span><h2>Generate cover artwork</h2></div><span>{SCREEN_RATIOS[screenRatio as keyof typeof SCREEN_RATIOS]?.label || screenRatio} · {screenRatio}</span></div><div className="cover-studio-grid"><div className={`cover-preview ratio-${screenRatio.replace(":","-")}`}>{currentCover ? <img src={currentCover.url} alt={`Generated ${screenRatio} video cover`}/> : <div className="empty-visual"><span>✦</span><b>No {screenRatio} cover yet</b></div>}</div><div className="cover-controls"><p>Create cover artwork with the configured image provider. The result follows the current Storyboard ratio and is saved with this episode.</p><label className="field"><span>Cover direction</span><textarea rows={6} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)}/><small>The suggested prompt uses the episode title, script, format, visual style, and creative direction. Edit it for a different concept.</small></label><div className="cover-actions"><button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested prompt</button><button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download current</button>}</div></div></div>{covers.length > 0 && <div className="cover-history"><h3>Saved covers</h3><div>{covers.map((cover:CoverImage) => <article key={cover.id}><img src={cover.url} alt={`${cover.screenRatio} cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`}/><span><b>{cover.screenRatio}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span><button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download</button></article>)}</div></div>}</section>;
+  const headline = coverHeadline.trim() || defaultHeadline.trim() || "Watch this story";
+  return <section className={`cover-studio ratio-${screenRatio.replace(":","-")}`}><div className="build-library-head"><div><span className="eyebrow">VIDEO COVER</span><h2>{currentCover ? "Place the cover title" : "Generate cover artwork"}</h2></div><span>{SCREEN_RATIOS[screenRatio as keyof typeof SCREEN_RATIOS]?.label || screenRatio} · {screenRatio}</span></div><div className="cover-studio-grid"><div className={`cover-preview ${currentCover ? `has-cover title-${coverTitlePosition}` : ""}`} style={{ aspectRatio:screenRatio.replace(":"," / ") }}>{currentCover ? <><img src={currentCover.url} alt={`Generated ${screenRatio} video cover`}/><div className="cover-preview-shade"/><div className="cover-preview-copy"><i/><strong>{headline}</strong></div></> : <div className="empty-visual"><span>✦</span><b>Generate the artwork first</b><small>Then place the title while seeing the real image.</small></div>}</div><div className="cover-controls"><p>{currentCover ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p><label className="field"><span>Artwork direction</span><textarea rows={currentCover ? 3 : 5} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)}/><small>The image model creates artwork without unreliable generated lettering.</small></label>{currentCover && <div className="cover-title-editor"><label className="field cover-headline-field"><span>Cover headline</span><input maxLength={90} value={coverHeadline} placeholder={defaultHeadline || "Add an attention-grabbing headline"} onChange={(event) => setCoverHeadline(event.target.value)}/><small>Keep it short and specific. The episode title is used when this field is empty.</small></label><fieldset className="cover-position-field"><legend>Title position</legend><div>{COVER_TITLE_POSITIONS.map((option) => <button type="button" key={option.id} className={coverTitlePosition === option.id ? "chosen" : ""} title={option.label} aria-label={option.label} aria-pressed={coverTitlePosition === option.id} onClick={() => setCoverTitlePosition(option.id)}><i/></button>)}</div><small>Choose a clear area that does not cover the main subject.</small></fieldset></div>}<div className="cover-actions"><button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button><button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button>}</div></div></div>{covers.length > 0 && <div className="cover-history"><h3>Saved covers</h3><div>{covers.map((cover:CoverImage) => <article key={cover.id}><div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:cover.screenRatio.replace(":"," / ") }}><img src={cover.url} alt={`${cover.screenRatio} cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`}/><strong>{headline}</strong></div><span><b>{cover.screenRatio}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span><button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button></article>)}</div></div>}</section>;
 }
 
 function Settings({ provider, setProvider, status, refreshStatus, close }: any) {
