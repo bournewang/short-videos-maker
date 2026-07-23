@@ -33,12 +33,13 @@ export function normalizeCachedProject(value) {
       videoStatus,
       videoError:videoStatus === "failed" ? String(shot?.videoError || (interruptedVideo ? "Video generation was interrupted when the project closed." : "Video generation failed.")) : "",
       videoProvider:String(shot?.videoProvider || ""),
+      videoRecommended:Boolean(shot?.videoRecommended),
       status:shot?.status === "generating" || (shot?.status === "generated" && !image && !longScenes) ? "planned" : (shot?.status || "planned"),
     };
   }) : [];
   return {
     ...value,
-    productionMode:longScenes ? "long-scenes" : "short-shots",
+    productionMode:longScenes ? "long-scenes" : value.productionMode === "mixed" ? "mixed" : "short-shots",
     longClipDuration:Math.max(6, Math.min(12, Math.round(Number(value.longClipDuration) || 10))),
     subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle),
     shots,

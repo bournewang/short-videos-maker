@@ -32,3 +32,9 @@ export function videoResolution(value, screenRatio = "9:16") {
   if (ratio === "1:1") return { ...preset, height:preset.width };
   return preset;
 }
+
+export function visualCoverage(shots = []) {
+  const total = Array.isArray(shots) ? shots.length : 0;
+  const ready = total ? shots.filter((shot) => Boolean(shot?.video || shot?.image)).length : 0;
+  return { total, ready, complete:Boolean(total && ready === total) };
+}

@@ -91,13 +91,34 @@ function timestampBoundaries(shots, transcription, target, options = {}) {
   return boundaries;
 }
 
+function mixedVideoIndexes(shots) {
+  const limit = Math.min(shots.length, Math.max(1, Math.ceil(shots.length / 4)));
+  const requested = shots.map((shot, index) => shot.videoRecommended ? index : -1).filter((index) => index >= 0);
+  const evenlySample = (values, count) => count === 1
+    ? [values[Math.floor(values.length / 2)]]
+    : Array.from({ length:count }, (_, index) => values[Math.round(index * (values.length - 1) / (count - 1))]);
+  if (requested.length >= limit) return new Set(evenlySample(requested, limit));
+  const selected = new Set(requested);
+  const anchors = limit === 1 ? [0] : Array.from({ length:limit }, (_, index) => Math.round(index * (shots.length - 1) / (limit - 1)));
+  for (const anchor of anchors) {
+    if (selected.size >= limit) break;
+    const candidate = shots.map((shot, index) => ({
+      index,
+      score:Math.abs(index - anchor) - (shot.type === "Climax" ? 1.5 : shot.type === "Opening" ? 1 : shot.type === "Emotion" ? .5 : 0),
+    })).filter((item) => !selected.has(item.index)).sort((left, right) => left.score - right.score || left.index - right.index)[0];
+    if (candidate) selected.add(candidate.index);
+  }
+  return selected;
+}
+
 export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   if (!Array.isArray(input) || !input.length) throw new Error("The planning provider returned no shots");
   const usable = input.slice(0, 80).filter((item) => String(item?.narration || item?.text || item?.voiceover || "").trim());
   if (!usable.length) throw new Error("The planning provider returned no usable narrated shots");
   const longScenes = options.productionMode === "long-scenes";
+  const mixedMode = options.productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(options.targetClipDuration) || 10)));
-  const source = usable.map((item, index) => {
+  let source = usable.map((item, index) => {
     const narration = String(item?.narration || item?.text || item?.voiceover || "").trim();
     const type = allowedTypes.has(item?.type) ? item.type : (index === 0 ? "Opening" : "Narrative");
     const duration = Math.max(.6, Math.min(longScenes ? 12 : 8, Number(item?.duration) || (longScenes ? targetClipDuration : 2.5)));
@@ -116,9 +137,14 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
       chinese: String(item?.chinese || "").trim(),
       prompt: needsHistoricalAccuracy ? `${prompt.replace(/[.\s]+$/, "")}. ${historicalAccuracy}` : prompt,
       videoPrompt: String(item?.videoPrompt || (longScenes ? defaultLongVideoPrompt({ ...item, narration, motion }, index, options) : defaultVideoPrompt({ ...item, narration, motion }, index))).trim(),
+      videoRecommended:Boolean(item?.videoRecommended),
       motion,
     };
   });
+  if (mixedMode) {
+    const selectedVideos = mixedVideoIndexes(source);
+    source = source.map((shot, index) => ({ ...shot, videoRecommended:selectedVideos.has(index) }));
+  }
   const rawTotal = source.reduce((sum, shot) => sum + shot.duration, 0);
   const transcriptionDuration = Number(options.transcription?.duration);
   const target = Math.max(Number(audioDuration) || transcriptionDuration || rawTotal, source.length * .6);

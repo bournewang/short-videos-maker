@@ -6,14 +6,14 @@ import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
 import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
 import { DEFAULT_SUBTITLE_STYLE, SUBTITLE_FONTS, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
-import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution } from "./lib/video";
+import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution, visualCoverage } from "./lib/video";
 
 type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
   type: string; narration: string; chinese: string; prompt: string; videoPrompt: string; status: string;
   locked: boolean; image: string; variants: string[]; provider: string; seed: string; motion: string;
   imageStatus: string; imageError: string;
-  video: string; videoStatus: string; videoError: string; videoProvider: string;
+  video: string; videoStatus: string; videoError: string; videoProvider: string; videoRecommended: boolean;
 };
 
 type ProviderSettings = {
@@ -142,7 +142,7 @@ export default function StudioApp() {
     allowSave.current = true;
     setTitle(parsed.title || ""); setScript(parsed.script || "");
     setContentFormat(parsed.contentFormat || "Documentary"); setVisualStyle(parsed.visualStyle || "Photorealistic");
-    setCreativeDirection(parsed.creativeDirection || ""); setProductionMode(parsed.productionMode === "long-scenes" ? "long-scenes" : "short-shots"); setLongClipDuration(Math.max(6, Math.min(12, Math.round(Number(parsed.longClipDuration) || 10)))); setShots(parsed.shots || []); setSelectedId(parsed.shots?.[0]?.id || "");
+    setCreativeDirection(parsed.creativeDirection || ""); setProductionMode(parsed.productionMode === "long-scenes" ? "long-scenes" : parsed.productionMode === "mixed" ? "mixed" : "short-shots"); setLongClipDuration(Math.max(6, Math.min(12, Math.round(Number(parsed.longClipDuration) || 10)))); setShots(parsed.shots || []); setSelectedId(parsed.shots?.[0]?.id || "");
     setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
     const savedBgmVolume = Number(parsed.bgmVolume);
     setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || "Review then batch"); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
@@ -204,15 +204,16 @@ export default function StudioApp() {
   function touchProject() { allowSave.current = true; }
 
   function changeProductionMode(value:string) {
-    const next = value === "long-scenes" ? "long-scenes" : "short-shots";
+    const next = value === "long-scenes" ? "long-scenes" : value === "mixed" ? "mixed" : "short-shots";
     if (next === productionMode) return;
     if (shots.length && !window.confirm("Switching visual workflow requires a new AI plan and will replace the current storyboard. Continue?")) return;
     touchProject(); setProductionMode(next); setShots([]); setSelectedId(""); setPreviewUrl(""); setDownloadUrl("");
-    setMessage(next === "long-scenes" ? "Long-scene workflow selected. Run AI analysis to create direct text-to-video scenes." : "Short-shot workflow selected. Run AI analysis to create an image-led storyboard.");
+    setMessage(next === "long-scenes" ? "Long-scene workflow selected. Run AI analysis to create direct text-to-video scenes." : next === "mixed" ? "Mixed workflow selected. Run AI analysis to create a full image storyboard with a few recommended video clips." : "Short-shot workflow selected. Run AI analysis to create an image-led storyboard.");
   }
 
   function goToStage(nextStage:string) {
     if (nextStage === "storyboard" && stage !== "storyboard") setSelectedId(shots[0]?.id || "");
+    setEpisodesOpen(false);
     setStage(nextStage);
   }
 
@@ -277,13 +278,16 @@ export default function StudioApp() {
       persistProject(projectSnapshot({ shots:planned, selectedId:planned[0]?.id || "", stage:"storyboard", previewUrl:"", downloadUrl:"" }));
       setPreviewUrl(""); setDownloadUrl("");
       setShots(planned); setSelectedId(planned[0]?.id || ""); setStage("storyboard");
-      setMessage(`${planned.length} ${productionMode === "long-scenes" ? "long scenes" : "production shots"} planned${audioDuration ? " and fitted to the narration duration" : ""}.`);
+      setMessage(`${planned.length} ${productionMode === "long-scenes" ? "long scenes" : "production shots"} planned${productionMode === "mixed" ? ` · ${planned.filter((shot) => shot.videoRecommended).length} selected for video` : ""}${audioDuration ? " and fitted to the narration duration" : ""}.`);
       if (mode === "Fully automatic") {
         if (productionMode === "long-scenes") {
           await generateAllVideos(planned);
         } else if (provider.kind !== "sdwebui" && !provider.apiKey && !providerStatus.image.configured) {
           setMessage("Storyboard planned. Configure the image provider to continue automatic generation."); setSettingsOpen(true);
-        } else await generatePlannedShots(planned);
+        } else {
+          const generated = await generatePlannedShots(planned);
+          if (productionMode === "mixed" && generated) await generateAllVideos(generated, true);
+        }
       }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Planning failed"); }
     finally { setBusy(""); }
@@ -351,8 +355,9 @@ export default function StudioApp() {
     try {
       const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt: shot.prompt, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
-      updateShot(shot.id, { image, variants: [...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" });
-      return { ok:true, shot };
+      const generatedShot = { ...shot, image, variants:[...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" };
+      updateShot(shot.id, generatedShot);
+      return { ok:true, shot:generatedShot };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Generation failed";
       updateShot(shot.id, { status:"planned", imageStatus:"failed", imageError:reason });
@@ -380,9 +385,9 @@ export default function StudioApp() {
   }
 
   async function generateBatch(source: Shot[], successMessage: string) {
-    if (!imageProviderReady()) return;
+    if (!imageProviderReady()) return null;
     const pending = source.filter((shot) => !shot.locked && !shot.image && shot.status !== "generating");
-    if (!pending.length) { setMessage("No unlocked shots are waiting for image generation."); return; }
+    if (!pending.length) { setMessage("No unlocked shots are waiting for image generation."); return source; }
     touchProject();
     const concurrency = Math.max(1, Math.min(6, Math.floor(provider.imageConcurrency) || 3));
     const workerCount = Math.min(concurrency, pending.length);
@@ -391,13 +396,15 @@ export default function StudioApp() {
     setShots((current) => current.map((shot) => pendingIds.has(shot.id) ? { ...shot, imageStatus:"queued", imageError:"" } : shot));
     setBusy(`Generating images · 0/${pending.length} · ${workerCount} parallel`);
     try {
-      await mapWithConcurrency(pending, concurrency, async (shot:Shot) => {
+      const results = await mapWithConcurrency(pending, concurrency, async (shot:Shot) => {
         const result = await requestShotImage(shot);
         if (!result.ok) failures.push(`Shot ${shot.index + 1}: ${result.error}`);
         return result;
       }, ({ completed }: { completed:number }) => setBusy(`Generating images · ${completed}/${pending.length} · ${workerCount} parallel`));
       const completed = pending.length - failures.length;
       setMessage(failures.length ? `${completed}/${pending.length} images generated. ${failures.length} failed and can be retried.` : successMessage);
+      const generatedById = new Map(results.filter((result:any) => result.status === "fulfilled" && result.value?.ok).map((result:any) => [result.value.shot.id, result.value.shot]));
+      return source.map((shot) => generatedById.get(shot.id) || shot) as Shot[];
     } finally { setBusy(""); }
   }
 
@@ -406,7 +413,7 @@ export default function StudioApp() {
   }
 
   async function generatePlannedShots(planned:Shot[]) {
-    await generateBatch(planned, "AI planning and image generation completed.");
+    return await generateBatch(planned, "AI planning and image generation completed.");
   }
 
   async function videoProviderReady() {
@@ -438,7 +445,7 @@ export default function StudioApp() {
     try {
       const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, generationMode:productionMode, videoPrompt:shot.videoPrompt, image:directTextToVideo ? "" : shot.image, motion:shot.motion, duration:shot.duration, screenRatio }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Video generation failed");
-      updateShot(shot.id, { video:data.video, videoStatus:"generated", videoError:"", videoProvider:provider.videoModel, ...(directTextToVideo ? { status:"generated" } : {}) });
+      updateShot(shot.id, { video:data.video, videoStatus:"generated", videoError:"", videoProvider:provider.videoModel, ...(directTextToVideo ? { status:"generated" } : {}), ...(productionMode === "mixed" ? { videoRecommended:true } : {}) });
       return { ok:true, shot };
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Video generation failed";
@@ -470,24 +477,25 @@ export default function StudioApp() {
     }
   }
 
-  async function generateAllVideos(source:Shot[] = shots) {
+  async function generateAllVideos(source:Shot[] = shots, recommendedOnly = productionMode === "mixed") {
     if (!await videoProviderReady()) return;
-    const pending = source.filter((shot) => !shot.locked && (productionMode === "long-scenes" || shot.image) && !shot.video && shot.videoStatus !== "generating");
-    if (!pending.length) { setMessage(productionMode === "long-scenes" ? "No unlocked long scenes are waiting for video generation." : "No unlocked storyboard images are waiting for animation."); return; }
+    const blockedRecommended = recommendedOnly ? source.filter((shot) => shot.videoRecommended && !shot.image && !shot.video) : [];
+    const pending = source.filter((shot) => !shot.locked && (productionMode === "long-scenes" || shot.image) && (!recommendedOnly || shot.videoRecommended) && !shot.video && shot.videoStatus !== "generating");
+    if (!pending.length) { setMessage(productionMode === "long-scenes" ? "No unlocked long scenes are waiting for video generation." : recommendedOnly && blockedRecommended.length ? `${blockedRecommended.length} recommended shots still need images before animation.` : recommendedOnly ? "No recommended storyboard shots are waiting for animation." : "No unlocked storyboard images are waiting for animation."); return; }
     touchProject();
     const concurrency = Math.max(1, Math.min(4, Math.floor(provider.videoConcurrency) || 2));
     const failures:string[] = [];
     const pendingIds = new Set(pending.map((shot) => shot.id));
     setShots((current) => current.map((shot) => pendingIds.has(shot.id) ? { ...shot, videoStatus:"queued", videoError:"" } : shot));
-    setBusy(`${productionMode === "long-scenes" ? "Generating long scenes" : "Animating clips"} · 0/${pending.length} · Volcengine may take several minutes`);
+    setBusy(`${productionMode === "long-scenes" ? "Generating long scenes" : recommendedOnly ? "Animating selected shots" : "Animating clips"} · 0/${pending.length} · Volcengine may take several minutes`);
     try {
       await mapWithConcurrency(pending, concurrency, async (shot:Shot) => {
         const result = await requestShotVideo(shot);
         if (!result.ok) failures.push(`Shot ${shot.index + 1}: ${result.error}`);
         return result;
-      }, ({ completed }:{ completed:number }) => setBusy(`${productionMode === "long-scenes" ? "Generating long scenes" : "Animating clips"} · ${completed}/${pending.length} · ${Math.min(concurrency, pending.length)} parallel`));
+      }, ({ completed }:{ completed:number }) => setBusy(`${productionMode === "long-scenes" ? "Generating long scenes" : recommendedOnly ? "Animating selected shots" : "Animating clips"} · ${completed}/${pending.length} · ${Math.min(concurrency, pending.length)} parallel`));
       const completed = pending.length - failures.length;
-      setMessage(failures.length ? `${completed}/${pending.length} clips generated. ${failures.length} failed and can be retried.` : productionMode === "long-scenes" ? "All long scenes now have locally cached video clips." : "All unlocked shots now have locally cached video clips.");
+      setMessage(failures.length ? `${completed}/${pending.length} clips generated. ${failures.length} failed and can be retried.` : productionMode === "long-scenes" ? "All long scenes now have locally cached video clips." : recommendedOnly && blockedRecommended.length ? `${completed} recommended clips generated; ${blockedRecommended.length} selected shots still need images.` : recommendedOnly ? "All recommended mixed-mode shots now have video clips." : "All unlocked shots now have locally cached video clips.");
     } finally { setBusy(""); }
   }
 
@@ -510,7 +518,7 @@ export default function StudioApp() {
   async function renderVideo(resolution:string) {
     if (!audioData) { setMessage("Upload the recorded narration before building the video."); setStage("episode"); return; }
     if (!shots.length) { setMessage("Analyze the script before building the video."); setStage("episode"); return; }
-    if (productionMode === "long-scenes" ? shots.some((shot) => !shot.video) : shots.some((shot) => !shot.image)) { setMessage(productionMode === "long-scenes" ? "Generate a video for every long scene before building the final video." : "Generate an image for every storyboard shot before building the video. Animated clips are optional."); goToStage("storyboard"); return; }
+    if (!visualCoverage(shots).complete) { setMessage("Every storyboard segment needs either a generated image or a video clip before building."); goToStage("storyboard"); return; }
     const preset = videoResolution(resolution, screenRatio);
     setPreviewUrl(""); setDownloadUrl("");
     setBusy(`Building ${preset.label} video`);
@@ -546,9 +554,10 @@ export default function StudioApp() {
     <main className="studio-shell">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">S</div><div><strong>Shortform</strong><span>STUDIO</span></div></div>
-        <nav aria-label="Production stages">
+        <nav aria-label="Workspace navigation">
+          <button type="button" onClick={() => void openEpisodeLibrary()} className={episodesOpen ? "nav-active" : ""} disabled={!!activityLabel} aria-current={episodesOpen ? "page" : undefined}><span>LIB</span>Episodes</button>
           {[['episode','01','Episode'],['storyboard','02','Storyboard'],['captions','03','Audio & captions'],['export','04','Build & Preview']].map(([id, n, label]) => (
-            <button key={id} onClick={() => goToStage(id)} className={stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
+            <button key={id} onClick={() => goToStage(id)} className={!episodesOpen && stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
           ))}
         </nav>
         <div className="sidebar-foot"><span className="local-dot"/>Local workspace<div>Nothing leaves this device until a provider is called.</div></div>
@@ -557,26 +566,27 @@ export default function StudioApp() {
       <section className="workspace">
         <header className="topbar">
           <div><span className="eyebrow">CURRENT EPISODE</span><input className="title-input" value={title} placeholder="Untitled episode" onChange={(e) => { touchProject(); setTitle(e.target.value); }} aria-label="Episode title" /></div>
-          <div className="top-actions"><span className="save-state">● Saved locally</span><button className="ghost episodes-button" onClick={() => void openEpisodeLibrary()} disabled={!!activityLabel}>Episodes</button><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
+          <div className="top-actions"><span className="save-state">● Saved locally</span><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
         </header>
 
-        {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
-        {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} audioData={audioData} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
-        {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
-        {stage === "export" && <ExportPanel productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
+        {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} /> : <>
+          {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
+          {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} audioData={audioData} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
+          {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
+          {stage === "export" && <ExportPanel productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
+        </>}
       </section>
 
       <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
-      {episodesOpen && <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} close={() => setEpisodesOpen(false)} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
 }
 
-function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode, close }:any) {
-  return <div className="modal-backdrop" onMouseDown={(event)=>{if(event.target===event.currentTarget)close();}}><div className="modal episode-library"><div className="modal-head"><div><span className="eyebrow">LOCAL WORKSPACE</span><h2>Episodes</h2></div><button onClick={close} aria-label="Close episode library">×</button></div><div className="episode-library-intro"><p>Every episode is saved locally on this device, including its script, narration, storyboard, captions, and generated assets.</p><button className="primary" onClick={newEpisode}>New episode</button></div>
+function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode }:any) {
+  return <div className="panel episode-library-page"><div className="section-head"><div><span className="eyebrow">LOCAL WORKSPACE</span><h1>Episodes</h1><p>Every episode is saved locally on this device, including its script, narration, storyboard, captions, and generated assets.</p></div><button className="primary large" onClick={newEpisode}>New episode</button></div>
     {loading ? <div className="episode-library-empty">Loading saved episodes…</div> : episodes.length ? <div className="episode-history">{episodes.map((episode:EpisodeSummary) => <article key={episode.id} className={episode.id === currentId ? "current" : ""}><button className="episode-open" onClick={() => openEpisode(episode.id)}><span className="episode-title"><b>{episode.title}</b>{episode.id === currentId && <em>Current</em>}</span><span className="episode-meta"><time>{formatEpisodeDate(episode.savedAt)}</time><i>{episode.shotCount} shots</i><i>{formatTime(episode.duration)}</i><i>{episode.hasNarration ? "Narration attached" : "No narration"}</i></span></button><button className="episode-delete" onClick={() => deleteEpisode(episode)} aria-label={`Delete ${episode.title}`}>Delete</button></article>)}</div> : <div className="episode-library-empty"><b>No saved episodes yet</b><span>Start a new episode and it will appear here automatically.</span></div>}
-  </div></div>;
+  </div>;
 }
 
 function formatEpisodeDate(savedAt:number) {
@@ -587,7 +597,7 @@ function formatEpisodeDate(savedAt:number) {
 function EpisodePanel({ title, setTitle, script, setScript, contentFormat, setContentFormat, visualStyle, setVisualStyle, creativeDirection, setCreativeDirection, productionMode, setProductionMode, longClipDuration, setLongClipDuration, mode, setMode, touchProject, audioName, transcription, handleAudio, analyze, busy }: any) {
   return <div className="panel intake-panel"><div className="section-head"><div><span className="eyebrow">SOURCE MATERIAL</span><h1>Create an episode</h1><p>Add the finished script and recorded narration. Choose quick image-led shots or longer text-to-video scenes.</p></div><button className="primary large" onClick={analyze} disabled={!!busy}>{busy || "Analyze with AI"}</button></div>
     <div className="intake-grid"><label className="field episode-title-field"><span>Episode title</span><input value={title} placeholder="Give this episode a recognizable title…" onChange={(e) => { touchProject(); setTitle(e.target.value); }} autoComplete="off"/></label><label className="field span-2"><span>English script</span><textarea value={script} placeholder="Paste the exact English narration script here…" onChange={(e) => { touchProject(); setScript(e.target.value); }} rows={13}/><small>{script.trim() ? script.trim().split(/\s+/).length : 0} words</small></label>
-      <div className="stack"><label className="field"><span>Content format</span><select value={contentFormat} onChange={(e) => { touchProject(); setContentFormat(e.target.value); }}><option>Documentary</option><option>Educational explainer</option><option>Narrative story</option><option>News recap</option><option>Product story</option><option>History documentary</option><option>Other</option></select></label><label className="field"><span>Visual style</span><select value={visualStyle} onChange={(e) => { touchProject(); setVisualStyle(e.target.value); }}><option>Photorealistic</option><option>Cinematic illustration</option><option>Editorial collage</option><option>3D animation</option><option>Anime</option><option>Minimal graphic</option></select></label><label className="field"><span>Creative direction</span><input value={creativeDirection} placeholder="Audience, mood, setting, visual constraints…" onChange={(e) => { touchProject(); setCreativeDirection(e.target.value); }}/></label><label className="field workflow-field"><span>Visual workflow</span><select value={productionMode} onChange={(e) => { touchProject(); setProductionMode(e.target.value); }}><option value="short-shots">Dynamic short shots · image first</option><option value="long-scenes">Long scenes · direct text to video</option></select><small>{productionMode === "long-scenes" ? "No storyboard images are generated." : "Create images, then optionally animate them."}</small></label>{productionMode === "long-scenes" && <label className="field clip-length-field"><span>Target clip length</span><div><input aria-label="Target long-scene clip length" type="range" min="6" max="12" step="1" value={longClipDuration} onChange={(e) => { touchProject(); setLongClipDuration(Number(e.target.value)); }}/><output>{longClipDuration}s</output></div><small>Adjustable from 6–12 seconds; scene boundaries follow natural pauses.</small></label>}<label className="field"><span>Generation mode</span><select value={mode} onChange={(e) => { touchProject(); setMode(e.target.value); }}><option>Plan only</option><option>Review then batch</option><option>Fully automatic</option></select></label>
+      <div className="stack"><label className="field"><span>Content format</span><select value={contentFormat} onChange={(e) => { touchProject(); setContentFormat(e.target.value); }}><option>Documentary</option><option>Educational explainer</option><option>Narrative story</option><option>News recap</option><option>Product story</option><option>History documentary</option><option>Other</option></select></label><label className="field"><span>Visual style</span><select value={visualStyle} onChange={(e) => { touchProject(); setVisualStyle(e.target.value); }}><option>Photorealistic</option><option>Cinematic illustration</option><option>Editorial collage</option><option>3D animation</option><option>Anime</option><option>Minimal graphic</option></select></label><label className="field"><span>Creative direction</span><input value={creativeDirection} placeholder="Audience, mood, setting, visual constraints…" onChange={(e) => { touchProject(); setCreativeDirection(e.target.value); }}/></label><label className="field workflow-field"><span>Visual workflow</span><select value={productionMode} onChange={(e) => { touchProject(); setProductionMode(e.target.value); }}><option value="short-shots">Dynamic short shots · image first</option><option value="mixed">Mixed · all images + selected videos</option><option value="long-scenes">Long scenes · direct text to video</option></select><small>{productionMode === "long-scenes" ? "No storyboard images are generated." : productionMode === "mixed" ? "All shots get images; about one in four is selected for video." : "Create images, then optionally animate them."}</small></label>{productionMode === "long-scenes" && <label className="field clip-length-field"><span>Target clip length</span><div><input aria-label="Target long-scene clip length" type="range" min="6" max="12" step="1" value={longClipDuration} onChange={(e) => { touchProject(); setLongClipDuration(Number(e.target.value)); }}/><output>{longClipDuration}s</output></div><small>Adjustable from 6–12 seconds; scene boundaries follow natural pauses.</small></label>}<label className="field"><span>Generation mode</span><select value={mode} onChange={(e) => { touchProject(); setMode(e.target.value); }}><option>Plan only</option><option>Review then batch</option><option>Fully automatic</option></select></label>
         <label className="upload-card"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Narration attached" : "Add recorded narration"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
 }
 
@@ -655,7 +665,7 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
     setShotAudioElapsed(0);
     let playFrame = 0;
     if (audio?.readyState && selected) {
-      const previewStart = Math.max(0, (Number(selected.start) || 0) - .2);
+      const previewStart = Math.max(0, Number(selected.start) || 0);
       audio.currentTime = Math.min(previewStart, audio.duration || previewStart);
       if (audioData && Number(selected.duration) > 0) {
         playFrame = window.requestAnimationFrame(() => {
@@ -666,7 +676,8 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
     return () => { if (playFrame) window.cancelAnimationFrame(playFrame); };
   }, [audioData, selected?.id, selected?.start, selected?.duration]);
   const longScenes = productionMode === "long-scenes";
-  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : "Storyboard"}</h1><p>Your {longScenes ? "text-to-video scenes" : "production shots"} will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No visual plan yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
+  const mixedMode = productionMode === "mixed";
+  if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>Your {longScenes ? "text-to-video scenes" : mixedMode ? "image shots and selected video moments" : "production shots"} will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No visual plan yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
   const manualImageLimit = Math.max(1, Math.min(6, Math.floor(Number(imageConcurrency)) || 3));
   const manualImageSlotFull = activeManualImageCount >= manualImageLimit;
   const manualVideoLimit = Math.max(1, Math.min(4, Math.floor(Number(videoConcurrency)) || 2));
@@ -675,8 +686,8 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
   const batchActionsBusy = otherWorkBusy || activeManualImageCount > 0 || activeManualVideoCount > 0;
   const currentScript = selected ? scriptSectionForDuration(script, transcription, selected.start, selected.end, totalDuration) : "";
   const shotStart = Math.max(0, Number(selected?.start) || 0);
-  const shotAudioStart = Math.max(0, shotStart - .2);
-  const shotAudioEnd = shotStart + Math.max(0, Number(selected?.duration) || 0) + .5;
+  const shotAudioStart = shotStart;
+  const shotAudioEnd = shotStart + Math.max(0, Number(selected?.duration) || 0);
   const shotAudioDuration = shotAudioEnd - shotAudioStart;
   function resetShotAudio(audio:HTMLAudioElement) {
     audio.pause();
@@ -692,15 +703,17 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
     try { await audio.play(); setShotAudioPlaying(true); }
     catch { setShotAudioPlaying(false); }
   }
-  return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : "Storyboard"}</h1><p>{shots.length} {longScenes ? "scenes" : "shots"} aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} clips ready <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/>{!longScenes && <button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button>}<button className="primary" onClick={() => generateAllVideos()} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : longScenes ? "Generate all long clips" : "Animate all shots"}</button></div></div>
+  const recommendedVideos = shots.filter((shot:Shot) => shot.videoRecommended).length;
+  return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>{shots.length} {longScenes ? "scenes" : "shots"} aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} clips ready{mixedMode ? ` · ${recommendedVideos} recommended` : ""} <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/>{!longScenes && <button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button>}<button className="primary" onClick={() => generateAllVideos()} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : longScenes ? "Generate all long clips" : mixedMode ? `Animate recommended (${recommendedVideos})` : "Animate all shots"}</button></div></div>
     <div className={`story-grid ratio-${screenRatio.replace(':','-')}`}><div className="shot-list" ref={shotListRef} aria-keyshortcuts="ArrowUp ArrowDown">{shots.map((shot: Shot) => <button key={shot.id} data-shot-id={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
-      <div className="thumb">{shot.video ? <video src={shot.video} muted playsInline aria-label="Generated scene clip"/> : shot.image ? <img src={shot.image} alt="Generated shot"/> : <span>{String(shot.index + 1).padStart(2,'0')}</span>}{shot.video && <i className="clip-badge">CLIP</i>}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? longScenes ? "generating" : "animating" : shot.video ? "clip ready" : longScenes ? "planned" : shot.status}</span></button>)}</div>
+      <div className="thumb">{shot.video ? <video src={shot.video} muted playsInline aria-label="Generated scene clip"/> : shot.image ? <img src={shot.image} alt="Generated shot"/> : null}<i className="shot-index-badge" aria-label={`Shot ${shot.index + 1}`}>{String(shot.index + 1).padStart(2,'0')}</i>{shot.video ? <i className="clip-badge">CLIP</i> : mixedMode && shot.videoRecommended ? <i className="video-pick-badge">VIDEO PICK</i> : null}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? longScenes ? "generating" : "animating" : shot.video ? "clip ready" : mixedMode && shot.videoRecommended ? "video selected" : longScenes ? "planned" : shot.status}</span></button>)}</div>
       {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/></div></div>
-        <div className={`shot-audio-preview ${audioData ? "" : "unavailable"}`}><audio ref={shotAudioRef} src={audioData || undefined} preload="metadata" autoPlay onPlay={() => setShotAudioPlaying(true)} onPause={() => setShotAudioPlaying(false)} onLoadedMetadata={(event) => { const audio = event.currentTarget; audio.currentTime = Math.min(shotAudioStart, audio.duration || shotAudioStart); if (audioData && shotAudioDuration) void audio.play().catch(() => setShotAudioPlaying(false)); }} onTimeUpdate={(event) => { const audio = event.currentTarget; const elapsed = Math.max(0, Math.min(shotAudioDuration, audio.currentTime - shotAudioStart)); setShotAudioElapsed(elapsed); if (audio.currentTime >= shotAudioEnd - .02) resetShotAudio(audio); }} onEnded={(event) => resetShotAudio(event.currentTarget)}/><button type="button" onClick={() => void toggleShotAudio()} disabled={!audioData || !shotAudioDuration} aria-label={`${shotAudioPlaying ? "Pause" : "Play"} narration for shot ${selected.index + 1}`}>{shotAudioPlaying ? "❚❚" : "▶"}</button><div><span>Shot narration · 0.2s lead / 0.5s tail</span><progress max={shotAudioDuration || 1} value={shotAudioElapsed}/></div><time>{formatTime(shotAudioElapsed)} / {formatTime(shotAudioDuration)}</time></div></div>
+        <div className={`shot-audio-preview ${audioData ? "" : "unavailable"}`}><audio ref={shotAudioRef} src={audioData || undefined} preload="metadata" autoPlay onPlay={() => setShotAudioPlaying(true)} onPause={() => setShotAudioPlaying(false)} onLoadedMetadata={(event) => { const audio = event.currentTarget; audio.currentTime = Math.min(shotAudioStart, audio.duration || shotAudioStart); if (audioData && shotAudioDuration) void audio.play().catch(() => setShotAudioPlaying(false)); }} onTimeUpdate={(event) => { const audio = event.currentTarget; const elapsed = Math.max(0, Math.min(shotAudioDuration, audio.currentTime - shotAudioStart)); setShotAudioElapsed(elapsed); if (audio.currentTime >= shotAudioEnd - .02) resetShotAudio(audio); }} onEnded={(event) => resetShotAudio(event.currentTarget)}/><button type="button" onClick={() => void toggleShotAudio()} disabled={!audioData || !shotAudioDuration} aria-label={`${shotAudioPlaying ? "Pause" : "Play"} narration for shot ${selected.index + 1}`}>{shotAudioPlaying ? "❚❚" : "▶"}</button><div><span>Shot narration</span><progress max={shotAudioDuration || 1} value={shotAudioElapsed}/></div><time>{formatTime(shotAudioElapsed)} / {formatTime(shotAudioDuration)}</time></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">{longScenes ? "SCENE" : "SHOT"} {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
           <div className="current-script" aria-live="polite"><div><span>Script in this {longScenes ? "scene" : "shot"}</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
           {!longScenes && <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/></label>}
           <label className="field"><span>{longScenes ? "Text-to-video prompt" : "Video prompt"}</span><textarea rows={7} value={selected.videoPrompt || ""} onChange={(e) => updateShot(selected.id,{videoPrompt:e.target.value,video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/><small>{longScenes ? "Describes the full scene directly; no reference image is sent to the video model." : "Created during AI analysis; describes subject action, environmental movement, and continuity from the generated first frame."}</small></label>
+          {mixedMode && <label className="mixed-video-toggle"><input type="checkbox" checked={Boolean(selected.videoRecommended)} onChange={(e) => updateShot(selected.id,{videoRecommended:e.target.checked})}/><span><b>Selected for batch video</b><small>Recommended clips are generated by the mixed-mode batch action. Existing clips remain in use if you later uncheck this.</small></span></label>}
           <div className="three-fields"><label className="field"><span>Duration</span><input type="number" min={longScenes ? "6" : "0.6"} max={longScenes ? "12" : "8"} step="0.1" value={selected.duration} onChange={(e) => updateShot(selected.id,{duration:Number(e.target.value)})}/></label><label className="field"><span>Motion</span><select value={selected.motion} onChange={(e) => updateShot(selected.id,{motion:e.target.value,video:'',videoStatus:'idle',videoError:'',videoProvider:''})}>{SHOT_MOTIONS.map((motion) => <option key={motion}>{motion}</option>)}</select></label><label className="field"><span>Status</span><select value={selected.status} onChange={(e) => updateShot(selected.id,{status:e.target.value})}><option>planned</option><option>approved</option><option>generated</option></select></label></div>
           <div className={`shot-generation-actions ${longScenes ? "single" : ""}`}>{!longScenes && <button className="ghost full" onClick={() => generateOne(selected)} disabled={selected.locked || selected.status === "generating" || selected.videoStatus === "generating" || otherWorkBusy || manualImageSlotFull}>{selected.status === "generating" ? "Generating…" : selected.image ? "Create another image" : "Generate image"}</button>}<button className="primary full" onClick={() => generateOneVideo(selected)} disabled={selected.locked || (!longScenes && !selected.image) || selected.videoStatus === "generating" || otherWorkBusy || manualVideoSlotFull}>{selected.videoStatus === "generating" ? "Generating…" : selected.video ? "Regenerate Volcengine clip" : longScenes ? "Generate long clip" : "Animate with Volcengine"}</button></div><GenerationTaskManager productionMode={productionMode} shot={selected} generateOne={generateOne} generateOneVideo={generateOneVideo} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={imageConcurrency} videoConcurrency={videoConcurrency}/></div></div>}
     </div><SubtitleStyleControls subtitleStyle={subtitleStyle} setSubtitleStyle={setSubtitleStyle}/></div>;
@@ -740,10 +753,8 @@ function Captions({ script, shots, updateShot, translateAll, audioName, audioDat
 
 function ExportPanel({ productionMode, shots, approved, duration, audioName, bgm, build, previewUrl, downloadUrl, downloadResolution, setDownloadResolution, screenRatio, busy }: any) {
   const longScenes = productionMode === "long-scenes";
-  const imagesReady = Boolean(shots.length && shots.every((shot:Shot) => shot.image));
-  const videosReady = Boolean(shots.length && shots.every((shot:Shot) => shot.video));
-  const visualsReady = longScenes ? videosReady : imagesReady;
-  const ready = Boolean(visualsReady && audioName);
+  const coverage = visualCoverage(shots);
+  const ready = Boolean(coverage.complete && audioName);
   const selected = videoResolution(downloadResolution, screenRatio);
   const videoUrl = previewUrl || downloadUrl;
   const previewRef = useRef<HTMLVideoElement | null>(null);
@@ -759,7 +770,7 @@ function ExportPanel({ productionMode, shots, approved, duration, audioName, bgm
   }, [videoUrl]);
   return <div className="panel export-panel"><div className="section-head export-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Uses the global screen ratio selected in Storyboard. Choose a resolution, build once, then preview or download that exact video.</p></div><label className="output-select"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label></div><div className="export-grid">
     <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">CURRENT VIDEO</span><h2>Review the final cut</h2></div><span>{selected.width} × {selected.height} · {screenRatio}</span></div><div className="build-video-stage"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{videoUrl ? <video key={videoUrl} ref={previewRef} controls autoPlay playsInline src={videoUrl} aria-label={`${selected.label} video preview`}/> : <div className="empty-visual"><span>▶</span><b>Video not built</b></div>}</div></div></div><div className="build-actions"><button className="primary large" onClick={build} disabled={!!busy || !ready}>{busy || "Build"}</button>{videoUrl ? <a className="ghost large" href={videoUrl} download>Download</a> : <button className="ghost large" disabled>Download</button>}</div></div>
-    <div className="export-side"><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>{longScenes ? "Scene plan" : "Storyboard"} <b>{shots.length} {longScenes ? "scenes" : "shots"}</b></div>{longScenes ? <div className={videosReady?'ok':'warn'}>Long clips <b>{shots.filter((s:Shot)=>s.video).length}/{shots.length} generated</b></div> : <><div className={imagesReady?'ok':'warn'}>Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length} generated</b></div><div className="optional">Animated clips <b>Optional · {shots.filter((s:Shot)=>s.video).length}/{shots.length}</b></div></>}<div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>{longScenes ? "Each planned scene requires a direct text-to-video clip before the final build." : "Every generated image receives subtle local motion. When a shot has an animated clip, that clip is used instead."}</small></div></div>
+    <div className="export-side"><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>{longScenes ? "Scene plan" : "Storyboard"} <b>{shots.length} {longScenes ? "scenes" : "shots"}</b></div><div className={coverage.complete?'ok':'warn'}>Visual coverage <b>{coverage.ready}/{coverage.total} ready</b></div><div className="optional">Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length}</b></div><div className="optional">{productionMode === "mixed" ? "Selected videos" : longScenes ? "Long clips" : "Animated clips"} <b>{productionMode === "mixed" ? `${shots.filter((s:Shot)=>s.video).length}/${shots.filter((s:Shot)=>s.videoRecommended).length} recommended` : `${shots.filter((s:Shot)=>s.video).length}/${shots.length}`}</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Each segment needs either an image or a video. When both exist, the generated video is used.</small></div></div>
   </div></div>;
 }
 

@@ -52,6 +52,22 @@ test("long scene source durations are limited to the provider maximum", () => {
   assert.equal(scene.duration, 12);
 });
 
+test("mixed mode recommends only about one video for every four shots", () => {
+  const shots = normalizePlannedShots(Array.from({ length:10 }, (_, index) => ({
+    narration:`Narration ${index + 1}.`, type:index === 5 ? "Climax" : index === 0 ? "Opening" : "Narrative", duration:2.5,
+    videoRecommended:[1, 5, 9].includes(index),
+  })), 25, { productionMode:"mixed" });
+  assert.equal(shots.filter((shot) => shot.videoRecommended).length, 3);
+  assert.deepEqual(shots.map((shot, index) => shot.videoRecommended ? index : -1).filter((index) => index >= 0), [1, 5, 9]);
+});
+
+test("mixed mode fills missing video recommendations across the episode", () => {
+  const shots = normalizePlannedShots(Array.from({ length:8 }, (_, index) => ({ narration:`Narration ${index + 1}.`, duration:2.5 })), 20, { productionMode:"mixed" });
+  assert.equal(shots.filter((shot) => shot.videoRecommended).length, 2);
+  assert.equal(shots[0].videoRecommended, true);
+  assert.equal(shots.at(-1).videoRecommended, true);
+});
+
 test("history image prompts enforce an era-accurate background", () => {
   const [shot] = normalizePlannedShots([{ narration:"In 1453, defenders watched the walls of Constantinople.", prompt:"Cinematic defenders overlooking a city at dawn, no text" }], 3, { contentFormat:"History documentary" });
   assert.match(shot.prompt, /exact historical era/i);

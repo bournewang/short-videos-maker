@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution } from "../app/lib/video.js";
+import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution, visualCoverage } from "../app/lib/video.js";
 
 test("download presets provide the requested vertical resolutions", () => {
   assert.deepEqual(Object.keys(VIDEO_RESOLUTIONS), ["480", "720", "1080"]);
@@ -27,4 +27,14 @@ test("screen ratio changes synchronize existing prompt framing", () => {
   assert.doesNotMatch(landscape, /9:16|vertical/i);
   assert.equal((landscape.match(/Final framing:/g) || []).length, 1);
   assert.match(promptForScreenRatio("Subject moves naturally.", "1:1"), /Square 1:1 screen ratio/);
+});
+
+test("build coverage accepts an image or a video for every segment", () => {
+  assert.deepEqual(visualCoverage([
+    { image:"image-one", video:"" },
+    { image:"", video:"video-two" },
+    { image:"image-three", video:"video-three" },
+  ]), { total:3, ready:3, complete:true });
+  assert.deepEqual(visualCoverage(Array.from({ length:6 }, (_, index) => ({ video:`video-${index + 1}` }))), { total:6, ready:6, complete:true });
+  assert.deepEqual(visualCoverage([{ image:"image-one" }, {}]), { total:2, ready:1, complete:false });
 });

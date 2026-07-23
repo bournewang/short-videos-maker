@@ -508,3 +508,24 @@ test("long-scene planning uses the selected 6-12 second target and direct video 
   assert.equal(shots.length, 8);
   assert.equal(shots.at(-1).end, 82);
 });
+
+test("mixed planning budgets a small set of image-to-video shots", async () => {
+  let providerPayload;
+  const providerShots = Array.from({ length:8 }, (_, index) => ({
+    narration:`Mixed narration ${index + 1}.`, chinese:`混合旁白 ${index + 1}。`, type:index === 0 ? "Opening" : index === 4 ? "Climax" : "Narrative", duration:3.25,
+    prompt:`Cinematic mixed storyboard image ${index + 1}, no text`, videoPrompt:`Natural motion for mixed shot ${index + 1}`, motion:"Slow drift", videoRecommended:index === 0 || index === 4,
+  }));
+  const fetchImpl = async (_url, options) => {
+    providerPayload = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ shots:providerShots }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"A complete mixed-mode narration.", audioDuration:26, productionMode:"mixed" }, { fetchImpl });
+  const planningInput = JSON.parse(providerPayload.messages[1].content);
+  assert.equal(planningInput.productionMode, "mixed");
+  assert.equal(planningInput.targetShotCount, 8);
+  assert.equal(planningInput.targetAnimatedShotCount, 2);
+  assert.match(providerPayload.messages[0].content, /roughly one in every four shots/i);
+  assert.equal(shots.filter((shot) => shot.videoRecommended).length, 2);
+  assert.equal(shots[0].videoRecommended, true);
+  assert.equal(shots[4].videoRecommended, true);
+});

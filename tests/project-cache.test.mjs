@@ -54,6 +54,16 @@ test("cached long-scene settings and video-only scenes are preserved", () => {
   assert.equal(cached.shots[0].videoStatus, "generated");
 });
 
+test("cached mixed-mode video selections are preserved", () => {
+  const cached = normalizeCachedProject({ productionMode:"mixed", shots:[
+    { narration:"Still image shot.", videoRecommended:false },
+    { narration:"Animated highlight.", videoRecommended:true },
+  ] });
+  assert.equal(cached.productionMode, "mixed");
+  assert.equal(cached.shots[0].videoRecommended, false);
+  assert.equal(cached.shots[1].videoRecommended, true);
+});
+
 test("invalid project cache values are ignored", () => {
   assert.equal(normalizeCachedProject(null), null);
   assert.equal(normalizeCachedProject("invalid"), null);
