@@ -168,6 +168,10 @@ export async function activateProjectCache(id) {
 }
 
 export async function listProjectCaches() {
+  return (await readAllProjectCaches()).map(episodeCacheSummary).filter(Boolean).sort((left, right) => right.savedAt - left.savedAt);
+}
+
+export async function readAllProjectCaches() {
   const database = await openDatabase();
   try {
     const store = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME);
@@ -175,15 +179,23 @@ export async function listProjectCaches() {
       new Promise((resolve, reject) => { const request = store.getAllKeys(); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); }),
       new Promise((resolve, reject) => { const request = store.getAll(); request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); }),
     ]);
-    const episodes = keys.map((key, index) => String(key).startsWith(EPISODE_KEY_PREFIX) ? episodeCacheSummary(values[index]) : null).filter(Boolean);
+    const episodes = keys.map((key, index) => String(key).startsWith(EPISODE_KEY_PREFIX) ? normalizeCachedProject(values[index]) : null).filter(Boolean);
     if (!episodes.length) {
       const legacyIndex = keys.findIndex((key, index) => key === ACTIVE_PROJECT_KEY && values[index]?.activeEpisodeId === undefined);
       if (legacyIndex >= 0) {
-        const legacy = episodeCacheSummary({ ...values[legacyIndex], id:"legacy-active" });
+        const legacy = normalizeCachedProject({ ...values[legacyIndex], id:"legacy-active" });
         if (legacy) episodes.push(legacy);
       }
     }
-    return episodes.sort((left, right) => right.savedAt - left.savedAt);
+    return episodes.sort((left, right) => (Number(right.savedAt) || 0) - (Number(left.savedAt) || 0));
+  } finally { database.close(); }
+}
+
+export async function readActiveProjectId() {
+  const database = await openDatabase();
+  try {
+    const active = await readDatabaseValue(database, ACTIVE_PROJECT_KEY, "Could not read the active episode cache");
+    return String(active?.activeEpisodeId || active?.id || "");
   } finally { database.close(); }
 }
 

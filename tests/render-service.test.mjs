@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { buildSubtitleAss, completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { buildSubtitleAss, completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -176,6 +176,7 @@ test("provider status reports configuration without exposing secrets", () => {
     VOLCENGINE_IMAGE_ENDPOINT:"https://volcengine.test/images",
     VOLCENGINE_VIDEO_ENDPOINT:"https://volcengine.test/videos",
     OPENAI_TEXT_ENDPOINT:"https://openai.test/chat",
+    SPEECH_ENDPOINT:"http://localhost:8010", SPEECH_MODEL:"mlx-community/Kokoro-test", SPEECH_VOICE:"af_test", SPEECH_LANGUAGE:"a", SPEECH_SPEED:"1.1",
   };
   const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
   Object.assign(process.env, environment);
@@ -184,6 +185,7 @@ test("provider status reports configuration without exposing secrets", () => {
     assert.deepEqual(status.image, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/images", model:"seedream-test", source:"environment" });
     assert.deepEqual(status.video, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/videos", model:"seedance-test", source:"environment" });
     assert.deepEqual(status.text, { configured:true, kind:"openai", endpoint:"https://openai.test/chat", model:"openai-text-test", source:"environment" });
+    assert.deepEqual(status.speech, { configured:true, endpoint:"http://localhost:8010", model:"mlx-community/Kokoro-test", voice:"af_test", language:"a", speed:1.1, source:"environment" });
     assert.doesNotMatch(JSON.stringify(status), /test-secret/);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
@@ -202,6 +204,48 @@ test("local transcription proxy sends audio and word timestamp options", async (
   assert.equal(requestUrl, "http://localhost:8000/v1/transcriptions");
   assert.equal(form.get("language"), "en"); assert.equal(form.get("word_timestamps"), "true"); assert.equal(form.get("file").name, "recording.mp3");
   assert.equal(result.text, "Hello world."); assert.equal(result.duration, 2.4); assert.equal(result.segments[0].words.length, 2);
+});
+
+test("MLX Audio synthesis proxy requests WAV narration with voice controls", async () => {
+  let requestUrl = ""; let request;
+  const wav = Buffer.from("RIFF-test-wave");
+  const fetchImpl = async (url, options) => {
+    requestUrl = url; request = options;
+    return new Response(wav, { status:200, headers:{ "Content-Type":"audio/wav" } });
+  };
+  const result = await synthesizeSpeech({
+    speechEndpoint:"http://localhost:8010",
+    speechModel:"mlx-community/Kokoro-82M-bf16",
+    speechVoice:"af_heart",
+    speechLanguage:"a",
+    speechSpeed:1.15,
+    speechInstruct:"Measured documentary narration",
+    input:"This is the episode narration.",
+  }, { fetchImpl });
+  assert.equal(requestUrl, "http://localhost:8010/v1/audio/speech");
+  assert.equal(request.method, "POST");
+  assert.deepEqual(JSON.parse(request.body), {
+    model:"mlx-community/Kokoro-82M-bf16",
+    input:"This is the episode narration.",
+    voice:"af_heart",
+    speed:1.15,
+    lang_code:"a",
+    instruct:"Measured documentary narration",
+    response_format:"wav",
+    stream:false,
+  });
+  assert.equal(result.audioData, `data:audio/wav;base64,${wav.toString("base64")}`);
+  assert.equal(result.filename, "mlx-af_heart.wav");
+});
+
+test("MLX Audio provider test uses the OpenAI-compatible model endpoint", async () => {
+  let requestUrl = "";
+  const result = await testProviderConnection({ target:"speech", speechEndpoint:"http://localhost:8010/v1/audio/speech", speechModel:"mlx-community/Kokoro-82M-bf16" }, {
+    fetchImpl:async (url) => { requestUrl = url; return new Response(JSON.stringify({ object:"list", data:[] }), { status:200, headers:{ "Content-Type":"application/json" } }); },
+  });
+  assert.equal(requestUrl, "http://localhost:8010/v1/models");
+  assert.equal(result.target, "speech");
+  assert.equal(result.model, "mlx-community/Kokoro-82M-bf16");
 });
 
 test("Volcengine image adapter sends a vertical Seedream request", async () => {

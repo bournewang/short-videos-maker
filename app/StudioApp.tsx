@@ -3,7 +3,8 @@
 
 import { ChangeEvent, useEffect, useRef, useState } from "react";
 import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
-import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readProjectCache, writeProjectCache } from "./lib/project-cache";
+import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readActiveProjectId, readAllProjectCaches, readProjectCache, writeProjectCache } from "./lib/project-cache";
+import { activateServerProject, deleteServerProject, importServerProjects, listServerProjects, readServerProject, writeServerProject } from "./lib/server-projects";
 import { DEFAULT_SUBTITLE_STYLE, SUBTITLE_FONTS, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
 import { buildSrt, subtitleFileName } from "./lib/subtitles";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
@@ -22,6 +23,7 @@ type ProviderSettings = {
   videoKind: "volcengine"; videoEndpoint: string; videoModel: string; videoApiKey: string; videoConcurrency: number;
   textKind: "openai" | "volcengine"; textEndpoint: string; textModel: string; textApiKey: string;
   transcriptionEndpoint: string; transcriptionLanguage: string; imageConcurrency: number;
+  speechEndpoint:string; speechModel:string; speechVoice:string; speechLanguage:string; speechSpeed:number; speechInstruct:string;
 };
 
 type Transcription = {
@@ -49,6 +51,7 @@ type ProviderStatus = {
   video: { configured: boolean; kind: "volcengine"; endpoint: string; model: string; source: string };
   text: { configured: boolean; kind:"openai" | "volcengine"; endpoint: string; model: string; source: string };
   transcription: { configured:boolean; endpoint:string; language:string; source:string };
+  speech: { configured:boolean; endpoint:string; model:string; voice:string; language:string; speed:number; source:string };
 };
 
 const SERVICE = "http://127.0.0.1:4317";
@@ -227,6 +230,7 @@ export default function StudioApp() {
   const [selectedId, setSelectedId] = useState("");
   const [audioName, setAudioName] = useState("");
   const [audioData, setAudioData] = useState("");
+  const [narrationAutoplayRequest, setNarrationAutoplayRequest] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
   const [denoiseNarration, setDenoiseNarration] = useState(true);
   const [transcription, setTranscription] = useState<Transcription | null>(null);
@@ -239,6 +243,7 @@ export default function StudioApp() {
   const [episodesOpen, setEpisodesOpen] = useState(false);
   const [episodeHistory, setEpisodeHistory] = useState<EpisodeSummary[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [storageState, setStorageState] = useState<"server" | "browser" | "saving" | "error">("saving");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("Ready");
@@ -256,18 +261,21 @@ export default function StudioApp() {
     apiKey: "", videoKind:"volcengine", videoEndpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", videoModel:"doubao-seedance-2-0-260128", videoApiKey:"", videoConcurrency:2,
     textKind:"openai", textEndpoint: "https://api.openai.com/v1/chat/completions", textModel: "gpt-4.1-mini", textApiKey: "",
     transcriptionEndpoint:"http://localhost:8000/v1/transcriptions", transcriptionLanguage:"en", imageConcurrency:3,
+    speechEndpoint:"http://localhost:8010/v1/audio/speech", speechModel:"mlx-community/Kokoro-82M-bf16", speechVoice:"af_heart", speechLanguage:"a", speechSpeed:1, speechInstruct:"",
   });
   const [providerStatus, setProviderStatus] = useState<ProviderStatus>({
     image: { configured:false, kind:"openai", endpoint:"", model:"", source:"default" },
     video: { configured:false, kind:"volcengine", endpoint:"", model:"", source:"default" },
     text: { configured:false, kind:"openai", endpoint:"", model:"", source:"default" },
     transcription: { configured:true, endpoint:"http://localhost:8000/v1/transcriptions", language:"en", source:"default" },
+    speech: { configured:true, endpoint:"http://localhost:8010/v1/audio/speech", model:"mlx-community/Kokoro-82M-bf16", voice:"af_heart", language:"a", speed:1, source:"default" },
   });
   const initialized = useRef(false);
   const allowSave = useRef(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cacheEpoch = useRef(0);
   const episodeIdRef = useRef(episodeId);
+  const serverStorageReady = useRef(false);
   const activeManualVideoIds = useRef(new Set<string>());
   const [activeManualVideoCount, setActiveManualVideoCount] = useState(0);
   const activeManualImageIds = useRef(new Set<string>());
@@ -277,15 +285,29 @@ export default function StudioApp() {
     return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
-  function persistProject(snapshot = projectSnapshot()) {
+  async function persistProject(snapshot = projectSnapshot()) {
     const epoch = cacheEpoch.current;
+    const savedSnapshot = { ...snapshot, savedAt:Date.now() };
+    setStorageState("saving");
     try {
-      const safeShots = (snapshot.shots as Shot[] || []).map((shot) => ({ ...shot, image:"", variants:[], imageStatus:"idle", imageError:"", video:"", videoStatus:"idle", videoError:"", status:shot.status === "generated" ? "planned" : shot.status }));
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...snapshot, audioData:"", previewUrl:"", downloadUrl:"", shots:safeShots }));
-    } catch { /* IndexedDB remains the primary local cache */ }
-    return writeProjectCache(snapshot).then(() => {
-      if (epoch !== cacheEpoch.current) return activateProjectCache(episodeIdRef.current);
-    }).catch(() => { /* lightweight localStorage fallback is already saved */ });
+      const safeShots = (savedSnapshot.shots as Shot[] || []).map((shot) => ({ ...shot, image:"", variants:[], imageStatus:"idle", imageError:"", video:"", videoStatus:"idle", videoError:"", status:shot.status === "generated" ? "planned" : shot.status }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...savedSnapshot, audioData:"", previewUrl:"", downloadUrl:"", shots:safeShots }));
+    } catch { /* server and IndexedDB writes below remain available */ }
+    const [serverResult, browserResult] = await Promise.allSettled([
+      writeServerProject(SERVICE, savedSnapshot),
+      writeProjectCache(savedSnapshot),
+    ]);
+    if (serverResult.status === "fulfilled") {
+      serverStorageReady.current = true;
+      setStorageState("server");
+    } else if (browserResult.status === "fulfilled") setStorageState("browser");
+    else setStorageState("error");
+    if (epoch !== cacheEpoch.current) {
+      await Promise.allSettled([
+        serverStorageReady.current ? activateServerProject(SERVICE, episodeIdRef.current) : Promise.resolve(),
+        activateProjectCache(episodeIdRef.current),
+      ]);
+    }
   }
 
   function applyProjectState(parsed:any, recoveryMessage = "") {
@@ -295,7 +317,7 @@ export default function StudioApp() {
     setTitle(parsed.title || ""); setScript(parsed.script || "");
     setContentFormat(parsed.contentFormat || "Documentary"); setVisualStyle(parsed.visualStyle || "Photorealistic");
     setCreativeDirection(parsed.creativeDirection || ""); setProductionMode(parsed.productionMode === "long-scenes" ? "long-scenes" : parsed.productionMode === "mixed" ? "mixed" : "short-shots"); setLongClipDuration(Math.max(6, Math.min(12, Math.round(Number(parsed.longClipDuration) || 10)))); setShots(parsed.shots || []); setSelectedId(parsed.shots?.[0]?.id || "");
-    setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
+    setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setNarrationAutoplayRequest(0); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
     const savedBgmVolume = Number(parsed.bgmVolume);
     setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || "Review then batch"); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
     setSubtitleStyle(normalizeSubtitleStyle(parsed.subtitleStyle));
@@ -317,11 +339,33 @@ export default function StudioApp() {
     if (initialized.current) return;
     let cancelled = false;
     void (async () => {
-      let parsed = null;
+      let parsed = null; let browserParsed = null;
       localStorage.removeItem("chronicle-studio-project");
       localStorage.removeItem("chronicle-studio-project-v2");
       localStorage.removeItem("chronicle-studio-project-v3");
-      try { parsed = await readProjectCache(); } catch { /* use compact fallback below */ }
+      try { browserParsed = await readProjectCache(); } catch { /* use compact fallback below */ }
+      try {
+        const browserEpisodes = await readAllProjectCaches();
+        let activeEpisodeId = await readActiveProjectId();
+        const migratedEpisodes = browserEpisodes.map((episode:any) => {
+          if (episode.id !== "legacy-active") return episode;
+          const id = createEpisodeId();
+          if (activeEpisodeId === "legacy-active") activeEpisodeId = id;
+          return { ...episode, id };
+        });
+        if (migratedEpisodes.length) await importServerProjects(SERVICE, migratedEpisodes, activeEpisodeId);
+        parsed = await readServerProject(SERVICE);
+        if (!parsed) {
+          const serverEpisodes = await listServerProjects(SERVICE);
+          if (serverEpisodes[0]?.id) {
+            parsed = await readServerProject(SERVICE, serverEpisodes[0].id);
+            await activateServerProject(SERVICE, serverEpisodes[0].id);
+          }
+        }
+        serverStorageReady.current = true;
+        setStorageState("server");
+      } catch { setStorageState(browserParsed ? "browser" : "error"); }
+      if (!parsed) parsed = browserParsed;
       if (!parsed) {
         try { parsed = normalizeCachedProject(JSON.parse(localStorage.getItem(STORAGE_KEY) || "null")); } catch { /* no recoverable cache */ }
       }
@@ -351,6 +395,7 @@ export default function StudioApp() {
       if (status.video?.configured) setProvider((current) => ({ ...current, videoKind:status.video.kind, videoEndpoint:status.video.endpoint, videoModel:status.video.model }));
       if (status.text.configured) setProvider((current) => ({ ...current, textKind:status.text.kind, textEndpoint:status.text.endpoint, textModel:status.text.model }));
       if (status.transcription?.endpoint) setProvider((current) => ({ ...current, transcriptionEndpoint:status.transcription.endpoint, transcriptionLanguage:status.transcription.language || "en" }));
+      if (status.speech?.source === "environment") setProvider((current) => ({ ...current, speechEndpoint:status.speech.endpoint, speechModel:status.speech.model, speechVoice:status.speech.voice, speechLanguage:status.speech.language, speechSpeed:status.speech.speed }));
     } catch { /* render bridge may still be starting */ }
   }
 
@@ -378,8 +423,13 @@ export default function StudioApp() {
 
   async function refreshEpisodeHistory() {
     setHistoryLoading(true);
-    try { setEpisodeHistory(await listProjectCaches() as EpisodeSummary[]); }
-    catch { setMessage("Could not read the local episode library."); }
+    try {
+      if (serverStorageReady.current) setEpisodeHistory(await listServerProjects(SERVICE) as EpisodeSummary[]);
+      else setEpisodeHistory(await listProjectCaches() as EpisodeSummary[]);
+    } catch {
+      try { setEpisodeHistory(await listProjectCaches() as EpisodeSummary[]); setStorageState("browser"); }
+      catch { setMessage("Could not read the episode library."); }
+    }
     finally { setHistoryLoading(false); }
   }
 
@@ -397,27 +447,35 @@ export default function StudioApp() {
     const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* IndexedDB is the primary cache */ }
-    await writeProjectCache(blank).catch(() => {});
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* server and IndexedDB writes below remain available */ }
+    await persistProject(blank);
   }
 
   async function openSavedEpisode(id:string) {
     if (id === episodeId) { setEpisodesOpen(false); return; }
     if (allowSave.current) await persistProject();
-    const parsed = await readProjectCache(id).catch(() => null);
+    const parsed = serverStorageReady.current
+      ? await readServerProject(SERVICE, id).catch(() => readProjectCache(id).catch(() => null))
+      : await readProjectCache(id).catch(() => null);
     if (!parsed) { setMessage("That saved episode could not be opened."); await refreshEpisodeHistory(); return; }
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     applyProjectState(parsed, `Opened ${parsed.title || "Untitled episode"} · ${parsed.shots?.length || 0} shots.`);
-    await activateProjectCache(id).catch(() => {});
+    await Promise.allSettled([
+      serverStorageReady.current ? activateServerProject(SERVICE, id) : Promise.resolve(),
+      activateProjectCache(id),
+    ]);
     setEpisodesOpen(false);
   }
 
   async function removeSavedEpisode(summary:EpisodeSummary) {
-    if (!window.confirm(`Delete “${summary.title}” from this device? This cannot be undone.`)) return;
+    if (!window.confirm(`Delete “${summary.title}”? Its server files will be moved to the recoverable local trash.`)) return;
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    const deleted = await deleteProjectCache(summary.id).then(() => true).catch(() => { setMessage("Could not delete the saved episode."); return false; });
+    const deleted = await Promise.all([
+      serverStorageReady.current ? deleteServerProject(SERVICE, summary.id) : Promise.resolve(),
+      deleteProjectCache(summary.id),
+    ]).then(() => true).catch(() => { setMessage("Could not delete the saved episode."); return false; });
     if (!deleted) return;
     if (summary.id === episodeId) { await newEpisode(false); return; }
     setMessage(`${summary.title} deleted from local history.`);
@@ -468,13 +526,12 @@ export default function StudioApp() {
     });
   }
 
-  async function handleAudio(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]; if (!file) return;
+  async function attachNarration(file:File, dataUrl:string, autoPlay = false) {
     touchProject();
     setPreviewUrl(""); setDownloadUrl("");
     setBusy("Reading narration timing");
-    const dataUrl = await fileToDataUrl(file);
     setAudioName(file.name); setAudioData(dataUrl); setTranscription(null);
+    if (autoPlay) setNarrationAutoplayRequest((current) => current + 1);
     const browserDuration = await readAudioDuration(file);
     if (browserDuration) setAudioDuration(browserDuration);
     setBusy("Transcribing narration locally");
@@ -489,6 +546,41 @@ export default function StudioApp() {
     } catch (error) {
       setMessage(`Narration loaded, but local transcription failed: ${error instanceof Error ? error.message : "Service unavailable"}`);
     } finally { setBusy(""); }
+  }
+
+  async function handleAudio(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]; if (!file) return;
+    await attachNarration(file, await fileToDataUrl(file));
+    event.target.value = "";
+  }
+
+  async function generateNarration() {
+    touchProject();
+    if (!script.trim()) { setMessage("Add the English narration script before generating speech."); return; }
+    if (!provider.speechEndpoint || !provider.speechModel) { setMessage("Configure the local MLX Audio service before generating narration."); setSettingsOpen(true); return; }
+    setBusy("Synthesizing narration");
+    try {
+      const response = await fetch(`${SERVICE}/audio/synthesize`, {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          speechEndpoint:provider.speechEndpoint,
+          speechModel:provider.speechModel,
+          speechVoice:provider.speechVoice,
+          speechLanguage:provider.speechLanguage,
+          speechSpeed:provider.speechSpeed,
+          speechInstruct:provider.speechInstruct,
+          input:script,
+        }),
+      });
+      const result = await response.json(); if (!response.ok) throw new Error(result.error || "Speech synthesis failed");
+      const blob = await (await fetch(result.audioData)).blob();
+      const file = new File([blob], result.filename || "mlx-narration.wav", { type:result.mimeType || "audio/wav" });
+      await attachNarration(file, result.audioData, true);
+    } catch (error) {
+      setMessage(`MLX Audio synthesis failed: ${error instanceof Error ? error.message : "Service unavailable"}`);
+      setBusy("");
+    }
   }
 
   function selectBgm(path: string) {
@@ -512,7 +604,7 @@ export default function StudioApp() {
   async function requestShotImage(shot: Shot) {
     updateShot(shot.id, { status:"generating", imageStatus:"generating", imageError:"" });
     try {
-      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt: shot.prompt, screenRatio }) });
+      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt:shot.prompt, screenRatio, episodeId, episodeTitle:title, assetKind:"images", assetName:shot.id }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
       const generatedShot = { ...shot, image, variants:[...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" };
       updateShot(shot.id, generatedShot);
@@ -602,7 +694,7 @@ export default function StudioApp() {
     if (!directTextToVideo && !shot.image) return { ok:false, shot, error:"Generate the storyboard image first" };
     updateShot(shot.id, { videoStatus:"generating", videoError:"", ...(directTextToVideo ? { status:"generating" } : {}) });
     try {
-      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, generationMode:productionMode, videoPrompt:shot.videoPrompt, image:directTextToVideo ? "" : shot.image, motion:shot.motion, duration:shot.duration, screenRatio }) });
+      const response = await fetch(`${SERVICE}/video/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ videoKind:provider.videoKind, endpoint:provider.videoEndpoint, model:provider.videoModel, apiKey:provider.videoApiKey, generationMode:productionMode, videoPrompt:shot.videoPrompt, image:directTextToVideo ? "" : shot.image, motion:shot.motion, duration:shot.duration, screenRatio, episodeId, episodeTitle:title, assetName:shot.id }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Video generation failed");
       updateShot(shot.id, { video:data.video, videoStatus:"generated", videoError:"", videoProvider:provider.videoModel, ...(directTextToVideo ? { status:"generated" } : {}), ...(productionMode === "mixed" ? { videoRecommended:true } : {}) });
       return { ok:true, shot };
@@ -682,7 +774,7 @@ export default function StudioApp() {
     setPreviewUrl(""); setDownloadUrl("");
     setBusy(`Building ${preset.label} video`);
     try {
-      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title, shots, narrationData: audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, width:preset.width, height:preset.height }) });
+      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ episodeId, title, shots, narrationData:audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, width:preset.width, height:preset.height }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Render failed");
       const requestedStyle = normalizeSubtitleStyle(subtitleStyle); const renderedStyle = data.subtitleStyle ? normalizeSubtitleStyle(data.subtitleStyle) : null;
       if (!renderedStyle || JSON.stringify(renderedStyle) !== JSON.stringify(requestedStyle)) throw new Error("The render service is outdated and did not apply the current subtitle style. Restart npm run dev, then rebuild the video");
@@ -702,12 +794,13 @@ export default function StudioApp() {
     const prompt = coverPrompt.trim() || coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection);
     setCoverPrompt(prompt); setBusy("Generating cover artwork");
     try {
-      const response = await fetch(`${SERVICE}/image/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...provider, prompt, screenRatio }) });
+      const coverId = `cover-${Date.now()}`;
+      const response = await fetch(`${SERVICE}/image/generate`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...provider, prompt, screenRatio, episodeId, episodeTitle:title, assetKind:"covers", assetName:coverId }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Cover generation failed");
       const url = String(data.image || ""); if (!url) throw new Error("The image provider returned no cover");
       let path = "";
       try { path = new URL(url).pathname; } catch { path = url; }
-      const cover:CoverImage = { id:`cover-${Date.now()}`, path, url, screenRatio, prompt, provider:provider.model, createdAt:Date.now() };
+      const cover:CoverImage = { id:coverId, path, url, screenRatio, prompt, provider:provider.model, createdAt:Date.now() };
       setCovers((current) => [cover, ...current]);
       setMessage(`${screenRatio} cover generated and saved to this episode.`);
     } catch (error) { setMessage(error instanceof Error ? `${error.message}. Start the local render service with “npm run render-service”.` : "Cover generation failed"); }
@@ -754,11 +847,11 @@ export default function StudioApp() {
       <section className="workspace">
         <header className="topbar">
           <div><span className="eyebrow">CURRENT EPISODE</span><input className="title-input" value={title} placeholder="Untitled episode" onChange={(e) => { touchProject(); setTitle(e.target.value); }} aria-label="Episode title" /></div>
-          <div className="top-actions"><span className="save-state">● Saved locally</span><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
+          <div className="top-actions"><span className={`save-state storage-${storageState}`}>● {storageState === "server" ? "Saved to server" : storageState === "browser" ? "Browser backup only" : storageState === "error" ? "Save failed" : "Saving…"}</span><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
         </header>
 
         {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} /> : <>
-          {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} analyze={analyze} busy={busy} />}
+          {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} audioData={audioData} narrationAutoplayRequest={narrationAutoplayRequest} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} provider={provider} setProvider={setProvider} speechStatus={providerStatus.speech} analyze={analyze} busy={busy} />}
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} audioData={audioData} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} videoBuilds={videoBuilds} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
@@ -782,11 +875,13 @@ function formatEpisodeDate(savedAt:number) {
   return new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"short" }).format(new Date(savedAt));
 }
 
-function EpisodePanel({ title, setTitle, script, setScript, contentFormat, setContentFormat, visualStyle, setVisualStyle, creativeDirection, setCreativeDirection, productionMode, setProductionMode, longClipDuration, setLongClipDuration, mode, setMode, touchProject, audioName, transcription, handleAudio, analyze, busy }: any) {
-  return <div className="panel intake-panel"><div className="section-head"><div><span className="eyebrow">SOURCE MATERIAL</span><h1>Create an episode</h1><p>Add the finished script and recorded narration. Choose quick image-led shots or longer text-to-video scenes.</p></div><button className="primary large" onClick={analyze} disabled={!!busy}>{busy || "Analyze with AI"}</button></div>
+function EpisodePanel({ title, setTitle, script, setScript, contentFormat, setContentFormat, visualStyle, setVisualStyle, creativeDirection, setCreativeDirection, productionMode, setProductionMode, longClipDuration, setLongClipDuration, mode, setMode, touchProject, audioName, transcription, handleAudio, generateNarration, provider, setProvider, speechStatus, analyze, busy }: any) {
+  const setSpeech = (patch:Partial<ProviderSettings>) => setProvider((current:ProviderSettings) => ({ ...current, ...patch }));
+  return <div className="panel intake-panel"><div className="section-head"><div><span className="eyebrow">SOURCE MATERIAL</span><h1>Create an episode</h1><p>Add the finished script, then generate narration locally or attach a recording. Choose quick image-led shots or longer text-to-video scenes.</p></div><button className="primary large" onClick={analyze} disabled={!!busy}>{busy || "Analyze with AI"}</button></div>
     <div className="intake-grid"><label className="field episode-title-field"><span>Episode title</span><input value={title} placeholder="Give this episode a recognizable title…" onChange={(e) => { touchProject(); setTitle(e.target.value); }} autoComplete="off"/></label><label className="field span-2"><span>English script</span><textarea value={script} placeholder="Paste the exact English narration script here…" onChange={(e) => { touchProject(); setScript(e.target.value); }} rows={13}/><small>{script.trim() ? script.trim().split(/\s+/).length : 0} words</small></label>
       <div className="stack"><label className="field"><span>Content format</span><select value={contentFormat} onChange={(e) => { touchProject(); setContentFormat(e.target.value); }}><option>Documentary</option><option>Educational explainer</option><option>Narrative story</option><option>News recap</option><option>Product story</option><option>History documentary</option><option>Other</option></select></label><label className="field"><span>Visual style</span><select value={visualStyle} onChange={(e) => { touchProject(); setVisualStyle(e.target.value); }}><option>Photorealistic</option><option>Cinematic illustration</option><option>Editorial collage</option><option>3D animation</option><option>Anime</option><option>Minimal graphic</option></select></label><label className="field"><span>Creative direction</span><input value={creativeDirection} placeholder="Audience, mood, setting, visual constraints…" onChange={(e) => { touchProject(); setCreativeDirection(e.target.value); }}/></label><label className="field workflow-field"><span>Visual workflow</span><select value={productionMode} onChange={(e) => { touchProject(); setProductionMode(e.target.value); }}><option value="short-shots">Dynamic short shots · image first</option><option value="mixed">Mixed · all images + selected videos</option><option value="long-scenes">Long scenes · direct text to video</option></select><small>{productionMode === "long-scenes" ? "No storyboard images are generated." : productionMode === "mixed" ? "All shots get images; about one in four is selected for video." : "Create images, then optionally animate them."}</small></label>{productionMode === "long-scenes" && <label className="field clip-length-field"><span>Target clip length</span><div><input aria-label="Target long-scene clip length" type="range" min="6" max="12" step="1" value={longClipDuration} onChange={(e) => { touchProject(); setLongClipDuration(Number(e.target.value)); }}/><output>{longClipDuration}s</output></div><small>Adjustable from 6–12 seconds; scene boundaries follow natural pauses.</small></label>}<label className="field"><span>Generation mode</span><select value={mode} onChange={(e) => { touchProject(); setMode(e.target.value); }}><option>Plan only</option><option>Review then batch</option><option>Fully automatic</option></select></label>
-        <label className="upload-card"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Narration attached" : "Add recorded narration"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
+        <section className="speech-card"><div className="speech-card-head"><div><span>Local narration</span><b>MLX Audio</b><small>{speechStatus?.configured ? `${provider.speechModel} · ${provider.speechEndpoint}` : "Configure the local service in Provider settings."}</small></div><button type="button" className="primary" onClick={generateNarration} disabled={!!busy || !script.trim()}>{busy === "Synthesizing narration" ? "Generating…" : audioName ? "Regenerate narration" : "Generate narration"}</button></div><div className="speech-controls"><label className="field"><span>Voice</span><input list="mlx-voice-presets" value={provider.speechVoice} placeholder="af_heart" onChange={(event) => setSpeech({ speechVoice:event.target.value })}/><datalist id="mlx-voice-presets"><option value="af_heart"/><option value="af_bella"/><option value="af_nova"/><option value="af_sky"/><option value="am_adam"/><option value="am_echo"/><option value="bf_alice"/><option value="bf_emma"/><option value="bm_daniel"/><option value="bm_george"/><option value="zf_xiaobei"/><option value="zm_yunxi"/></datalist></label><label className="field"><span>Language</span><select value={provider.speechLanguage} onChange={(event) => setSpeech({ speechLanguage:event.target.value })}><option value="a">American English</option><option value="b">British English</option><option value="z">Mandarin Chinese</option><option value="j">Japanese</option><option value="e">Spanish</option><option value="f">French</option></select></label><label className="field speech-speed"><span>Speed</span><div><input aria-label="Narration speech speed" type="range" min=".75" max="1.35" step=".05" value={provider.speechSpeed} onChange={(event) => setSpeech({ speechSpeed:Number(event.target.value) })}/><output>{Number(provider.speechSpeed).toFixed(2)}×</output></div></label></div><label className="field"><span>Style instruction · optional</span><input value={provider.speechInstruct} placeholder="Warm documentary narrator, measured and confident" onChange={(event) => setSpeech({ speechInstruct:event.target.value })}/></label></section>
+        <div className="narration-choice"><span>or attach a recording</span></div><label className="upload-card mini"><input type="file" accept="audio/*" onChange={handleAudio}/><b>{audioName ? "Replace narration audio" : "Upload narration audio"}</b><span>{audioName || "MP3, WAV, M4A or AAC · transcribed locally"}</span></label>{audioName && <div className={`transcript-note ${transcription ? "ready" : ""}`}><b>{transcription ? "Local transcript ready" : "Waiting for local transcript"}</b><span>{transcription ? `${transcription.segments.length} timed segments · ${formatTime(transcription.duration)}` : "Check the speech-to-text URL in Provider settings."}</span></div>}</div></div></div>;
 }
 
 function motionPreviewClass(motion: string, index: number) {
@@ -984,12 +1079,12 @@ function Settings({ provider, setProvider, status, refreshStatus, close }: any) 
   async function testConnection(target:string) {
     setTesting(target); setTestResult("");
     try {
-      const endpoint = target === "text" ? provider.textEndpoint : target === "video" ? provider.videoEndpoint : provider.endpoint;
-      const model = target === "text" ? provider.textModel : target === "video" ? provider.videoModel : provider.model;
-      const apiKey = target === "text" ? provider.textApiKey : target === "video" ? provider.videoApiKey : provider.apiKey;
+      const endpoint = target === "speech" ? provider.speechEndpoint : target === "text" ? provider.textEndpoint : target === "video" ? provider.videoEndpoint : provider.endpoint;
+      const model = target === "speech" ? provider.speechModel : target === "text" ? provider.textModel : target === "video" ? provider.videoModel : provider.model;
+      const apiKey = target === "speech" ? "" : target === "text" ? provider.textApiKey : target === "video" ? provider.videoApiKey : provider.apiKey;
       const response = await fetch(`${SERVICE}/providers/test`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ target, ...provider, endpoint, model, apiKey }) });
       const result = await response.json(); if (!response.ok) throw new Error(result.error || "Connection failed");
-      setTestResult(`${target === "image" ? "Image" : target === "video" ? "Video" : "Translation"} provider connected.`); await refreshStatus();
+      setTestResult(`${target === "speech" ? "MLX Audio" : target === "image" ? "Image" : target === "video" ? "Video" : "Translation"} provider connected.`); await refreshStatus();
     } catch (error) { setTestResult(error instanceof Error ? error.message : "Connection failed"); }
     finally { setTesting(""); }
   }
@@ -997,6 +1092,7 @@ function Settings({ provider, setProvider, status, refreshStatus, close }: any) 
     <div className={`provider-status ${status.image.configured ? "connected" : ""}`}><span>{status.image.configured ? "●" : "○"}</span><div><b>Image generation</b><small>{status.image.configured ? `${status.image.model} · key loaded from .env.local` : "No environment key loaded"}</small></div></div>
     <label className="field"><span>Image provider</span><select value={imageProviderChoice} onChange={(e)=>chooseImageProvider(e.target.value)}><option value="openai">OpenAI-compatible images API</option><option value="volcengine">Volcengine Ark · Seedream · pay as you go</option><option value="volcengine-plan">Volcengine Agent Plan · Seedream</option><option value="sdwebui">Local Stable Diffusion WebUI</option></select></label><label className="field"><span>Endpoint or API base URL</span><input value={provider.endpoint} onChange={(e)=>set({endpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model</span><input value={provider.model} placeholder={provider.kind === "volcengine" ? "Ark Seedream model name or ID" : "Model ID"} onChange={(e)=>set({model:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.apiKey} placeholder={status.image.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({apiKey:e.target.value})}/></label></div><label className="field"><span>Parallel image jobs</span><input type="number" min="1" max="6" step="1" value={provider.imageConcurrency} onChange={(e)=>set({imageConcurrency:Math.max(1,Math.min(6,Number(e.target.value)||1))})}/><small>3 is recommended. Lower this if your provider reports rate limits.</small></label><button className="ghost test-button" onClick={()=>testConnection("image")} disabled={!!testing}>{testing === "image" ? "Testing…" : "Test image provider"}</button>
     <hr/><div className={`provider-status ${status.video?.configured ? "connected" : ""}`}><span>{status.video?.configured ? "●" : "○"}</span><div><b>Video generation · Volcengine Ark</b><small>{status.video?.configured ? `${status.video.model} · key loaded from .env.local` : "Required to turn storyboard images into video clips"}</small></div></div><label className="field"><span>Volcengine video access</span><select value={videoProviderChoice} onChange={(e)=>chooseVideoProvider(e.target.value)}><option value="api">Pay-as-you-go API</option><option value="plan">Agent Plan subscription</option></select></label><label className="field"><span>Video task endpoint or API base URL</span><input value={provider.videoEndpoint} onChange={(e)=>set({videoEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Seedance model / endpoint ID</span><input value={provider.videoModel} placeholder={videoProviderChoice === "plan" ? "doubao-seedance-2.0" : "doubao-seedance-2-0-260128"} onChange={(e)=>set({videoModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.videoApiKey} placeholder={status.video?.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({videoApiKey:e.target.value})}/></label></div><label className="field"><span>Parallel video jobs</span><input type="number" min="1" max="4" step="1" value={provider.videoConcurrency} onChange={(e)=>set({videoConcurrency:Math.max(1,Math.min(4,Number(e.target.value)||1))})}/><small>2 is recommended. Ark video generation is asynchronous and may take several minutes per clip.</small></label><button className="ghost test-button" onClick={()=>testConnection("video")} disabled={!!testing}>{testing === "video" ? "Testing…" : "Test video provider"}</button>
+    <hr/><div className={`provider-status ${status.speech?.configured ? "connected" : ""}`}><span>{status.speech?.configured ? "●" : "○"}</span><div><b>Local speech synthesis · MLX Audio</b><small>{status.speech?.configured ? `${status.speech.model} · ${status.speech.endpoint}` : "Required to generate narration from the episode script"}</small></div></div><label className="field"><span>MLX Audio speech endpoint</span><input value={provider.speechEndpoint} placeholder="http://localhost:8010/v1/audio/speech" onChange={(e)=>set({speechEndpoint:e.target.value})}/><small>A base URL is also accepted; the bridge appends <code>/v1/audio/speech</code>.</small></label><label className="field"><span>TTS model</span><input value={provider.speechModel} placeholder="mlx-community/Kokoro-82M-bf16" onChange={(e)=>set({speechModel:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Default voice</span><input value={provider.speechVoice} placeholder="af_heart" onChange={(e)=>set({speechVoice:e.target.value})}/></label><label className="field"><span>Language code</span><input value={provider.speechLanguage} placeholder="a" onChange={(e)=>set({speechLanguage:e.target.value})}/></label></div><button className="ghost test-button" onClick={()=>testConnection("speech")} disabled={!!testing}>{testing === "speech" ? "Testing…" : "Test MLX Audio service"}</button>
     <hr/><div className="provider-status connected"><span>●</span><div><b>Local speech-to-text</b><small>Audio is sent only to the configured local service.</small></div></div><label className="field"><span>Transcription service URL</span><input value={provider.transcriptionEndpoint} placeholder="http://localhost:8000/v1/transcriptions" onChange={(e)=>set({transcriptionEndpoint:e.target.value})}/></label><label className="field"><span>Audio language</span><input value={provider.transcriptionLanguage} placeholder="en" onChange={(e)=>set({transcriptionLanguage:e.target.value})}/></label>
     <hr/><div className={`provider-status ${status.text.configured ? "connected" : ""}`}><span>{status.text.configured ? "●" : "○"}</span><div><b>Storyboard and translation provider</b><small>{status.text.configured ? `${status.text.model} · key loaded from .env.local` : "Required for AI planning and translation"}</small></div></div><label className="field"><span>Text provider</span><select value={textProviderChoice} onChange={(e)=>chooseTextProvider(e.target.value)}><option value="openai">OpenAI-compatible chat API</option><option value="volcengine">Volcengine Ark · Doubao · pay as you go</option><option value="volcengine-plan">Volcengine Agent Plan · OpenAI-compatible chat</option></select></label><label className="field"><span>Chat endpoint or API base URL</span><input value={provider.textEndpoint} onChange={(e)=>set({textEndpoint:e.target.value})}/></label><div className="two-fields"><label className="field"><span>Model / endpoint ID</span><input value={provider.textModel} placeholder={textProviderChoice === "volcengine-plan" ? "ark-code-latest" : provider.textKind === "volcengine" ? "Enter an activated Ark model or ep-… ID" : "Model ID"} onChange={(e)=>set({textModel:e.target.value})}/></label><label className="field"><span>Session API key</span><input type="password" value={provider.textApiKey} placeholder={status.text.configured ? "Loaded securely from .env.local" : "Optional session override"} onChange={(e)=>set({textApiKey:e.target.value})}/></label></div><button className="ghost test-button" onClick={()=>testConnection("text")} disabled={!!testing}>{testing === "text" ? "Testing…" : "Test storyboard provider"}</button>{testResult&&<div className="connection-result" role="status">{testResult}</div>}<button className="primary full" onClick={close}>Save session settings</button></div></div>;
 }

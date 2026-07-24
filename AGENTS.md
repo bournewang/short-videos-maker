@@ -6,7 +6,7 @@ This file is written for AI coding agents who need to work on the Shortform Stud
 
 Shortform Studio is a **local-first production desk for vertical short videos**. A creator pastes an English script, uploads a recorded narration, and the app helps plan an AI-assisted storyboard, generate images, optionally animate those images into video clips, edit bilingual subtitles, add background music, and export a finished 9:16 H.264 MP4.
 
-The editor is a React web app. Heavy media work (FFmpeg rendering, AI-provider proxies, local speech-to-text transcription) is delegated to a local Node.js bridge. Episode data is stored in the browser's IndexedDB cache; generated provider assets are cached on disk in `.shortform/assets/` and final exports go to `.shortform/exports/`.
+The editor is a React web app. Heavy media work (FFmpeg rendering, AI-provider proxies, local speech-to-text transcription) is delegated to a local Node.js bridge. The local bridge stores authoritative episode records in `.shortform/episodes.sqlite` and organizes JSON backups, narration, generated assets, covers, and exports under `.shortform/episodes/<episode-slug>/`. Browser IndexedDB is retained as a fallback and migration source.
 
 ## Technology stack
 
@@ -42,7 +42,8 @@ The editor is a React web app. Heavy media work (FFmpeg rendering, AI-provider p
 │       ├── timeline.js         # Shot timing normalization, prompt fallbacks, formatting
 │       ├── audio.js            # Voice presets and FFmpeg cleanup filter chains
 │       ├── video.js            # Export resolution presets
-│       └── project-cache.js    # IndexedDB persistence for episode state
+│       ├── project-cache.js    # IndexedDB fallback and migration source
+│       └── server-projects.js  # Browser client for bridge-backed episode storage
 ├── scripts/                    # Local development helpers
 │   ├── dev-all.mjs             # Spawns render bridge + web dev server
 │   └── render-service.mjs        # Local Node HTTP bridge for AI + FFmpeg
@@ -91,7 +92,7 @@ This is a plain Node.js HTTP server listening on `127.0.0.1:4317` by default. It
 - Provider API keys (read from `.env.local` / `.env`).
 - Local speech-to-text transcription endpoints.
 
-The bridge exposes JSON/REST endpoints such as `/render`, `/image/generate`, `/video/generate`, `/text/plan`, `/text/translate`, `/audio/transcribe`, `/audio/process`, `/config/status`, and `/providers/test`. Provider images/videos are downloaded into `.shortform/assets/` and served back under `/assets/`. Final exports are written to `.shortform/exports/` and served under `/renders/`.
+The bridge exposes JSON/REST endpoints such as `/episodes`, `/render`, `/image/generate`, `/video/generate`, `/text/plan`, `/text/translate`, `/audio/transcribe`, `/audio/process`, `/config/status`, and `/providers/test`. `scripts/episode-store.mjs` maintains the SQLite catalog, JSON backups, browser-cache migration, and per-episode media layout. Legacy global `/assets/` and `/renders/` paths remain readable for existing projects.
 
 ### Cloudflare Worker (`worker/index.ts`)
 
@@ -181,7 +182,7 @@ Provider endpoints and model names can also be overridden per-session from the i
 
 - **API keys are server-side only.** They live in `.env.local` / `.env` and are read by `scripts/render-service.mjs`. The browser never sees them.
 - **Environment files are ignored.** `.gitignore` excludes `.env*` except `.env.example`. Do not commit real keys.
-- **Local asset storage.** Generated images/videos are written to `.shortform/assets/` and exports to `.shortform/exports/`. These directories are ignored by Git and are not protected by authentication in local development.
+- **Local asset storage.** Episode data is written under `.shortform/episodes/<episode-slug>/` (or `SHORTFORM_STORAGE_DIR`). These directories and the SQLite database are ignored by Git and are not protected by authentication in local development.
 - **Input validation.** The bridge limits request body sizes (`160MB` max for media, smaller for JSON). FFmpeg arguments are constructed from validated numeric fields; durations, widths, and heights are clamped.
 - **CORS.** The local bridge only allows `http://localhost:3000` in development.
 - **Auth file.** `app/chatgpt-auth.ts` is a template artifact from the Vinext starter. It is not currently wired into the editor flow.

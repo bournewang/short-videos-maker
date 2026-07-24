@@ -9,13 +9,9 @@ import { normalizePlannedShots } from "../app/lib/timeline.js";
 import { normalizeScreenRatio, promptForScreenRatio } from "../app/lib/video.js";
 import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
 import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } from "../app/lib/subtitle-style.js";
+import { EpisodeStore } from "./episode-store.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const workRoot = path.join(root, ".shortform");
-const exportRoot = path.join(workRoot, "exports");
-const assetRoot = path.join(workRoot, "assets");
-const audioPreviewRoot = path.join(workRoot, "audio-previews");
-const bgmRoot = path.join(root, "public", "bgm");
 
 async function loadEnvironmentFile(filename) {
   try {
@@ -39,6 +35,12 @@ async function loadEnvironmentFile(filename) {
 await loadEnvironmentFile(".env.local");
 await loadEnvironmentFile(".env");
 const port = Number(process.env.SHORTFORM_PORT || 4317);
+const workRoot = path.resolve(process.env.SHORTFORM_STORAGE_DIR || path.join(root, ".shortform"));
+const exportRoot = path.join(workRoot, "exports");
+const assetRoot = path.join(workRoot, "assets");
+const audioPreviewRoot = path.join(workRoot, "audio-previews");
+const bgmRoot = path.join(root, "public", "bgm");
+const episodeStore = new EpisodeStore({ storageRoot:workRoot, assetRoot, exportRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
 
 const providerDefaults = {
   image: {
@@ -53,6 +55,14 @@ const providerDefaults = {
     openai: { endpoint:"https://api.openai.com/v1/chat/completions", model:"gpt-4.1-mini" },
     volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", model:"doubao-seed-2-1-turbo-260628" },
   },
+};
+
+const speechDefaults = {
+  endpoint:"http://localhost:8010/v1/audio/speech",
+  model:"mlx-community/Kokoro-82M-bf16",
+  voice:"af_heart",
+  language:"a",
+  speed:1,
 };
 
 function selectedProvider(modality, fallback) {
@@ -88,6 +98,13 @@ function environmentProviders() {
       endpoint: process.env.TRANSCRIPTION_ENDPOINT || "http://localhost:8000/v1/transcriptions",
       language: process.env.TRANSCRIPTION_LANGUAGE || "en",
     },
+    speech: {
+      endpoint:process.env.SPEECH_ENDPOINT || speechDefaults.endpoint,
+      model:process.env.SPEECH_MODEL || speechDefaults.model,
+      voice:process.env.SPEECH_VOICE || speechDefaults.voice,
+      language:process.env.SPEECH_LANGUAGE || speechDefaults.language,
+      speed:Number(process.env.SPEECH_SPEED) || speechDefaults.speed,
+    },
   };
 }
 
@@ -98,6 +115,7 @@ export function getProviderStatus() {
     video: { configured:Boolean(providers.video.apiKey && providers.video.model), kind:providers.video.kind, endpoint:providers.video.endpoint, model:providers.video.model, source:providers.video.apiKey ? "environment" : "default" },
     text: { configured: Boolean(providers.text.apiKey && providers.text.model), kind:providers.text.kind, endpoint: providers.text.endpoint, model: providers.text.model, source: providers.text.apiKey ? "environment" : "default" },
     transcription: { configured:Boolean(providers.transcription.endpoint), endpoint:providers.transcription.endpoint, language:providers.transcription.language, source:process.env.TRANSCRIPTION_ENDPOINT ? "environment" : "default" },
+    speech: { configured:Boolean(providers.speech.endpoint && providers.speech.model), endpoint:providers.speech.endpoint, model:providers.speech.model, voice:providers.speech.voice, language:providers.speech.language, speed:providers.speech.speed, source:process.env.SPEECH_ENDPOINT || process.env.SPEECH_MODEL ? "environment" : "default" },
   };
 }
 
@@ -154,8 +172,32 @@ function resolveTextProvider(data = {}) {
   };
 }
 
+function resolveSpeechProvider(data = {}) {
+  const configured = environmentProviders().speech;
+  return {
+    endpoint:String(data.speechEndpoint || data.endpoint || configured.endpoint || "").trim(),
+    model:String(data.speechModel || data.model || configured.model || "").trim(),
+    voice:String(data.speechVoice || data.voice || configured.voice || "").trim(),
+    language:String(data.speechLanguage || data.language || configured.language || "").trim(),
+    speed:Math.max(.25, Math.min(4, Number(data.speechSpeed ?? data.speed ?? configured.speed) || 1)),
+    instruct:String(data.speechInstruct || data.instruct || "").trim(),
+    input:String(data.input || data.text || "").trim(),
+  };
+}
+
+function speechApiBase(endpoint) {
+  return String(endpoint || "").trim().replace(/\/+$/, "").replace(/\/v1\/audio\/speech$/, "").replace(/\/audio\/speech$/, "").replace(/\/v1$/, "");
+}
+
+function speechGenerationEndpoint(endpoint) {
+  const value = String(endpoint || "").trim().replace(/\/+$/, "");
+  if (/\/(?:v1\/)?audio\/speech$/.test(value)) return value;
+  if (/\/v1$/.test(value)) return `${value}/audio/speech`;
+  return `${value}/v1/audio/speech`;
+}
+
 function cors(extra = {}) {
-  return { "Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST,OPTIONS", ...extra };
+  return { "Access-Control-Allow-Origin": "http://localhost:3000", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS", ...extra };
 }
 
 function json(res, status, value) {
@@ -213,6 +255,48 @@ export async function transcribeAudio(payload = {}, options = {}) {
   return normalizeTranscription(await response.json());
 }
 
+export async function synthesizeSpeech(payload = {}, options = {}) {
+  const config = resolveSpeechProvider(payload);
+  if (!config.endpoint) throw new Error("An MLX Audio service URL is required");
+  if (!config.model) throw new Error("An MLX Audio TTS model is required");
+  if (!config.input) throw new Error("Add a narration script before generating speech");
+  if (config.input.length > 50000) throw new Error("The narration script is too long to synthesize in one request");
+  const request = {
+    model:config.model,
+    input:config.input,
+    voice:config.voice || undefined,
+    speed:config.speed,
+    lang_code:config.language || undefined,
+    instruct:config.instruct || undefined,
+    response_format:"wav",
+    stream:false,
+  };
+  const timeoutMs = Math.max(1000, Number(process.env.SPEECH_REQUEST_TIMEOUT_MS) || 600000);
+  const response = await (options.fetchImpl || fetch)(speechGenerationEndpoint(config.endpoint), {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body:JSON.stringify(request),
+    signal:options.signal || AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    let detail = "";
+    try { const result = await response.json(); detail = result.error?.message || result.error || result.detail || result.message || ""; } catch { detail = await response.text().catch(() => ""); }
+    throw new Error(detail || `MLX Audio returned ${response.status}`);
+  }
+  const audio = Buffer.from(await response.arrayBuffer());
+  if (!audio.length) throw new Error("MLX Audio returned an empty audio file");
+  const voiceStem = (config.voice || "voice").replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "voice";
+  return {
+    audioData:`data:audio/wav;base64,${audio.toString("base64")}`,
+    filename:`mlx-${voiceStem}.wav`,
+    mimeType:"audio/wav",
+    model:config.model,
+    voice:config.voice,
+    language:config.language,
+    speed:config.speed,
+  };
+}
+
 async function saveMedia(value, targetBase, fetchImpl = fetch) {
   if (!value) return "";
   let mime = "application/octet-stream"; let data; let remoteExtension = "";
@@ -227,14 +311,15 @@ async function saveMedia(value, targetBase, fetchImpl = fetch) {
 
 export async function persistGeneratedImage(value, options = {}) {
   if (!value) throw new Error("Provider returned no image");
-  await mkdir(assetRoot, { recursive:true });
-  const id = options.id || randomUUID();
-  const source = await saveMedia(value, path.join(assetRoot, id), options.fetchImpl || fetch);
+  const directory = options.directory || assetRoot;
+  await mkdir(directory, { recursive:true });
+  const id = options.baseName || options.id || randomUUID();
+  const source = await saveMedia(value, path.join(directory, id), options.fetchImpl || fetch);
   let filename = source;
   if (options.screenRatio) {
     const ratio = normalizeScreenRatio(options.screenRatio);
     const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
-    const output = path.join(assetRoot, `${id}-${ratio.replace(":", "x")}.png`);
+    const output = path.join(directory, `${id}-${ratio.replace(":", "x")}.png`);
     const filter = `scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=increase,crop=${dimensions.width}:${dimensions.height},setsar=1`;
     try {
       await run("ffmpeg", ["-y", "-i", source, "-frames:v", "1", "-vf", filter, "-compression_level", "6", output]);
@@ -245,20 +330,23 @@ export async function persistGeneratedImage(value, options = {}) {
       throw error;
     }
   }
+  const urlPrefix = options.urlPrefix || "/assets";
   return {
     path:filename,
-    url:`http://127.0.0.1:${port}/assets/${encodeURIComponent(path.basename(filename))}`,
+    url:`http://127.0.0.1:${port}${urlPrefix}/${encodeURIComponent(path.basename(filename))}`,
   };
 }
 
 export async function persistGeneratedVideo(value, options = {}) {
   if (!value) throw new Error("Provider returned no video");
-  await mkdir(assetRoot, { recursive:true });
-  const filename = await saveMedia(value, path.join(assetRoot, options.id || randomUUID()), options.fetchImpl || fetch);
+  const directory = options.directory || assetRoot;
+  await mkdir(directory, { recursive:true });
+  const filename = await saveMedia(value, path.join(directory, options.baseName || options.id || randomUUID()), options.fetchImpl || fetch);
   if (path.extname(filename).toLowerCase() !== ".mp4") throw new Error("Provider returned an unsupported video format");
+  const urlPrefix = options.urlPrefix || "/assets";
   return {
     path:filename,
-    url:`http://127.0.0.1:${port}/assets/${encodeURIComponent(path.basename(filename))}`,
+    url:`http://127.0.0.1:${port}${urlPrefix}/${encodeURIComponent(path.basename(filename))}`,
   };
 }
 
@@ -281,6 +369,12 @@ async function providerImageUrl(value) {
       const mime = assetContentType(filename);
       if (!mime.startsWith("image/")) throw new Error("The local storyboard asset is not an image");
       return `data:${mime};base64,${(await readFile(filename)).toString("base64")}`;
+    }
+    const episodeMatch = /^\/episodes\/([^/]+)\/files\/(.+)$/.exec(url.pathname);
+    if ((url.hostname === "127.0.0.1" || url.hostname === "localhost") && episodeMatch) {
+      const { filename, contentType } = await episodeStore.fileForRequest(decodeURIComponent(episodeMatch[1]), episodeMatch[2].split("/").map(decodeURIComponent).join(path.sep));
+      if (!contentType.startsWith("image/")) throw new Error("The local storyboard asset is not an image");
+      return `data:${contentType};base64,${(await readFile(filename)).toString("base64")}`;
     }
   } catch (error) {
     if (error instanceof TypeError) throw new Error("The storyboard image URL is invalid");
@@ -458,7 +552,7 @@ export async function renderEpisode(payload, options = {}) {
   else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
   await run("ffmpeg", args);
-  return { id, output, url: `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
+  return { id, output, url:options.publicUrl || `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
 }
 
 export async function generateImage(data, options = {}) {
@@ -655,15 +749,15 @@ function modelsEndpoint(endpoint, kind) {
 }
 
 export async function testProviderConnection(data, options = {}) {
-  const target = data.target === "text" ? "text" : data.target === "video" ? "video" : "image";
-  const config = target === "text" ? resolveTextProvider(data) : target === "video" ? resolveVideoProvider(data) : resolveImageProvider(data);
+  const target = data.target === "speech" ? "speech" : data.target === "text" ? "text" : data.target === "video" ? "video" : "image";
+  const config = target === "speech" ? resolveSpeechProvider(data) : target === "text" ? resolveTextProvider(data) : target === "video" ? resolveVideoProvider(data) : resolveImageProvider(data);
   if (!config.endpoint) throw new Error("Provider endpoint is required");
   if (target === "text" && !config.apiKey) throw new Error("No translation API key is configured");
   if (target === "video" && !config.apiKey) throw new Error("No video API key is configured");
   if (target === "image" && config.kind !== "sdwebui" && !config.apiKey) throw new Error("No image API key is configured");
   const fetchImpl = options.fetchImpl || fetch;
   const planText = target === "text" && config.kind === "volcengine" && isVolcenginePlanEndpoint(config.endpoint);
-  const endpoint = planText ? textCompletionsEndpoint(config.endpoint) : target === "video" ? `${videoTasksEndpoint(config.endpoint)}?page_num=1&page_size=1` : modelsEndpoint(config.endpoint, config.kind);
+  const endpoint = target === "speech" ? `${speechApiBase(config.endpoint)}/v1/models` : planText ? textCompletionsEndpoint(config.endpoint) : target === "video" ? `${videoTasksEndpoint(config.endpoint)}?page_num=1&page_size=1` : modelsEndpoint(config.endpoint, config.kind);
   const response = await fetchImpl(endpoint, planText ? {
     method:"POST",
     headers:{ "Content-Type":"application/json", Authorization:`Bearer ${config.apiKey}` },
@@ -682,9 +776,47 @@ export function createRenderServer() {
     try {
       if (req.method === "OPTIONS") { res.writeHead(204, cors()); res.end(); return; }
       const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-      if (req.method === "GET" && url.pathname === "/health") { json(res, 200, { ok:true, ffmpeg:"available" }); return; }
+      await episodeStore.initialize();
+      if (req.method === "GET" && url.pathname === "/health") { json(res, 200, { ok:true, ffmpeg:"available", storage:{ kind:"sqlite+files", root:workRoot } }); return; }
       if (req.method === "GET" && url.pathname === "/audio/presets") { json(res, 200, { presets:voicePresetSummaries(), processing:"local" }); return; }
-      if (req.method === "GET" && url.pathname === "/config/status") { json(res, 200, getProviderStatus()); return; }
+      if (req.method === "GET" && url.pathname === "/config/status") { json(res, 200, { ...getProviderStatus(), storage:{ configured:true, kind:"sqlite+files", root:workRoot } }); return; }
+      if (req.method === "GET" && url.pathname === "/episodes") { json(res, 200, { episodes:episodeStore.listEpisodes() }); return; }
+      if (req.method === "GET" && url.pathname === "/episodes/active") { json(res, 200, { episode:episodeStore.getActiveEpisode() }); return; }
+      if (req.method === "POST" && url.pathname === "/episodes/import") {
+        const payload = await body(req);
+        const imported = await episodeStore.importEpisodes(payload.episodes, payload.activeEpisodeId);
+        json(res, 200, { imported, episodes:episodeStore.listEpisodes() }); return;
+      }
+      const episodeFileMatch = /^\/episodes\/([^/]+)\/files\/(.+)$/.exec(url.pathname);
+      if (req.method === "GET" && episodeFileMatch) {
+        const relativePath = episodeFileMatch[2].split("/").map(decodeURIComponent).join(path.sep);
+        const { filename, contentType } = await episodeStore.fileForRequest(decodeURIComponent(episodeFileMatch[1]), relativePath);
+        const disposition = contentType === "video/mp4" ? `attachment; filename="${path.basename(filename)}"` : "inline";
+        res.writeHead(200, cors({ "Content-Type":contentType, "Content-Disposition":disposition, "Cache-Control":"public, max-age=31536000, immutable" }));
+        createReadStream(filename).pipe(res); return;
+      }
+      const episodeActivateMatch = /^\/episodes\/([^/]+)\/activate$/.exec(url.pathname);
+      if (req.method === "POST" && episodeActivateMatch) {
+        episodeStore.activateEpisode(decodeURIComponent(episodeActivateMatch[1]));
+        json(res, 200, { ok:true }); return;
+      }
+      const episodeMatch = /^\/episodes\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && episodeMatch) {
+        const episode = episodeStore.getEpisode(decodeURIComponent(episodeMatch[1]));
+        if (!episode) { json(res, 404, { error:"Episode was not found" }); return; }
+        json(res, 200, { episode }); return;
+      }
+      if (req.method === "PUT" && episodeMatch) {
+        const payload = await body(req);
+        const id = decodeURIComponent(episodeMatch[1]);
+        if (payload.project?.id && payload.project.id !== id) throw new Error("Episode ID does not match the request path");
+        const saved = await episodeStore.saveEpisode({ ...(payload.project || {}), id });
+        json(res, 200, saved); return;
+      }
+      if (req.method === "DELETE" && episodeMatch) {
+        const deleted = await episodeStore.deleteEpisode(decodeURIComponent(episodeMatch[1]));
+        json(res, deleted ? 200 : 404, deleted ? { ok:true } : { error:"Episode was not found" }); return;
+      }
       if (req.method === "GET" && url.pathname.startsWith("/audio/")) {
         const parts = url.pathname.split("/").filter(Boolean);
         if (parts.length !== 3) throw new Error("Audio preview was not found");
@@ -699,20 +831,37 @@ export function createRenderServer() {
         const filename = path.basename(decodeURIComponent(url.pathname)); const file = path.join(assetRoot, filename); await readFile(file);
         res.writeHead(200, cors({"Content-Type":assetContentType(filename),"Cache-Control":"public, max-age=31536000, immutable"})); createReadStream(file).pipe(res); return;
       }
-      if (req.method === "POST" && url.pathname === "/render") { const result = await renderEpisode(await body(req)); json(res, 200, result); return; }
+      if (req.method === "POST" && url.pathname === "/render") {
+        const payload = await body(req);
+        if (payload.episodeId) {
+          const id = randomUUID();
+          const result = await episodeStore.withMediaTarget(payload.episodeId, payload.title, "exports", id, async (target) => {
+            return await renderEpisode(payload, { id, output:path.join(target.directory, `${target.baseName}.mp4`), publicUrl:`${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.mp4`)}` });
+          });
+          json(res, 200, result); return;
+        }
+        const result = await renderEpisode(payload);
+        json(res, 200, result); return;
+      }
       if (req.method === "POST" && url.pathname === "/image/generate") {
         const payload = await body(req, 2*1024*1024);
         const generated = await generateImage(payload);
-        const cached = await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
-        json(res, 200, { image:cached.url }); return;
+        const cached = payload.episodeId
+          ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, payload.assetKind === "covers" ? "covers" : "images", payload.assetName || randomUUID(), async (target) => await persistGeneratedImage(generated, { screenRatio:payload.screenRatio, ...target }))
+          : await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
+        json(res, 200, { image:cached.url, path:cached.path }); return;
       }
       if (req.method === "POST" && url.pathname === "/video/generate") {
-        const generated = await generateVideo(await body(req, 24*1024*1024));
-        const cached = await persistGeneratedVideo(generated.videoUrl);
-        json(res, 200, { video:cached.url, taskId:generated.taskId, duration:generated.duration }); return;
+        const payload = await body(req, 24*1024*1024);
+        const generated = await generateVideo(payload);
+        const cached = payload.episodeId
+          ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, "videos", payload.assetName || randomUUID(), async (target) => await persistGeneratedVideo(generated.videoUrl, target))
+          : await persistGeneratedVideo(generated.videoUrl);
+        json(res, 200, { video:cached.url, path:cached.path, taskId:generated.taskId, duration:generated.duration }); return;
       }
       if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
       if (req.method === "POST" && url.pathname === "/text/plan") { json(res, 200, { shots:await planEpisode(await body(req, 4*1024*1024)) }); return; }
+      if (req.method === "POST" && url.pathname === "/audio/synthesize") { json(res, 200, await synthesizeSpeech(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/transcribe") { json(res, 200, await transcribeAudio(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/audio/process") { json(res, 200, await processNarration(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/providers/test") { json(res, 200, await testProviderConnection(await body(req, 2*1024*1024))); return; }
@@ -722,5 +871,5 @@ export function createRenderServer() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await Promise.all([mkdir(exportRoot, { recursive:true }), mkdir(assetRoot, { recursive:true })]); const server = createRenderServer(); server.listen(port, "127.0.0.1", () => console.log(`Shortform render service: http://127.0.0.1:${port}`));
+  await Promise.all([mkdir(exportRoot, { recursive:true }), mkdir(assetRoot, { recursive:true }), episodeStore.initialize()]); const server = createRenderServer(); server.listen(port, "127.0.0.1", () => console.log(`Shortform render service: http://127.0.0.1:${port}`));
 }
