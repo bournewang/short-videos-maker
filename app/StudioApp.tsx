@@ -832,7 +832,7 @@ export default function StudioApp() {
   const activityLabel = busy || (manualActivity ? `${manualActivity} manual jobs active` : "");
 
   return (
-    <main className="studio-shell">
+    <main className={`studio-shell ${audioData && !episodesOpen ? "has-narration-bar" : ""}`}>
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">S</div><div><strong>Shortform</strong><span>STUDIO</span></div></div>
         <nav aria-label="Workspace navigation">
@@ -852,16 +852,62 @@ export default function StudioApp() {
 
         {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} /> : <>
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} audioData={audioData} narrationAutoplayRequest={narrationAutoplayRequest} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} provider={provider} setProvider={setProvider} speechStatus={providerStatus.speech} analyze={analyze} busy={busy} />}
-          {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} audioData={audioData} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
+          {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} previewUrl={previewUrl} downloadUrl={downloadUrl} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} videoBuilds={videoBuilds} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} />}
         </>}
       </section>
 
       <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
+      {audioData && !episodesOpen && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
+}
+
+function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, previewShot }: any) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [duration, setDuration] = useState(0);
+  useEffect(() => {
+    setElapsed(0); setPlaying(false); setDuration(Number(audioDuration) || 0);
+  }, [audioData]);
+  useEffect(() => {
+    if (!autoplayRequest) return;
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = 0;
+    void audio.play().catch(() => setPlaying(false));
+  }, [autoplayRequest]);
+  useEffect(() => {
+    if (!previewShot) return;
+    const audio = audioRef.current;
+    const start = Math.max(0, Number(previewShot.start) || 0);
+    if (!audio) { setElapsed(start); return; }
+    audio.currentTime = Math.min(start, audio.duration || start);
+    setElapsed(audio.currentTime);
+    void audio.play().catch(() => setPlaying(false));
+  }, [previewShot?.id, previewShot?.start, previewShot?.end]);
+  function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (!audio.paused) { audio.pause(); return; }
+    if (duration && audio.currentTime >= duration - .02) audio.currentTime = previewShot ? Math.max(0, Number(previewShot.start) || 0) : 0;
+    void audio.play().catch(() => setPlaying(false));
+  }
+  return <div className="narration-bar" aria-label="Narration audio player">
+    <audio ref={audioRef} src={audioData} preload="metadata"
+      onLoadedMetadata={(event) => { const meta = event.currentTarget.duration; if (Number.isFinite(meta) && meta > 0) setDuration(meta); }}
+      onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+      onTimeUpdate={(event) => { const audio = event.currentTarget; if (previewShot && Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end) - .02) { audio.pause(); audio.currentTime = Math.max(0, Number(previewShot.start) || 0); } setElapsed(audio.currentTime); }}
+      onEnded={() => { setPlaying(false); setElapsed(0); }}/>
+    <button type="button" onClick={togglePlayback} aria-label={playing ? "Pause narration" : "Play narration"}>{playing ? "❚❚" : "▶"}</button>
+    <div className="narration-bar-label"><span>Narration</span><b title={audioName}>{audioName || "Untitled audio"}</b></div>
+    <input type="range" min={0} max={duration || 0} step={0.01} value={Math.min(elapsed, duration || 0)} disabled={!duration} aria-label="Narration playback position"
+      onChange={(event) => { const audio = audioRef.current; if (!audio) return; audio.currentTime = Number(event.target.value); setElapsed(Number(event.target.value)); }}/>
+    <time>{formatTime(elapsed)} / {formatTime(duration)}</time>
+  </div>;
 }
 
 function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode }:any) {
@@ -917,11 +963,8 @@ function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle }:any) {
   </div></section>;
 }
 
-function Storyboard({ productionMode, script, transcription, audioData, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio, subtitleStyle, setSubtitleStyle }: any) {
+function Storyboard({ productionMode, script, transcription, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio, subtitleStyle, setSubtitleStyle }: any) {
   const shotListRef = useRef<HTMLDivElement | null>(null);
-  const shotAudioRef = useRef<HTMLAudioElement | null>(null);
-  const [shotAudioPlaying, setShotAudioPlaying] = useState(false);
-  const [shotAudioElapsed, setShotAudioElapsed] = useState(0);
   useEffect(() => {
     if (!shots.length) return;
     const handleKeyDown = (event:KeyboardEvent) => {
@@ -941,23 +984,6 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
     const selectedRow = Array.from(shotListRef.current?.querySelectorAll<HTMLElement>("[data-shot-id]") || []).find((row) => row.dataset.shotId === selected?.id);
     selectedRow?.scrollIntoView({ block:"nearest" });
   }, [selected?.id]);
-  useEffect(() => {
-    const audio = shotAudioRef.current;
-    audio?.pause();
-    setShotAudioPlaying(false);
-    setShotAudioElapsed(0);
-    let playFrame = 0;
-    if (audio?.readyState && selected) {
-      const previewStart = Math.max(0, Number(selected.start) || 0);
-      audio.currentTime = Math.min(previewStart, audio.duration || previewStart);
-      if (audioData && Number(selected.duration) > 0) {
-        playFrame = window.requestAnimationFrame(() => {
-          void audio.play().catch(() => setShotAudioPlaying(false));
-        });
-      }
-    }
-    return () => { if (playFrame) window.cancelAnimationFrame(playFrame); };
-  }, [audioData, selected?.id, selected?.start, selected?.duration]);
   const longScenes = productionMode === "long-scenes";
   const mixedMode = productionMode === "mixed";
   if (!shots.length) return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>Your {longScenes ? "text-to-video scenes" : mixedMode ? "image shots and selected video moments" : "production shots"} will appear here after AI analysis.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><div className="empty-state"><span>01</span><h2>No visual plan yet</h2><p>Open Episode, add your script and narration, then run AI analysis.</p></div></div>;
@@ -968,30 +994,11 @@ function Storyboard({ productionMode, script, transcription, audioData, shots, s
   const otherWorkBusy = Boolean(busy);
   const batchActionsBusy = otherWorkBusy || activeManualImageCount > 0 || activeManualVideoCount > 0;
   const currentScript = selected ? scriptSectionForDuration(script, transcription, selected.start, selected.end, totalDuration) : "";
-  const shotStart = Math.max(0, Number(selected?.start) || 0);
-  const shotAudioStart = shotStart;
-  const shotAudioEnd = shotStart + Math.max(0, Number(selected?.duration) || 0);
-  const shotAudioDuration = shotAudioEnd - shotAudioStart;
-  function resetShotAudio(audio:HTMLAudioElement) {
-    audio.pause();
-    if (audio.readyState) audio.currentTime = Math.min(shotAudioStart, audio.duration || shotAudioStart);
-    setShotAudioPlaying(false);
-    setShotAudioElapsed(0);
-  }
-  async function toggleShotAudio() {
-    const audio = shotAudioRef.current;
-    if (!audio || !audioData || !shotAudioDuration) return;
-    if (!audio.paused) { audio.pause(); setShotAudioPlaying(false); return; }
-    if (audio.currentTime < shotAudioStart || audio.currentTime >= shotAudioEnd - .02) audio.currentTime = shotAudioStart;
-    try { await audio.play(); setShotAudioPlaying(true); }
-    catch { setShotAudioPlaying(false); }
-  }
   const recommendedVideos = shots.filter((shot:Shot) => shot.videoRecommended).length;
   return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>{shots.length} {longScenes ? "scenes" : "shots"} aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} clips ready{mixedMode ? ` · ${recommendedVideos} recommended` : ""} <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/>{!longScenes && <button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button>}<button className="primary" onClick={() => generateAllVideos()} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : longScenes ? "Generate all long clips" : mixedMode ? `Animate recommended (${recommendedVideos})` : "Animate all shots"}</button></div></div>
     <div className={`story-grid ratio-${screenRatio.replace(':','-')}`}><div className="shot-list" ref={shotListRef} aria-keyshortcuts="ArrowUp ArrowDown">{shots.map((shot: Shot) => <button key={shot.id} data-shot-id={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => setSelectedId(shot.id)}>
       <div className="thumb">{shot.video ? <video src={shot.video} muted playsInline aria-label="Generated scene clip"/> : shot.image ? <img src={shot.image} alt="Generated shot"/> : null}<i className="shot-index-badge" aria-label={`Shot ${shot.index + 1}`}>{String(shot.index + 1).padStart(2,'0')}</i>{shot.video ? <i className="clip-badge">CLIP</i> : mixedMode && shot.videoRecommended ? <i className="video-pick-badge">VIDEO PICK</i> : null}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? longScenes ? "generating" : "animating" : shot.video ? "clip ready" : mixedMode && shot.videoRecommended ? "video selected" : longScenes ? "planned" : shot.status}</span></button>)}</div>
-      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/></div></div>
-        <div className={`shot-audio-preview ${audioData ? "" : "unavailable"}`}><audio ref={shotAudioRef} src={audioData || undefined} preload="metadata" autoPlay onPlay={() => setShotAudioPlaying(true)} onPause={() => setShotAudioPlaying(false)} onLoadedMetadata={(event) => { const audio = event.currentTarget; audio.currentTime = Math.min(shotAudioStart, audio.duration || shotAudioStart); if (audioData && shotAudioDuration) void audio.play().catch(() => setShotAudioPlaying(false)); }} onTimeUpdate={(event) => { const audio = event.currentTarget; const elapsed = Math.max(0, Math.min(shotAudioDuration, audio.currentTime - shotAudioStart)); setShotAudioElapsed(elapsed); if (audio.currentTime >= shotAudioEnd - .02) resetShotAudio(audio); }} onEnded={(event) => resetShotAudio(event.currentTarget)}/><button type="button" onClick={() => void toggleShotAudio()} disabled={!audioData || !shotAudioDuration} aria-label={`${shotAudioPlaying ? "Pause" : "Play"} narration for shot ${selected.index + 1}`}>{shotAudioPlaying ? "❚❚" : "▶"}</button><div><span>Shot narration</span><progress max={shotAudioDuration || 1} value={shotAudioElapsed}/></div><time>{formatTime(shotAudioElapsed)} / {formatTime(shotAudioDuration)}</time></div></div>
+      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video src={selected.video} autoPlay loop muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/></div></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">{longScenes ? "SCENE" : "SHOT"} {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
           <div className="current-script" aria-live="polite"><div><span>Script in this {longScenes ? "scene" : "shot"}</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
           {!longScenes && <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/></label>}
