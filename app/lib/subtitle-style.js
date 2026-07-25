@@ -1,7 +1,11 @@
 export const SUBTITLE_FONTS = Object.freeze([
   { value:"Arial", label:"Clean sans" },
+  { value:"Helvetica", label:"Helvetica" },
   { value:"Georgia", label:"Editorial serif" },
+  { value:"Times New Roman", label:"Traditional serif" },
   { value:"Courier New", label:"Monospace" },
+  { value:"Verdana", label:"Screen sans" },
+  { value:"Trebuchet MS", label:"Modern sans" },
 ]);
 
 export const DEFAULT_SUBTITLE_STYLE = Object.freeze({
@@ -16,6 +20,33 @@ export const DEFAULT_SUBTITLE_STYLE = Object.freeze({
   bold:true,
   outline:2,
 });
+
+export const SUBTITLE_PRESETS = Object.freeze([
+  {
+    id:"netflix-bold", label:"Netflix bold",
+    style:{ fontFamily:"Arial", fontScale:110, englishColor:"#ffffff", chineseColor:"#f2d79f", backgroundColor:"#000000", backgroundOpacity:55, position:6, alignment:"center", bold:true, outline:2.5 },
+  },
+  {
+    id:"youtube-clean", label:"YouTube clean",
+    style:{ fontFamily:"Helvetica", fontScale:100, englishColor:"#ffffff", chineseColor:"#fafafa", backgroundColor:"#000000", backgroundOpacity:35, position:8, alignment:"center", bold:false, outline:1.5 },
+  },
+  {
+    id:"minimal", label:"Minimal",
+    style:{ fontFamily:"Arial", fontScale:95, englishColor:"#ffffff", chineseColor:"#e8d5a3", backgroundColor:"#000000", backgroundOpacity:0, position:8, alignment:"center", bold:false, outline:0 },
+  },
+  {
+    id:"cinematic", label:"Cinematic",
+    style:{ fontFamily:"Georgia", fontScale:105, englishColor:"#f5f0e8", chineseColor:"#d4bf8c", backgroundColor:"#0a0a0a", backgroundOpacity:50, position:5, alignment:"center", bold:true, outline:3 },
+  },
+  {
+    id:"classic", label:"Classic",
+    style:{ fontFamily:"Times New Roman", fontScale:100, englishColor:"#ffffff", chineseColor:"#f2d79f", backgroundColor:"#000000", backgroundOpacity:50, position:8, alignment:"center", bold:true, outline:2 },
+  },
+  {
+    id:"modern", label:"Modern",
+    style:{ fontFamily:"Verdana", fontScale:100, englishColor:"#ffffff", chineseColor:"#e0e0e0", backgroundColor:"#1a1a2e", backgroundOpacity:60, position:7, alignment:"left", bold:false, outline:0 },
+  },
+]);
 
 function clamp(value, minimum, maximum, fallback) {
   const number = Number(value);
@@ -60,4 +91,9 @@ export function subtitleAssColor(value, opacity = 100) {
 
 export function subtitleAssOverrideColor(value) {
   return `${subtitleAssColor(value).replace(/^&H00/, "&H")}&`;
+}
+
+export function applyPreset(presetId) {
+  const preset = SUBTITLE_PRESETS.find((p) => p.id === presetId);
+  return preset ? normalizeSubtitleStyle(preset.style) : null;
 }
