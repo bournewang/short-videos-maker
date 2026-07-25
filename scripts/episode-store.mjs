@@ -229,7 +229,7 @@ export class EpisodeStore {
     const extension = dataMedia ? mediaExtension(dataMedia.mime, fallbackExtension) : mediaExtension("", fallbackExtension || path.extname(source));
     const relativePath = path.join(mediaDirectory, `${safeMediaName(name)}${extension}`);
     const target = path.join(context.directory, relativePath);
-    if (!await exists(target)) {
+    if (dataMedia || !await exists(target)) {
       await mkdir(path.dirname(target), { recursive:true });
       if (dataMedia) await atomicWrite(target, dataMedia.data);
       else if (path.resolve(source) !== path.resolve(target)) {

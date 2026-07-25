@@ -176,7 +176,7 @@ test("provider status reports configuration without exposing secrets", () => {
     VOLCENGINE_IMAGE_ENDPOINT:"https://volcengine.test/images",
     VOLCENGINE_VIDEO_ENDPOINT:"https://volcengine.test/videos",
     OPENAI_TEXT_ENDPOINT:"https://openai.test/chat",
-    SPEECH_ENDPOINT:"http://localhost:8010", SPEECH_MODEL:"mlx-community/Kokoro-test", SPEECH_VOICE:"af_test", SPEECH_LANGUAGE:"a", SPEECH_SPEED:"1.1",
+    SPEECH_ENDPOINT:"http://localhost:8010", SPEECH_MODEL:"mlx-community/Kokoro-test", SPEECH_VOICE:"af_test", SPEECH_VOICES:"af_test, bf_two ,cf_three", SPEECH_LANGUAGE:"a", SPEECH_SPEED:"1.1",
   };
   const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
   Object.assign(process.env, environment);
@@ -185,7 +185,7 @@ test("provider status reports configuration without exposing secrets", () => {
     assert.deepEqual(status.image, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/images", model:"seedream-test", source:"environment" });
     assert.deepEqual(status.video, { configured:true, kind:"volcengine", endpoint:"https://volcengine.test/videos", model:"seedance-test", source:"environment" });
     assert.deepEqual(status.text, { configured:true, kind:"openai", endpoint:"https://openai.test/chat", model:"openai-text-test", source:"environment" });
-    assert.deepEqual(status.speech, { configured:true, endpoint:"http://localhost:8010", model:"mlx-community/Kokoro-test", voice:"af_test", language:"a", speed:1.1, source:"environment" });
+    assert.deepEqual(status.speech, { configured:true, endpoint:"http://localhost:8010", model:"mlx-community/Kokoro-test", voice:"af_test", voices:["af_test", "bf_two", "cf_three"], language:"a", speed:1.1, source:"environment" });
     assert.doesNotMatch(JSON.stringify(status), /test-secret/);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
@@ -416,7 +416,7 @@ test("generated provider images are copied into the local intermediate asset sto
   const info = await stat(result.path);
   assert.ok(info.size > 0);
   assert.match(result.path, /\.shortform\/assets\/cache-test-\d+\.png$/);
-  assert.match(result.url, /^http:\/\/127\.0\.0\.1:4317\/assets\/cache-test-\d+\.png$/);
+  assert.match(result.url, /^http:\/\/127\.0\.0\.1:4317\/assets\/cache-test-\d+\.png\?v=\d+$/);
 });
 
 test("generated provider images are cropped to the selected cover ratio before caching", async () => {
@@ -437,7 +437,7 @@ test("generated provider videos are copied into the local intermediate asset sto
   };
   const result = await persistGeneratedVideo("https://example.test/temporary-provider-video.mp4", { id:`video-cache-test-${Date.now()}`, fetchImpl });
   const info = await stat(result.path);
-  assert.ok(info.size > 0); assert.match(result.path, /\.shortform\/assets\/video-cache-test-\d+\.mp4$/); assert.match(result.url, /\/assets\/video-cache-test-\d+\.mp4$/);
+  assert.ok(info.size > 0); assert.match(result.path, /\.shortform\/assets\/video-cache-test-\d+\.mp4$/); assert.match(result.url, /\/assets\/video-cache-test-\d+\.mp4\?v=\d+$/);
 });
 
 test("Volcengine text adapter uses Ark chat completions", async () => {
@@ -526,8 +526,8 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"The complete timed narration.", audioDuration:82, transcription }, { fetchImpl });
   const planningInput = JSON.parse(providerPayload.messages[1].content);
   assert.equal(planningInput.narrationDurationSeconds, 82);
-  assert.equal(planningInput.minimumShotCount, 21);
-  assert.equal(planningInput.targetShotCount, 25);
+  assert.equal(planningInput.minimumShotCount, 9);
+  assert.equal(planningInput.targetShotCount, 14);
   assert.match(providerPayload.messages[0].content, /videoPrompt/);
   assert.match(providerPayload.messages[0].content, /every image prompt must explicitly name the most accurate era or date and location/i);
   assert.match(providerPayload.messages[0].content, /period-accurate background/i);
@@ -576,7 +576,7 @@ test("mixed planning budgets a small set of image-to-video shots", async () => {
   const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"A complete mixed-mode narration.", audioDuration:26, productionMode:"mixed" }, { fetchImpl });
   const planningInput = JSON.parse(providerPayload.messages[1].content);
   assert.equal(planningInput.productionMode, "mixed");
-  assert.equal(planningInput.targetShotCount, 8);
+  assert.equal(planningInput.targetShotCount, 5);
   assert.equal(planningInput.targetAnimatedShotCount, 2);
   assert.match(providerPayload.messages[0].content, /roughly one in every four shots/i);
   assert.equal(shots.filter((shot) => shot.videoRecommended).length, 2);
