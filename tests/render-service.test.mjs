@@ -135,6 +135,24 @@ test("local renderer keeps image shots visible after generated clips", { timeout
   assert.ok(Math.abs(finalPixel[0] - greenPixel[0]) + Math.abs(finalPixel[1] - greenPixel[1]) + Math.abs(finalPixel[2] - greenPixel[2]) > 25, `Expected final still to replace the preceding clip; green=${greenPixel}, final=${finalPixel}`);
 });
 
+test("local renderer reports staged progress events", { timeout: 120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-progress-test-")); const output = path.join(dir, "episode.mp4");
+  const events = [];
+  await renderEpisode({ width:360, height:640, narrationData:narrationWav(), voicePreset:"original", shots:[
+    { duration:.8, image:png, narration:"First shot.", chinese:"第一个镜头。" },
+    { duration:.8, image:png, narration:"Second shot.", chinese:"第二个镜头。" },
+  ] }, { id:`progress-${Date.now()}`, output, onProgress:(event) => events.push(event) });
+  assert.equal(events[0].stage, "Preparing sources");
+  assert.deepEqual(events.filter((event) => event.stage.startsWith("Encoding shot")).map((event) => event.stage), ["Encoding shot 1/2", "Encoding shot 2/2"]);
+  assert.deepEqual(events.map((event) => event.totalShots), events.map(() => 2));
+  assert.ok(events.some((event) => event.stage === "Processing narration"));
+  assert.ok(events.some((event) => event.stage === "Writing subtitles"));
+  assert.equal(events.at(-1).stage, "Final assembly");
+  const percents = events.map((event) => event.percent);
+  assert.deepEqual(percents, [...percents].sort((a, b) => a - b));
+  assert.ok(percents.at(-1) < 100);
+});
+
 test("still motion filter maps shot motion to a non-resetting zoompan", () => {
   const push = stillMotionFilter("Slow push-in", 1080, 1920, 3, 0);
   assert.ok(push.includes("zoompan=z='1+0.14*on/90'"));
@@ -257,7 +275,7 @@ test("Volcengine image adapter sends a vertical Seedream request", async () => {
   const image = await generateImage({ kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-pro-260628", apiKey:"ark-test", prompt:"A vertical cinematic scene" }, { fetchImpl });
   const payload = JSON.parse(request.body);
   assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/v3/images/generations");
-  assert.equal(request.headers.Authorization, "Bearer ark-test"); assert.equal(payload.size, "1440x2560"); assert.equal(payload.watermark, false);
+  assert.equal(request.headers.Authorization, "Bearer ark-test"); assert.equal(payload.size, "2160x3840"); assert.equal(payload.watermark, false);
   assert.equal(image, "https://example.test/seedream.png");
 });
 
@@ -273,7 +291,7 @@ test("image adapters use the selected screen ratio", async () => {
   };
   await generateImage({ kind:"volcengine", endpoint:"https://example.test", model:"seedream", apiKey:"key", prompt:"Scene", screenRatio:"16:9" }, { fetchImpl:volcengineFetch });
   await generateImage({ kind:"openai", endpoint:"https://example.test/images", model:"gpt-image", apiKey:"key", prompt:"Scene", screenRatio:"1:1" }, { fetchImpl:openaiFetch });
-  assert.equal(volcengineRequest.size, "2560x1440");
+  assert.equal(volcengineRequest.size, "3840x2160");
   assert.match(volcengineRequest.prompt, /16:9 screen ratio/);
   assert.equal(openaiRequest.size, "1024x1024");
 });
@@ -292,9 +310,9 @@ test("Volcengine Agent Plan image adapter accepts the documented API base URL", 
 
 test("video first frames are cropped to the selected screen ratio before submission", { timeout:120000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "shortform-video-frame-test-"));
-  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "16:9", { workDir:dir })), { width:1280, height:720 });
-  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "9:16", { workDir:dir })), { width:720, height:1280 });
-  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "1:1", { workDir:dir })), { width:960, height:960 });
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "16:9", { workDir:dir })), { width:1920, height:1080 });
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "9:16", { workDir:dir })), { width:1080, height:1920 });
+  assert.deepEqual(pngDimensions(await prepareProviderImage(png, "1:1", { workDir:dir })), { width:1080, height:1080 });
 });
 
 test("Volcengine video adapter creates and polls an image-to-video task", async () => {
@@ -310,11 +328,11 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
   assert.equal(requests[0].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks");
   assert.equal(requests[0].options.headers.Authorization, "Bearer ark-test");
   assert.equal(payload.model, "doubao-seedance-2-0-260128");
-  assert.equal(payload.content[1].role, "first_frame"); assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:720, height:1280 });
+  assert.equal(payload.content[1].role, "first_frame"); assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:1080, height:1920 });
   assert.match(payload.content[0].text, /Rain streams diagonally/);
   assert.match(payload.content[0].text, /Camera direction override: Slow push-in/);
   assert.doesNotMatch(payload.content[0].text, /--ratio|--dur|--resolution/);
-  assert.equal(payload.duration, 3); assert.equal(payload.ratio, "9:16"); assert.equal(payload.resolution, "720p");
+  assert.equal(payload.duration, 3); assert.equal(payload.ratio, "9:16"); assert.equal(payload.resolution, "1080p");
   assert.equal(payload.generate_audio, false); assert.equal(payload.watermark, false);
   assert.equal(requests[2].url, "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks/cgt-test-123");
   assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
@@ -362,7 +380,7 @@ test("Volcengine video adapter uses the selected screen ratio", async () => {
   await generateVideo({ videoKind:"volcengine", endpoint:"https://example.test", model:"seedance", apiKey:"key", image:png, screenRatio:"1:1" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
   const payload = JSON.parse(requests[0].options.body);
   assert.equal(payload.ratio, "1:1");
-  assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:960, height:960 });
+  assert.deepEqual(pngDimensions(payload.content[1].image_url.url), { width:1080, height:1080 });
   assert.match(payload.content[0].text, /Square 1:1 screen ratio/);
 });
 
@@ -422,7 +440,7 @@ test("generated provider images are copied into the local intermediate asset sto
 test("generated provider images are cropped to the selected cover ratio before caching", async () => {
   const result = await persistGeneratedImage(png, { id:`ratio-cache-test-${Date.now()}`, screenRatio:"16:9" });
   try {
-    assert.deepEqual(await probeVideoSize(result.path), { width:1280, height:720 });
+    assert.deepEqual(await probeVideoSize(result.path), { width:3840, height:2160 });
     assert.match(result.path, /-16x9\.png$/);
   } finally {
     await unlink(result.path).catch(() => {});

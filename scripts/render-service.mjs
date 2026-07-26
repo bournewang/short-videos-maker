@@ -206,6 +206,20 @@ function json(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
+const renderJobs = new Map();
+const RENDER_JOB_TTL_MS = 30 * 60 * 1000;
+
+function updateRenderJob(id, patch) {
+  if (!id) return;
+  const current = renderJobs.get(id) || { id, status:"running", stage:"Queued", percent:0, completedShots:0, totalShots:0 };
+  renderJobs.set(id, { ...current, ...patch, updatedAt:Date.now() });
+  for (const [key, job] of renderJobs) if (Date.now() - job.updatedAt > RENDER_JOB_TTL_MS) renderJobs.delete(key);
+}
+
+export function getRenderJob(id) {
+  return renderJobs.get(id) || null;
+}
+
 async function body(req, maxBytes = 160 * 1024 * 1024) {
   const chunks = []; let size = 0;
   for await (const chunk of req) { size += chunk.length; if (size > maxBytes) throw new Error("Request is too large"); chunks.push(chunk); }
@@ -318,7 +332,9 @@ export async function persistGeneratedImage(value, options = {}) {
   let filename = source;
   if (options.screenRatio) {
     const ratio = normalizeScreenRatio(options.screenRatio);
-    const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
+    // Keep the provider's native 4K resolution so exports always downscale
+    // from real detail instead of upscaling a shrunken cache.
+    const dimensions = ratio === "16:9" ? { width:3840, height:2160 } : ratio === "1:1" ? { width:4096, height:4096 } : { width:2160, height:3840 };
     const output = path.join(directory, `${id}-${ratio.replace(":", "x")}.png`);
     const filter = `scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=increase,crop=${dimensions.width}:${dimensions.height},setsar=1`;
     try {
@@ -385,7 +401,7 @@ async function providerImageUrl(value) {
 
 export async function prepareProviderImage(value, screenRatio, options = {}) {
   const ratio = normalizeScreenRatio(screenRatio);
-  const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:960, height:960 } : { width:720, height:1280 };
+  const dimensions = ratio === "16:9" ? { width:1920, height:1080 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
   const workDir = options.workDir || assetRoot;
   const id = options.id || randomUUID();
   await mkdir(workDir, { recursive:true });
@@ -474,7 +490,7 @@ export function buildSubtitleAss(shots, width, height, value = {}) {
 // the crop window moves in sub-output-pixel steps (no jitter).
 export function stillMotionFilter(motion, width, height, duration, index = 0) {
   const frames = Math.max(1, Math.round((Number(duration) || 2) * 30));
-  const hiRes = `scale=${width * 3}:${height * 3}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709,crop=${width * 3}:${height * 3}`;
+  const hiRes = `scale=${width * 3}:${height * 3}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709:flags=lanczos,crop=${width * 3}:${height * 3}`;
   const kinds = { "Slow push-in":"push", "Slow pull-out":"pull", "Slow drift":"drift", "Slow rise":"rise", "Slow sink":"sink", "Diagonal drift":"diagonal", "Push to subject":"push-subject", "Static":"static" };
   const rotation = ["push", "drift", "pull", "rise", "sink", "diagonal"];
   const kind = kinds[motion] || rotation[index % rotation.length];
@@ -505,6 +521,9 @@ export async function renderEpisode(payload, options = {}) {
   await mkdir(jobDir, { recursive: true }); await mkdir(exportRoot, { recursive: true });
   const { width, height } = renderDimensions(payload); const subtitleStyle = normalizeSubtitleStyle(payload.subtitleStyle);
   const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
+  const totalShots = payload.shots.length;
+  const report = (stage, percent, completedShots = 0) => { if (typeof options.onProgress === "function") options.onProgress({ stage, percent, completedShots, totalShots }); };
+  report("Preparing sources", 2);
   let cursor = 0; const shots = [];
   for (let i = 0; i < payload.shots.length; i += 1) {
     if (!payload.shots[i].video && !payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image or video clip`);
@@ -512,17 +531,22 @@ export async function renderEpisode(payload, options = {}) {
     const sourceValue = payload.shots[i].video || payload.shots[i].image;
     const source = await saveMedia(sourceValue, path.join(jobDir, `source-${String(i).padStart(3,"0")}`));
     const segment = path.join(jobDir, `segment-${String(i).padStart(3,"0")}.mp4`);
-    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709,crop=${width}:${height},fps=30,setsar=1`;
+    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709:flags=lanczos,crop=${width}:${height},fps=30,setsar=1`;
     const normalizedFormat = "format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
     const colorMetadata = ["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"];
+    // Intermediate segments are encoded near-lossless so the single final
+    // encode (which burns subtitles) is the only lossy step.
+    const segmentEncoding = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"];
     if (payload.shots[i].video) {
-      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
+      await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     } else {
       const stillMotion = stillMotionFilter(payload.shots[i].motion, width, height, duration, i);
-      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", ...colorMetadata, segment]);
+      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     }
     shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment }); cursor += duration;
+    report(`Encoding shot ${i + 1}/${totalShots}`, 2 + Math.round(68 * (i + 1) / totalShots), i + 1);
   }
+  report("Processing narration", 74, totalShots);
   let narration = await saveMedia(payload.narrationData, path.join(jobDir, "narration"));
   if (narration && payload.voicePreset !== "original") narration = (await renderNarrationStages(narration, "denoise", jobDir, "narration")).final;
   let customBgm = null;
@@ -532,6 +556,7 @@ export async function renderEpisode(payload, options = {}) {
     customBgm = path.join(bgmRoot, filename);
     await readFile(customBgm);
   }
+  report("Writing subtitles", 78, totalShots);
   const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle));
   const concatFile = path.join(jobDir, "segments.txt");
   const quoteConcat = (value) => value.replace(/'/g, "'\\''");
@@ -550,7 +575,8 @@ export async function renderEpisode(payload, options = {}) {
   else if (narrationInput) filters.push(`[${narrationInput.index}:a]volume=1[aout]`);
   else if (bgmInput) filters.push(`[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[aout]`);
   else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
-  args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
+  args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
+  report("Final assembly", 82, totalShots);
   await run("ffmpeg", args);
   return { id, output, url:options.publicUrl || `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
 }
@@ -569,7 +595,7 @@ export async function generateImage(data, options = {}) {
     const result = await response.json(); if (!response.ok) throw new Error(result.error || `Provider returned ${response.status}`); if (!result.images?.[0]) throw new Error("Provider returned no image");
     return `data:image/png;base64,${result.images[0]}`;
   }
-  const volcengineSize = screenRatio === "16:9" ? "2560x1440" : screenRatio === "1:1" ? "1920x1920" : "1440x2560";
+  const volcengineSize = screenRatio === "16:9" ? "3840x2160" : screenRatio === "1:1" ? "4096x4096" : "2160x3840";
   const openaiSize = screenRatio === "16:9" ? "1536x1024" : screenRatio === "1:1" ? "1024x1024" : "1024x1536";
   const requestBody = data.kind === "volcengine"
     ? { model:data.model, prompt, size:volcengineSize, response_format:"url", watermark:false }
@@ -629,7 +655,7 @@ export async function generateVideo(data, options = {}) {
     ],
     duration,
     ratio:screenRatio,
-    resolution:"720p",
+    resolution:"1080p",
     generate_audio:false,
     watermark:false,
   }) });
@@ -832,17 +858,33 @@ export function createRenderServer() {
         const filename = path.basename(decodeURIComponent(url.pathname)); const file = path.join(assetRoot, filename); await readFile(file);
         res.writeHead(200, cors({"Content-Type":assetContentType(filename),"Cache-Control":"public, max-age=31536000, immutable"})); createReadStream(file).pipe(res); return;
       }
+      const renderJobMatch = /^\/render\/jobs\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && renderJobMatch) {
+        const job = getRenderJob(decodeURIComponent(renderJobMatch[1]));
+        if (!job) { json(res, 404, { error:"Render job was not found" }); return; }
+        json(res, 200, { job }); return;
+      }
       if (req.method === "POST" && url.pathname === "/render") {
         const payload = await body(req);
-        if (payload.episodeId) {
-          const id = randomUUID();
-          const result = await episodeStore.withMediaTarget(payload.episodeId, payload.title, "exports", id, async (target) => {
-            return await renderEpisode(payload, { id, output:path.join(target.directory, `${target.baseName}.mp4`), publicUrl:`${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.mp4`)}` });
-          });
+        const jobId = typeof payload.renderJobId === "string" ? payload.renderJobId.slice(0, 80) : "";
+        if (jobId) updateRenderJob(jobId, { status:"running", stage:"Queued", percent:0 });
+        try {
+          const onProgress = jobId ? (event) => updateRenderJob(jobId, event) : undefined;
+          let result;
+          if (payload.episodeId) {
+            const id = randomUUID();
+            result = await episodeStore.withMediaTarget(payload.episodeId, payload.title, "exports", id, async (target) => {
+              return await renderEpisode(payload, { id, onProgress, output:path.join(target.directory, `${target.baseName}.mp4`), publicUrl:`${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.mp4`)}` });
+            });
+          } else {
+            result = await renderEpisode(payload, { onProgress });
+          }
+          if (jobId) updateRenderJob(jobId, { status:"done", stage:"Complete", percent:100 });
           json(res, 200, result); return;
+        } catch (error) {
+          if (jobId) updateRenderJob(jobId, { status:"error", stage:"Failed", error:error instanceof Error ? error.message : "Render failed" });
+          throw error;
         }
-        const result = await renderEpisode(payload);
-        json(res, 200, result); return;
       }
       if (req.method === "POST" && url.pathname === "/image/generate") {
         const payload = await body(req, 2*1024*1024);
@@ -850,6 +892,15 @@ export function createRenderServer() {
         const cached = payload.episodeId
           ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, payload.assetKind === "covers" ? "covers" : "images", payload.assetName || randomUUID(), async (target) => await persistGeneratedImage(generated, { screenRatio:payload.screenRatio, ...target }))
           : await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
+        json(res, 200, { image:cached.url, path:cached.path }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/image/upload") {
+        const payload = await body(req, 16*1024*1024);
+        if (!payload.image) throw new Error("No image data provided");
+        const assetName = payload.assetName || randomUUID();
+        const cached = payload.episodeId
+          ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, "images", assetName, async (target) => await persistGeneratedImage(payload.image, { screenRatio:payload.screenRatio, ...target }))
+          : await persistGeneratedImage(payload.image, { screenRatio:payload.screenRatio });
         json(res, 200, { image:cached.url, path:cached.path }); return;
       }
       if (req.method === "POST" && url.pathname === "/video/generate") {
