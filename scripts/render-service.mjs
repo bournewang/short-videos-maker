@@ -461,28 +461,46 @@ function assTime(value) {
 
 function assText(value) { return String(value || "").replace(/\\/g, "\\\\").replace(/[\r\n]+/g, " ").replace(/\{/g, "（").replace(/\}/g, "）"); }
 
-export function buildSubtitleAss(shots, width, height, value = {}) {
+export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode = false, headlineText = "", headlinePosition = 4) {
   const style = normalizeSubtitleStyle(value);
   const fontSize = Math.max(10, Math.round(height * .028 * style.fontScale / 100));
   const marginV = Math.round(height * style.position / 100); const marginH = Math.round(width * .065);
   const alignment = { left:1, center:2, right:3 }[style.alignment];
   const primary = subtitleAssColor(style.englishColor); const chinese = subtitleAssOverrideColor(style.chineseColor);
   const outline = subtitleAssColor(style.backgroundColor); const background = subtitleAssColor(style.backgroundColor, style.backgroundOpacity);
-  const header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontFamily},${fontSize},${primary},&H000000FF,${outline},&HFF000000,${style.bold ? -1 : 0},0,0,0,100,100,0,0,1,${style.outline},0,${alignment},${marginH},${marginH},${marginV},1\nStyle: Box,Arial,1,${background},${background},${background},${background},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
+  const hasHeadline = broadcastMode && String(headlineText || "").trim().length > 0;
+  console.log(`[buildSubtitleAss] broadcastMode=${broadcastMode}, headlineText="${headlineText}", hasHeadline=${hasHeadline}`);
+  const headlineFontSize = Math.max(12, Math.round(fontSize * 1.15));
+  const headlineColor = subtitleAssColor("#ffffff");
+  const headlineBg = subtitleAssColor("#000000", 65);
+  const headlineMarginV = Math.round(height * headlinePosition / 100);
+  const headlineBarHeight = Math.round(headlineFontSize * 2.2);
+  let header = `[Script Info]\nScriptType: v4.00+\nPlayResX: ${width}\nPlayResY: ${height}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Main,${style.fontFamily},${fontSize},${primary},&H000000FF,${outline},&HFF000000,${style.bold ? -1 : 0},0,0,0,100,100,0,0,1,${style.outline},0,${alignment},${marginH},${marginH},${marginV},1\nStyle: Box,Arial,1,${background},${background},${background},${background},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1`;
+  if (hasHeadline) {
+    header += `\nStyle: Headline,${style.fontFamily},${headlineFontSize},${headlineColor},&H000000FF,&H00000000,&HEE000000,1,0,0,0,100,100,0,0,1,2.5,0,8,${marginH},${marginH},${headlineMarginV},1`;
+  }
+  header += `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
   const events = shots.flatMap((shot) => {
     const englishText = assText(shot.narration); const chineseText = assText(shot.chinese);
     const text = [englishText, chineseText ? `{\\c${chinese}}${chineseText}` : ""].filter(Boolean).join("\\N");
     const lines = Math.max(1, Number(Boolean(englishText)) + Number(Boolean(chineseText)));
-    const paddingY = Math.max(4, Math.round(fontSize * .55)); const lineHeight = Math.round(fontSize * 1.3);
+    const paddingY = Math.max(4, Math.round(fontSize * .35)); const lineHeight = Math.round(fontSize * 1.3);
     const boxHeight = lines * lineHeight + paddingY * 2; const boxWidth = width - marginH * 2;
     const boxBottom = Math.min(height, height - marginV + paddingY); const boxTop = Math.max(0, boxBottom - boxHeight);
     const box = `{\\an7\\pos(${marginH},${boxTop})\\p1}m 0 0 l ${boxWidth} 0 l ${boxWidth} ${boxHeight} l 0 ${boxHeight}{\\p0}`;
+    const headlineEvents = hasHeadline ? [
+      `Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Box,,0,0,0,,{\\an7\\pos(0,0)\\p1}m 0 0 l ${width} 0 l ${width} ${headlineBarHeight} l 0 ${headlineBarHeight}{\\p0}`,
+      `Dialogue: 1,${assTime(shot.start)},${assTime(shot.end)},Headline,,0,0,0,,${assText(headlineText)}`,
+    ] : [];
     return [
+      ...headlineEvents,
       ...(style.backgroundOpacity > 0 ? [`Dialogue: 0,${assTime(shot.start)},${assTime(shot.end)},Box,,0,0,0,,${box}`] : []),
       `Dialogue: 1,${assTime(shot.start)},${assTime(shot.end)},Main,,0,0,0,,${text}`,
     ];
   });
-  return header + events.join("\n");
+  const ass = header + events.join("\n");
+  if (hasHeadline) console.log(`[buildSubtitleAss] Generated ASS with headline, first 600 chars: ${ass.substring(0, 600)}`);
+  return ass;
 }
 
 // Ken Burns-style motion for still shots. The zoom ramps across the whole shot
@@ -557,7 +575,7 @@ export async function renderEpisode(payload, options = {}) {
     await readFile(customBgm);
   }
   report("Writing subtitles", 78, totalShots);
-  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle));
+  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle, payload.broadcastMode, payload.headlineText, payload.headlinePosition));
   const concatFile = path.join(jobDir, "segments.txt");
   const quoteConcat = (value) => value.replace(/'/g, "'\\''");
   await writeFile(concatFile, shots.map((shot) => `file '${quoteConcat(shot.segment)}'`).join("\n"));

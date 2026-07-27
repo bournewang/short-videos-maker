@@ -48,6 +48,19 @@ export const SUBTITLE_PRESETS = Object.freeze([
   },
 ]);
 
+export const BROADCAST_MODE_STYLE = Object.freeze({
+  fontFamily:"Arial",
+  fontScale:105,
+  englishColor:"#ffffff",
+  chineseColor:"#f2d79f",
+  backgroundColor:"#000000",
+  backgroundOpacity:55,
+  position:42,
+  alignment:"center",
+  bold:true,
+  outline:2.5,
+});
+
 function clamp(value, minimum, maximum, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
@@ -69,7 +82,7 @@ export function normalizeSubtitleStyle(value = {}) {
     chineseColor:normalizeColor(source.chineseColor, DEFAULT_SUBTITLE_STYLE.chineseColor),
     backgroundColor:normalizeColor(source.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor),
     backgroundOpacity:Math.round(clamp(source.backgroundOpacity, 0, 100, DEFAULT_SUBTITLE_STYLE.backgroundOpacity)),
-    position:Math.round(clamp(source.position, 3, 35, DEFAULT_SUBTITLE_STYLE.position)),
+    position:Math.round(clamp(source.position, 3, 60, DEFAULT_SUBTITLE_STYLE.position)),
     alignment:["left","center","right"].includes(source.alignment) ? source.alignment : DEFAULT_SUBTITLE_STYLE.alignment,
     bold:typeof source.bold === "boolean" ? source.bold : DEFAULT_SUBTITLE_STYLE.bold,
     outline:Math.round(clamp(source.outline, 0, 5, DEFAULT_SUBTITLE_STYLE.outline) * 10) / 10,
@@ -96,4 +109,16 @@ export function subtitleAssOverrideColor(value) {
 export function applyPreset(presetId) {
   const preset = SUBTITLE_PRESETS.find((p) => p.id === presetId);
   return preset ? normalizeSubtitleStyle(preset.style) : null;
+}
+
+export function normalizeBroadcastHeadline(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    text: String(source.text || "").trim(),
+    fontFamily: SUBTITLE_FONTS.some((font) => font.value === source.fontFamily) ? source.fontFamily : "Arial",
+    fontScale: Math.round(clamp(source.fontScale, 70, 160, 100)),
+    textColor: normalizeColor(source.textColor, "#ffffff"),
+    backgroundColor: normalizeColor(source.backgroundColor, "#000000"),
+    backgroundOpacity: Math.round(clamp(source.backgroundOpacity, 0, 100, 65)),
+  };
 }
