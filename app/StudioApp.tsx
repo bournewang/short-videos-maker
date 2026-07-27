@@ -908,13 +908,13 @@ export default function StudioApp() {
       </section>
 
       <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
-      {audioData && !episodesOpen && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} continuous={previewActive} />}
+      {audioData && !episodesOpen && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} continuous={previewActive} shots={stage === "storyboard" ? shots : []} setSelectedId={setSelectedId} setPreviewActive={setPreviewActive} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
 }
 
-function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, previewShot, continuous }: any) {
+function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, previewShot, continuous, shots, setSelectedId, setPreviewActive }: any) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -957,7 +957,7 @@ function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, pr
     <audio ref={audioRef} src={audioData} preload="metadata"
       onLoadedMetadata={(event) => { const meta = event.currentTarget.duration; if (Number.isFinite(meta) && meta > 0) setDuration(meta); }}
       onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-      onTimeUpdate={(event) => { const audio = event.currentTarget; if (previewShot && !continuous && Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end) - .02) { audio.pause(); audio.currentTime = Math.max(0, Number(previewShot.start) || 0); } setElapsed(audio.currentTime); }}
+      onTimeUpdate={(event) => { const audio = event.currentTarget; if (previewShot) { if (continuous) { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end)) { const idx = shots.findIndex((s:any) => s.id === previewShot.id); if (idx >= 0 && idx < shots.length - 1) { setSelectedId(shots[idx + 1].id); } else { setPreviewActive(false); audio.pause(); } } } else { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end) - .02) { audio.pause(); audio.currentTime = Math.max(0, Number(previewShot.start) || 0); } } } setElapsed(audio.currentTime); }}
       onEnded={() => { setPlaying(false); setElapsed(0); }}/>
     <button type="button" onClick={togglePlayback} aria-label={playing ? "Pause narration" : "Play narration"}>{playing ? "❚❚" : "▶"}</button>
     <div className="narration-bar-label"><span>Narration</span><b title={audioName}>{audioName || "Untitled audio"}</b></div>
@@ -1077,7 +1077,6 @@ function Storyboard({ productionMode, script, transcription, shots, selected, se
     selectedRow?.scrollIntoView({ block:"nearest" });
   }, [selected?.id]);
   const previewIndexRef = useRef(0);
-  const advancedRef = useRef(false);
 
   function handleShotClick(shotId: string) {
     setPreviewActive(false);
@@ -1088,30 +1087,9 @@ function Storyboard({ productionMode, script, transcription, shots, selected, se
     if (!shots.length) return;
     const startIndex = selected ? Math.max(0, shots.findIndex((s:Shot) => s.id === selected.id)) : 0;
     previewIndexRef.current = startIndex;
-    advancedRef.current = false;
     setPreviewActive(true);
     setSelectedId(shots[startIndex].id);
   }
-
-  function advancePreview() {
-    if (advancedRef.current) return;
-    advancedRef.current = true;
-    const next = previewIndexRef.current + 1;
-    if (next < shots.length) {
-      previewIndexRef.current = next;
-      setSelectedId(shots[next].id);
-    } else {
-      setPreviewActive(false);
-    }
-  }
-
-  useEffect(() => {
-    if (!previewActive || !selected) return;
-    advancedRef.current = false;
-    const duration = Math.max(0.6, Number(selected.duration) || 2) * 1000;
-    const timer = setTimeout(() => advancePreview(), duration + 500);
-    return () => clearTimeout(timer);
-  }, [selected?.id, previewActive]);
 
   const longScenes = productionMode === "long-scenes";
   const mixedMode = productionMode === "mixed";
@@ -1127,7 +1105,7 @@ function Storyboard({ productionMode, script, transcription, shots, selected, se
   return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>{shots.length} {longScenes ? "scenes" : "shots"} aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} clips ready{mixedMode ? ` · ${recommendedVideos} recommended` : ""} <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/>{previewActive ? <button className="ghost preview-stop" onClick={() => setPreviewActive(false)}>Stop preview</button> : <button className="primary preview-play" onClick={startPreview} disabled={batchActionsBusy}>Preview</button>}{!longScenes && <button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button>}<button className="primary" onClick={() => generateAllVideos()} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : longScenes ? "Generate all long clips" : mixedMode ? `Animate recommended (${recommendedVideos})` : "Animate all shots"}</button></div></div>
     <div className={`story-grid ratio-${screenRatio.replace(':','-')}`}><div className="shot-list" ref={shotListRef} aria-keyshortcuts="ArrowUp ArrowDown">{shots.map((shot: Shot) => <button key={shot.id} data-shot-id={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => handleShotClick(shot.id)}>
       <div className="thumb">{shot.video ? <video src={shot.video} muted playsInline aria-label="Generated scene clip"/> : shot.image ? <img src={shot.image} alt="Generated shot"/> : null}<i className="shot-index-badge" aria-label={`Shot ${shot.index + 1}`}>{String(shot.index + 1).padStart(2,'0')}</i>{shot.video ? <i className="clip-badge">CLIP</i> : mixedMode && shot.videoRecommended ? <i className="video-pick-badge">VIDEO PICK</i> : null}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? longScenes ? "generating" : "animating" : shot.video ? "clip ready" : mixedMode && shot.videoRecommended ? "video selected" : longScenes ? "planned" : shot.status}</span></button>)}</div>
-      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video key={selected.id} src={selected.video} autoPlay loop={!previewActive} muted playsInline aria-label="Generated shot video preview" onEnded={previewActive ? advancePreview : undefined}/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/>{broadcastMode && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div>
+      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video key={selected.id} src={selected.video} autoPlay loop={!previewActive} muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle}/>{broadcastMode && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">{longScenes ? "SCENE" : "SHOT"} {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
           <div className="current-script" aria-live="polite"><div><span>Script in this {longScenes ? "scene" : "shot"}</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
           {!longScenes && <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/></label>}
