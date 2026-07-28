@@ -1190,16 +1190,34 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 
 function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle }: any) {
   const [livestreamRatio, setLivestreamRatio] = useState("9:16");
-  const [backgroundImage, setBackgroundImage] = useState(() => {
-    const verticalCover = covers.find((c: CoverImage) => c.screenRatio === "9:16");
-    return verticalCover?.url || "";
-  });
+  const [customBackground, setCustomBackground] = useState<string | null>(null);
+  const defaultBackground = covers.find((c: CoverImage) => c.screenRatio === "9:16")?.url || "";
+  const backgroundImage = customBackground ?? defaultBackground;
   const [isPlaying, setIsPlaying] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const previewRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (subtitleStyle.position === DEFAULT_SUBTITLE_STYLE.position) setSubtitleStyle({ position: 40 });
+    if (headlinePosition === 4) setHeadlinePosition(10);
+  }, []);
+
+  useEffect(() => {
+    function handleSpaceToggle(event: KeyboardEvent) {
+      if (event.code === "Escape" && expanded) { setExpanded(false); return; }
+      if (event.code !== "Space" || event.repeat) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName) || target.isContentEditable)) return;
+      if (!audioRef.current || !audioData || !backgroundImage) return;
+      event.preventDefault();
+      togglePlayback();
+    }
+    window.addEventListener("keydown", handleSpaceToggle);
+    return () => window.removeEventListener("keydown", handleSpaceToggle);
+  });
 
   const currentShot = shots.find((shot: Shot) => currentTime >= shot.start && currentTime < shot.end) || null;
   const previewShot = currentShot || (backgroundImage && !isPlaying ? shots[0] : null);
@@ -1216,37 +1234,33 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   }
 
   function toggleFullscreen() {
-    const el = previewRef.current;
-    if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen();
-    } else {
-      el.requestFullscreen();
-    }
+    setExpanded((current) => !current);
   }
 
   function handleCoverSelect(url: string) {
-    setBackgroundImage(url);
+    setCustomBackground(url);
   }
 
   async function handleBackgroundUpload(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
     const dataUrl = await fileToDataUrl(file);
-    setBackgroundImage(dataUrl);
+    setCustomBackground(dataUrl);
     event.target.value = "";
   }
 
   return <div className="panel livestream-panel"><div className="section-head"><div><span className="eyebrow">LIVESTREAM</span><h1>Broadcast</h1><p>Simulate a livestream with a background image and synced subtitles.</p></div><div className="livestream-head-actions"><label className="ratio-select"><span>Screen ratio</span><select value={livestreamRatio} onChange={(event) => setLivestreamRatio(event.target.value)}><option value="9:16">9:16 · Vertical</option><option value="16:9">16:9 · Landscape</option></select></label></div></div>
-    <div className="livestream-grid">
+    <div className={`livestream-grid ${expanded ? "expanded" : ""}`}>
       <div className="livestream-preview-col">
-        <div className={`phone-frame ratio-${livestreamRatio.replace(":", "-")}`} ref={previewRef}>
+        {expanded && <button type="button" className="livestream-collapse-btn" onClick={() => setExpanded(false)} aria-label="Exit full width">✕</button>}
+        <div className={`phone-frame ratio-${livestreamRatio.replace(":", "-")}`}>
           <div className="phone-canvas" style={{ aspectRatio: livestreamRatio.replace(":", " / ") }}>
             {backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>}
             {backgroundImage && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} />}
 {backgroundImage && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} />}
           </div>
         </div>
+        <button type="button" className="ghost full livestream-fullscreen-btn" onClick={toggleFullscreen} disabled={!backgroundImage}>{expanded ? "✕ Exit full width" : "⛶ Full width"}</button>
       </div>
       <div className="livestream-controls">
         <div className="livestream-bg-section">
@@ -1268,8 +1282,6 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
           <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!audioData || !backgroundImage}>
             {isPlaying ? "❚❚ Pause" : "▶ Start broadcast"}
           </button>
-          {isPlaying && <button type="button" className="ghost full livestream-fullscreen-btn" onClick={toggleFullscreen}>⛶ Full screen</button>}
-          {isPlaying && <div className="livestream-progress"><input type="range" min={0} max={duration || audioRef.current?.duration || 0} step={0.01} value={currentTime} aria-label="Livestream playback position" onChange={(event) => { const audio = audioRef.current; if (!audio) return; audio.currentTime = Number(event.target.value); setCurrentTime(Number(event.target.value)); }}/><div className="livestream-progress-time"><time>{formatTime(currentTime)}</time><time>{formatTime(duration || audioRef.current?.duration || 0)}</time></div></div>}
           {isPlaying && <div className="livestream-status"><span className="live-dot" />LIVE</div>}
           {!audioData && <p className="helper-copy">Add narration audio in Episode or Captions before starting.</p>}
           {audioData && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
