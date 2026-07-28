@@ -1193,6 +1193,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const [customBackground, setCustomBackground] = useState<string | null>(null);
   const defaultBackground = covers.find((c: CoverImage) => c.screenRatio === "9:16")?.url || "";
   const backgroundImage = customBackground ?? defaultBackground;
+  const [bgMode, setBgMode] = useState<"cover" | "shots">("cover");
   const [isPlaying, setIsPlaying] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -1211,7 +1212,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
       if (event.code !== "Space" || event.repeat) return;
       const target = event.target as HTMLElement | null;
       if (target && (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName) || target.isContentEditable)) return;
-      if (!audioRef.current || !audioData || !backgroundImage) return;
+      if (!audioRef.current || !audioData || !(backgroundImage || (bgMode === "shots" && shots.length > 0))) return;
       event.preventDefault();
       togglePlayback();
     }
@@ -1220,7 +1221,8 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   });
 
   const currentShot = shots.find((shot: Shot) => currentTime >= shot.start && currentTime < shot.end) || null;
-  const previewShot = currentShot || (backgroundImage && !isPlaying ? shots[0] : null);
+  const previewShot = currentShot || ((backgroundImage || bgMode === "shots") && !isPlaying ? shots[0] : null);
+  const hasVisual = backgroundImage || (bgMode === "shots" && !!previewShot);
 
   function togglePlayback() {
     const audio = audioRef.current;
@@ -1255,21 +1257,34 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
         {expanded && <button type="button" className="livestream-collapse-btn" onClick={() => setExpanded(false)} aria-label="Exit full width">✕</button>}
         <div className={`phone-frame ratio-${livestreamRatio.replace(":", "-")}`}>
           <div className="phone-canvas" style={{ aspectRatio: livestreamRatio.replace(":", " / ") }}>
-            {backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>}
-            {backgroundImage && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} />}
-{backgroundImage && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} />}
+            {bgMode === "shots" && previewShot ? (
+                previewShot.video ? <video key={previewShot.id} src={previewShot.video} autoPlay muted loop playsInline aria-label="Shot video background" />
+                : previewShot.image ? <img src={previewShot.image} alt="Shot visual background" />
+                : backgroundImage ? <img src={backgroundImage} alt="Livestream background" />
+                : <div className="empty-visual"><span>📺</span><b>No shot visual</b></div>
+              ) : backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>}
+            {hasVisual && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} />}
+{hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} />}
           </div>
         </div>
-        <button type="button" className="ghost full livestream-fullscreen-btn" onClick={toggleFullscreen} disabled={!backgroundImage}>{expanded ? "✕ Exit full width" : "⛶ Full width"}</button>
+        <button type="button" className="ghost full livestream-fullscreen-btn" onClick={toggleFullscreen} disabled={!hasVisual}>{expanded ? "✕ Exit full width" : "⛶ Full width"}</button>
       </div>
       <div className="livestream-controls">
         <div className="livestream-bg-section">
-          <h3>Background image</h3>
+          <h3>Background</h3>
           <div className="livestream-bg-options">
+            <label className="field"><span>Mode</span>
+              <select value={bgMode} onChange={(e) => setBgMode(e.target.value as "cover" | "shots")}>
+                <option value="cover">Cover image</option>
+                <option value="shots">Dynamic shots</option>
+              </select>
+            </label>
+            {bgMode === "cover" && <>
             <label className="field"><span>From covers</span><select value={backgroundImage} onChange={(event) => handleCoverSelect(event.target.value)}><option value="">Choose a cover…</option>{covers.map((cover: CoverImage) => <option key={cover.id} value={cover.url}>{cover.screenRatio} · {new Date(cover.createdAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</option>)}</select></label>
             <div className="narration-choice"><span>or upload an image</span></div>
             <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleBackgroundUpload} />
             <button type="button" className="ghost full" onClick={() => fileInputRef.current?.click()}>Upload background image</button>
+            </>}
           </div>
         </div>
         <div className="livestream-playback">
@@ -1279,12 +1294,13 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
             onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
             onEnded={() => { setIsPlaying(false); setCurrentTime(0); }} />
-          <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!audioData || !backgroundImage}>
+          <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!audioData || !(backgroundImage || (bgMode === "shots" && shots.length > 0))}>
             {isPlaying ? "❚❚ Pause" : "▶ Start broadcast"}
           </button>
           {isPlaying && <div className="livestream-status"><span className="live-dot" />LIVE</div>}
           {!audioData && <p className="helper-copy">Add narration audio in Episode or Captions before starting.</p>}
-          {audioData && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
+          {audioData && bgMode === "cover" && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
+          {audioData && bgMode === "shots" && shots.length === 0 && <p className="helper-copy">Generate shots in the Storyboard before starting.</p>}
         </div>
       </div>
     </div>
