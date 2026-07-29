@@ -728,6 +728,81 @@ export async function completeText(data, messages, options = {}) {
   return result.choices?.[0]?.message?.content || "{}";
 }
 
+export async function generateDocumentaryScript(data, options = {}) {
+  const config = resolveTextProvider(data);
+  if (!config.endpoint || !config.apiKey || !config.model) throw new Error("Text endpoint, API key, and model or endpoint ID are required");
+  const topic = String(data.topic || "").trim();
+  if (!topic) throw new Error("A topic is required to generate the script");
+  const duration = Math.max(2, Math.min(6, Math.round(Number(data.duration) || 3)));
+  const creativeDirection = String(data.creativeDirection || "").trim();
+  const wordRanges = { 2:[180,220], 3:[270,330], 4:[360,440], 5:[450,550], 6:[540,660] };
+  const [minWords, maxWords] = wordRanges[duration];
+  const hookTimes = { 2:"0–15 sec", 3:"0–20 sec", 4:"0–30 sec", 5:"0–35 sec", 6:"0–45 sec" };
+  const setupTimes = { 2:"15–45 sec", 3:"20–65 sec", 4:"30–90 sec", 5:"35–110 sec", 6:"45–135 sec" };
+  const coreTimes = { 2:"45–100 sec", 3:"65–150 sec", 4:"90–200 sec", 5:"110–250 sec", 6:"135–300 sec" };
+  const closeTimes = { 2:"100–120 sec", 3:"150–180 sec", 4:"200–240 sec", 5:"250–300 sec", 6:"300–360 sec" };
+  const system = `You are a senior documentary scriptwriter for a history channel aimed at B1–B2 English learners. Write one accurate, high-retention English history documentary script from the user's topic.
+
+Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation. The JSON must have two fields: "title" (a clear, interesting, historically accurate video title) and "script" (the full narration-only script in plain text, with no headings, timing labels, or word-count notes). Escape every quote, backslash, and line break inside string values.
+
+BUILD THE STORY: Identify the central historical question, time span, geography, major actors, turning point, and consequences. Choose one clear narrative path. Arrange facts as cause and effect. Verify dates, names, and chronology. Distinguish established fact from interpretation. Never invent dialogue, motives, or precise details.
+
+ENGLISH LEVEL: Use common everyday words. Write clear sentences with one main idea, mostly 8–16 words. Prefer active voice. Avoid rare words, academic language, old-fashioned language, abstract noun chains, and complex idioms. Keep necessary historical names and terms — explain each difficult term in simple words when it first appears. Simple English must not become childish, vague, or inaccurate.
+
+DURATION: ${duration} minutes. Write ${minWords}–${maxWords} words of narration at 90–110 words per minute. Count narration only.
+
+STRUCTURE:
+1. HOOK (${hookTimes[duration]}): Open immediately with a question, surprising contrast, or urgent historical problem. Create an honest curiosity gap. Promise what the viewer will understand. Never begin with greetings or "Today we will learn."
+2. SETUP (${setupTimes[duration]}): Establish when, where, who, and why this moment matters. State what could be gained, lost, changed, or remembered.
+3. CONFLICT & PAYOFF (${coreTimes[duration]}): Build the decisive sequence through actions, choices, pressure, setbacks, and rising consequences. Add one natural midpoint re-hook (new danger, reversal, or surprising fact). Reach a clear turning point, then deliver the answer promised by the opening.
+4. GLOBAL VIEW & CLOSE (${closeTimes[duration]}): Show why the payoff mattered. Pull back to a global-history perspective — compare what was happening in Eastern and Western societies in the same period with at least one meaningful contemporaneous reference from each. End with one memorable, reflective sentence.
+
+NARRATIVE VOICE: Calm, confident, cinematic, humane at a measured documentary pace. Create tension from real stakes and uncertainty — not clickbait. Center human agency while acknowledging institutions, geography, technology, belief, and chance. Do not add shot lists, editing directions, or music cues.
+
+QUALITY: Create attention through real stakes — not invented drama. Do not use unsupported superlatives. Do not repeat facts merely to fill time. Do not add calls to action.`;
+
+  const userMessage = JSON.stringify({
+    topic,
+    durationMinutes: duration,
+    targetWordRange: `${minWords}–${maxWords} words`,
+    creativeDirection: creativeDirection || undefined,
+    instruction: `Write a ${duration}-minute history documentary script about "${topic}". The script field must contain only the spoken narration (no headings, no timing labels, no word counts). The title field must be a clear, engaging video title.`,
+  });
+
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.TEXT_REQUEST_TIMEOUT_MS) || 120000);
+  const endpoint = config.kind === "volcengine" ? textCompletionsEndpoint(config.endpoint) : config.endpoint;
+  const payload = config.kind === "volcengine" && isVolcenginePlanEndpoint(endpoint)
+    ? { model:config.model, messages:[{ role:"system", content:system }, { role:"user", content:userMessage }], max_tokens:8000 }
+    : { model:config.model, temperature:.3, max_tokens:8000, response_format:{ type:"json_object" }, ...(config.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages:[{ role:"system", content:system }, { role:"user", content:userMessage }] };
+  const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${config.apiKey}`}, body:JSON.stringify(payload) };
+  const callProvider = () => fetchImpl(endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
+  let response;
+  try { response = await callProvider(); }
+  catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try { response = await callProvider(); }
+    catch (retryError) {
+      if (retryError?.name === "TimeoutError" || retryError?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      throw retryError;
+    }
+  }
+  if (response.status === 429 || response.status >= 500) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    response = await callProvider();
+  }
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || `Provider returned ${response.status}`);
+  const raw = result.choices?.[0]?.message?.content || "{}";
+  const parsed = parseProviderJson(raw);
+  const title = String(parsed.title || "").trim();
+  const script = String(parsed.script || "").trim();
+  if (!title) throw new Error("The provider did not return a title");
+  if (!script) throw new Error("The provider did not return a script");
+  return { title, script };
+}
+
 function parseProviderJson(raw) {
   let source = String(raw || "").trim();
   source = source.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
@@ -766,9 +841,9 @@ export async function planEpisode(data, options = {}) {
   const mixedMode = productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(config.longClipDuration) || 10)));
   const shortClipDuration = Math.max(5, Math.min(10, Math.round(Number(config.shortClipDuration) || 6)));
-  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: each shot should be 5–10 seconds; prefer natural pauses and complete ideas over arbitrary cuts. Opening hooks may be 3–5 seconds; ordinary narration 5–8; climaxes 4–7; maps and timelines 7–10; emotional turns 5–8. Avoid shots shorter than 3 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: each shot should be 5–10 seconds; prefer natural pauses and complete ideas over arbitrary cuts. Opening hooks may be 3–5 seconds; ordinary narration 5–8; climaxes 4–7; maps and timelines 7–10; emotional turns 5–8. Avoid shots shorter than 3 seconds. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by splitting long sentences into consecutive clauses; if the script cannot be split further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const mixedSystem = `${shortSystem} This request uses mixed mode to control generation cost. Add videoRecommended (boolean) to every shot. When targetAnimatedShotCount is supplied, mark exactly that many shots true; otherwise mark roughly one in every four shots true. Mark all others false. Spread the selections across the full episode and prioritize the opening hook, climaxes, emotional turns, and shots where real subject or environmental motion adds clear value. A recommended video still begins from its generated storyboard image; write every videoPrompt so it also works as a strong image-to-video instruction. Do not recommend adjacent shots unless the narrative makes both essential.`;
-  const longSystem = `You are a senior text-to-video scene planner for short-form social video. Divide the supplied English narration into meaningful consecutive scenes for direct text-to-video generation, without creating or relying on storyboard images. Preserve every spoken word in order across the narration fields and do not add unsupported facts. Prefer natural pauses, complete ideas, and real changes of setting or action over arbitrary cuts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each scene must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, videoPrompt (a detailed direct text-to-video prompt of at most 100 words), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static). The videoPrompt must faithfully visualize the complete narration excerpt as a coherent sequence of two or three timed visual beats within one continuous take. Describe subject identity and appearance, setting, actions in order, environmental motion, lighting, pace, camera path, and continuity. Do not refer to a supplied image or first frame. Exclude cuts, unrelated subjects, text, logos, flicker, unstable anatomy, warping, and morphing. For historical subjects or whenever the narration contains a date or period cue, explicitly name the most accurate era or date and location supported by the script and require period-accurate architecture, landscape or interiors, clothing, materials, props, transport, weapons, and technology; never mix eras or include anachronisms. Target the requested clip length, keep every normal scene between 6 and 12 seconds, and rebalance neighboring scenes so the final scene is not needlessly short. A narration shorter than 6 seconds may remain one scene. When duration and scene-count guidance are supplied, return at least the minimum count and aim for the target count. Never return an empty object, empty narration, placeholder, or trailing item merely to reach a count. The sum of scene durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const longSystem = `You are a senior text-to-video scene planner for short-form social video. Divide the supplied English narration into meaningful consecutive scenes for direct text-to-video generation, without creating or relying on storyboard images. Preserve every spoken word in order across the narration fields and do not add unsupported facts. Prefer natural pauses, complete ideas, and real changes of setting or action over arbitrary cuts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each scene must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, videoPrompt (a detailed direct text-to-video prompt of at most 100 words), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static). The videoPrompt must faithfully visualize the complete narration excerpt as a coherent sequence of two or three timed visual beats within one continuous take. Describe subject identity and appearance, setting, actions in order, environmental motion, lighting, pace, camera path, and continuity. Do not refer to a supplied image or first frame. Exclude cuts, unrelated subjects, text, logos, flicker, unstable anatomy, warping, and morphing. The first scene (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening is weak. Its videoPrompt must create immediate visual impact: dramatic cinematic lighting, striking composition, and visual tension or mystery. Never open with a map, chart, diagram, split-screen comparison, or flat informational establishing shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion. The opening should feel like a movie teaser, not a textbook illustration. For historical subjects or whenever the narration contains a date or period cue, explicitly name the most accurate era or date and location supported by the script and require period-accurate architecture, landscape or interiors, clothing, materials, props, transport, weapons, and technology; never mix eras or include anachronisms. Target the requested clip length, keep every normal scene between 6 and 12 seconds, and rebalance neighboring scenes so the final scene is not needlessly short. A narration shorter than 6 seconds may remain one scene. When duration and scene-count guidance are supplied, return at least the minimum count and aim for the target count. Never return an empty object, empty narration, placeholder, or trailing item merely to reach a count. The sum of scene durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const system = longScenes ? longSystem : mixedMode ? mixedSystem : shortSystem;
   const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
   const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
@@ -780,6 +855,26 @@ export async function planEpisode(data, options = {}) {
   const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
   const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a shots array");
   return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, productionMode, targetClipDuration, shortClipDuration, screenRatio, transcription:config.transcription });
+}
+
+async function regenerateOpeningHook(data) {
+  const config = resolveTextProvider(data);
+  if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
+  const narration = String(data.narration || "").trim();
+  if (!narration) throw new Error("Opening narration is required");
+  const contentFormat = String(data.contentFormat || "Documentary");
+  const visualStyle = String(data.visualStyle || "Photorealistic");
+  const creativeDirection = String(data.creativeDirection || "").trim();
+  const screenRatio = String(data.screenRatio || "9:16");
+  const system = `You are a visual designer for short-form social video openings. Write a single image generation prompt for the opening shot that stops viewers from scrolling. Return one compact RFC 8259 JSON object only, without Markdown, with a prompt field (at most 55 words). The image must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery. Never describe a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion. The image should feel like a movie poster, not a textbook illustration. For historical subjects, include period-accurate era, location, architecture, clothing, and props. Always exclude text, watermarks, and logos. The screen ratio is ${screenRatio}.`;
+  const raw = await completeText(config, [
+    { role:"system", content:system },
+    { role:"user", content:JSON.stringify({ narration, contentFormat, visualStyle, creativeDirection }) },
+  ], { temperature:.3, maxTokens:2000 });
+  const parsed = await parseOrRepairProviderJson(raw, config, {}, "an object with a prompt field");
+  const prompt = String(parsed.prompt || "").trim();
+  if (!prompt) throw new Error("The provider returned an empty prompt");
+  return { prompt };
 }
 
 function modelsEndpoint(endpoint, kind) {
@@ -931,6 +1026,8 @@ export function createRenderServer() {
       }
       if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
       if (req.method === "POST" && url.pathname === "/text/plan") { json(res, 200, { shots:await planEpisode(await body(req, 4*1024*1024)) }); return; }
+      if (req.method === "POST" && url.pathname === "/text/generate-documentary-script") { json(res, 200, await generateDocumentaryScript(await body(req, 4*1024*1024))); return; }
+      if (req.method === "POST" && url.pathname === "/text/opening-hook") { json(res, 200, await regenerateOpeningHook(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/synthesize") { json(res, 200, await synthesizeSpeech(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/transcribe") { json(res, 200, await transcribeAudio(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/audio/process") { json(res, 200, await processNarration(await body(req))); return; }
