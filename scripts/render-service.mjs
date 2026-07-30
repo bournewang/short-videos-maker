@@ -595,6 +595,21 @@ export async function renderEpisode(payload, options = {}) {
   else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
   report("Final assembly", 82, totalShots);
+  const ffmpegCmd = `ffmpeg ${args.map((arg) => `'${arg.replace(/'/g, "'\\''")}'`).join(" ")}`;
+  const subtitleFontSize = Math.max(10, Math.round(height * .028 * subtitleStyle.fontScale / 100));
+  const ratioLabel = width > height ? "16:9" : width === height ? "1:1" : "9:16";
+  const logEntry = `=== Build ${new Date().toISOString()} ===
+Video: ${width}x${height} · ${ratioLabel} · ${total}s · ${totalShots} shots
+Subtitle font: ${subtitleFontSize}px (height=${height} * 0.028 * fontScale=${subtitleStyle.fontScale} / 100)
+Font family: ${subtitleStyle.fontFamily}
+Position: ${subtitleStyle.position}% · Alignment: ${subtitleStyle.alignment}
+Outline: ${subtitleStyle.outline} · Bold: ${subtitleStyle.bold}
+English color: ${subtitleStyle.englishColor} · Chinese color: ${subtitleStyle.chineseColor}
+Background opacity: ${subtitleStyle.backgroundOpacity}
+Command:
+${ffmpegCmd}
+`;
+  await writeFile(path.join(root, "ffmpeg-build.log"), logEntry);
   await run("ffmpeg", args);
   return { id, output, url:options.publicUrl || `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
 }
