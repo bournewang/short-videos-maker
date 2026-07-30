@@ -77,7 +77,7 @@ export function normalizeSubtitleStyle(value = {}) {
   const source = value && typeof value === "object" ? value : {};
   return {
     fontFamily:SUBTITLE_FONTS.some((font) => font.value === source.fontFamily) ? source.fontFamily : DEFAULT_SUBTITLE_STYLE.fontFamily,
-    fontScale:Math.round(clamp(source.fontScale, 70, 160, DEFAULT_SUBTITLE_STYLE.fontScale)),
+    fontScale:Math.round(clamp(source.fontScale, 60, 300, DEFAULT_SUBTITLE_STYLE.fontScale)),
     englishColor:normalizeColor(source.englishColor, DEFAULT_SUBTITLE_STYLE.englishColor),
     chineseColor:normalizeColor(source.chineseColor, DEFAULT_SUBTITLE_STYLE.chineseColor),
     backgroundColor:normalizeColor(source.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor),
@@ -116,7 +116,7 @@ export function normalizeBroadcastHeadline(value = {}) {
   return {
     text: String(source.text || "").trim(),
     fontFamily: SUBTITLE_FONTS.some((font) => font.value === source.fontFamily) ? source.fontFamily : "Arial",
-    fontScale: Math.round(clamp(source.fontScale, 70, 160, 100)),
+    fontScale: Math.round(clamp(source.fontScale, 60, 300, 100)),
     textColor: normalizeColor(source.textColor, "#ffffff"),
     backgroundColor: normalizeColor(source.backgroundColor, "#000000"),
     backgroundOpacity: Math.round(clamp(source.backgroundOpacity, 0, 100, 65)),

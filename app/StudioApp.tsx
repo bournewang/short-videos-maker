@@ -964,6 +964,7 @@ function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, pr
   const [elapsed, setElapsed] = useState(0);
   const [duration, setDuration] = useState(0);
   const hadPreviewRef = useRef(false);
+  const lastPreviewIdRef = useRef<string | null>(null);
   useEffect(() => {
     setElapsed(0); setPlaying(false); setDuration(Number(audioDuration) || 0);
   }, [audioData]);
@@ -986,9 +987,13 @@ function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, pr
     }
     const start = Math.max(0, Number(previewShot.start) || 0);
     if (!audio) { setElapsed(start); return; }
+    const wasPlaying = !audio.paused;
+    lastPreviewIdRef.current = previewShot.id;
     audio.currentTime = Math.min(start, audio.duration || start);
     setElapsed(audio.currentTime);
-    void audio.play().catch(() => setPlaying(false));
+    if (wasPlaying) {
+      void audio.play().catch(() => setPlaying(false));
+    }
   }, [previewShot?.id, previewShot?.start, previewShot?.end, continuous]);
   function togglePlayback() {
     const audio = audioRef.current;
@@ -1001,7 +1006,7 @@ function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, pr
     <audio ref={audioRef} src={audioData} preload="metadata"
       onLoadedMetadata={(event) => { const meta = event.currentTarget.duration; if (Number.isFinite(meta) && meta > 0) setDuration(meta); }}
       onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-      onTimeUpdate={(event) => { const audio = event.currentTarget; if (previewShot) { if (continuous) { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end)) { const idx = shots.findIndex((s:any) => s.id === previewShot.id); if (idx >= 0 && idx < shots.length - 1) { setSelectedId(shots[idx + 1].id); } else { setPreviewActive(false); audio.pause(); } } } else { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end) - .02) { audio.pause(); audio.currentTime = Math.max(0, Number(previewShot.start) || 0); } } } setElapsed(audio.currentTime); }}
+      onTimeUpdate={(event) => { const audio = event.currentTarget; if (previewShot) { if (continuous) { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end)) { const idx = shots.findIndex((s:any) => s.id === previewShot.id); if (idx >= 0 && idx < shots.length - 1) { setSelectedId(shots[idx + 1].id); } else { setPreviewActive(false); audio.pause(); } } } else { if (Number(previewShot.end) > 0 && audio.currentTime >= Number(previewShot.end) - .02 && previewShot.id === lastPreviewIdRef.current) { audio.pause(); audio.currentTime = Math.max(0, Number(previewShot.start) || 0); } } } setElapsed(audio.currentTime); }}
       onEnded={() => { setPlaying(false); setElapsed(0); }}/>
     <button type="button" onClick={togglePlayback} aria-label={playing ? "Pause narration" : "Play narration"}>{playing ? "❚❚" : "▶"}</button>
     <div className="narration-bar-label"><span>Narration</span><b title={audioName}>{audioName || "Untitled audio"}</b></div>
@@ -1085,7 +1090,7 @@ function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode,
     <label className="dock-select preset-select"><span>Preset</span><select value={currentPresetId} onChange={(event) => { if (!event.target.value) return; const preset = SUBTITLE_PRESETS.find((p) => p.id === event.target.value); if (preset) setSubtitleStyle(preset.style); }}><option value="">{currentPresetId ? "Custom" : "Choose…"}</option>{SUBTITLE_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select></label>
     <label className="dock-select"><span>Font</span><select value={subtitleStyle.fontFamily} onChange={(event)=>setSubtitleStyle({ fontFamily:event.target.value })}>{SUBTITLE_FONTS.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
     <label className="dock-select alignment"><span>Align</span><select value={subtitleStyle.alignment} onChange={(event)=>setSubtitleStyle({ alignment:event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
-    <label className="dock-range"><span>Size</span><input aria-label="Subtitle text size" type="range" min="70" max="160" step="5" value={subtitleStyle.fontScale} onChange={(event)=>setSubtitleStyle({ fontScale:Number(event.target.value) })}/><output>{subtitleStyle.fontScale}%</output></label>
+    <label className="dock-range"><span>Size</span><input aria-label="Subtitle text size" type="range" min="60" max="300" step="5" value={subtitleStyle.fontScale} onChange={(event)=>setSubtitleStyle({ fontScale:Number(event.target.value) })}/><output>{subtitleStyle.fontScale}%</output></label>
     <label className="dock-range"><span>Position</span><input aria-label="Subtitle bottom position" type="range" min="3" max={positionMax} step="1" value={subtitleStyle.position} onChange={(event)=>setSubtitleStyle({ position:Number(event.target.value) })}/><output>{subtitleStyle.position}%</output></label>
     <label className="dock-color" title="English text color"><span>EN</span><input aria-label="English subtitle color" type="color" value={subtitleStyle.englishColor} onChange={(event)=>setSubtitleStyle({ englishColor:event.target.value })}/></label>
     <label className="dock-color" title="Chinese text color"><span>中文</span><input aria-label="Chinese subtitle color" type="color" value={subtitleStyle.chineseColor} onChange={(event)=>setSubtitleStyle({ chineseColor:event.target.value })}/></label>
