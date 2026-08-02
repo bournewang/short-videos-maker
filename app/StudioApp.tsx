@@ -5,7 +5,7 @@ import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
 import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readActiveProjectId, readAllProjectCaches, readProjectCache, writeProjectCache } from "./lib/project-cache";
 import { activateServerProject, deleteServerProject, importServerProjects, listServerProjects, readServerProject, writeServerProject } from "./lib/server-projects";
-import { BROADCAST_MODE_STYLE, DEFAULT_SUBTITLE_STYLE, SUBTITLE_FONTS, SUBTITLE_PRESETS, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
+import { BROADCAST_MODE_STYLE, DEFAULT_HEADLINE_STYLE, DEFAULT_SUBTITLE_STYLE, HEADLINE_PRESETS, SUBTITLE_FONTS, SUBTITLE_PRESETS, normalizeHeadlineStyle, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
 import { alignBilingualChunks, buildSrt, subtitleFileName } from "./lib/subtitles";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
 import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution, visualCoverage } from "./lib/video";
@@ -32,6 +32,7 @@ type Transcription = {
 };
 
 type SubtitleStyle = ReturnType<typeof normalizeSubtitleStyle>;
+type HeadlineStyle = ReturnType<typeof normalizeHeadlineStyle>;
 
 type EpisodeSummary = {
   id:string; title:string; savedAt:number; shotCount:number; duration:number; hasNarration:boolean; stage:string;
@@ -230,6 +231,7 @@ export default function StudioApp() {
   const [headlineText, setHeadlineText] = useState("");
   const [headlinePosition, setHeadlinePosition] = useState(4);
   const [preBroadcastStyle, setPreBroadcastStyle] = useState<SubtitleStyle | null>(null);
+  const [headlineStyle, setHeadlineStyle] = useState<HeadlineStyle>(DEFAULT_HEADLINE_STYLE);
   const [mode, setMode] = useState("Review then batch");
   const [productionMode, setProductionMode] = useState("short-shots");
   const [longClipDuration, setLongClipDuration] = useState(10);
@@ -283,7 +285,7 @@ export default function StudioApp() {
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
   async function persistProject(snapshot = projectSnapshot()) {
@@ -324,7 +326,8 @@ export default function StudioApp() {
     setSubtitleStyle(normalizeSubtitleStyle(parsed.subtitleStyle));
     setBroadcastMode(Boolean(parsed.broadcastMode));
     setHeadlineText(String(parsed.headlineText || ""));
-    setHeadlinePosition(Math.max(0, Math.min(20, Math.round(Number(parsed.headlinePosition) || 4))));
+    setHeadlinePosition(Math.max(0, Math.min(100, Math.round(Number(parsed.headlinePosition) || 4))));
+    setHeadlineStyle(normalizeHeadlineStyle(parsed.headlineStyle));
     setCoverHeadline(String(parsed.coverHeadline || ""));
     setCoverTitlePosition(normalizeCoverTitlePosition(parsed.coverTitlePosition)); setCoverTitleVertical(Math.max(2, Math.min(92, Math.round(Number(parsed.coverTitleVertical) || 90)))); setCoverTitleScale(Math.max(50, Math.min(200, Math.round(Number(parsed.coverTitleScale) || 100)))); setCoverTitleWidth(Math.max(50, Math.min(95, Math.round(Number(parsed.coverTitleWidth) || 84))));
     setCoverPrompt(String(parsed.coverPrompt || ""));
@@ -387,7 +390,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio]);
+  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio]);
 
   async function refreshProviderStatus() {
     try {
@@ -423,6 +426,7 @@ export default function StudioApp() {
     if (nextStage === "storyboard" && stage !== "storyboard") setSelectedId(shots[0]?.id || "");
     setEpisodesOpen(false);
     setStage(nextStage);
+    if (nextStage === "livestream") refreshEpisodeHistory();
   }
 
   async function refreshEpisodeHistory() {
@@ -448,7 +452,7 @@ export default function StudioApp() {
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     const id = createEpisodeId();
-    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
+    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* server and IndexedDB writes below remain available */ }
@@ -484,6 +488,21 @@ export default function StudioApp() {
     if (summary.id === episodeId) { await newEpisode(false); return; }
     setMessage(`${summary.title} deleted from local history.`);
     await refreshEpisodeHistory();
+  }
+
+  async function loadEpisodeDataForLivestream(id: string) {
+    try {
+      const parsed = serverStorageReady.current
+        ? await readServerProject(SERVICE, id).catch(() => readProjectCache(id).catch(() => null))
+        : await readProjectCache(id).catch(() => null);
+      if (!parsed) return null;
+      return {
+        audioData: parsed.audioData || null,
+        shots: parsed.shots || [],
+        covers: parsed.covers || [],
+        title: parsed.title || "",
+      };
+    } catch { return null; }
   }
 
   async function analyze() {
@@ -957,10 +976,10 @@ export default function StudioApp() {
       </aside>
 
       <section className="workspace">
-        <header className="topbar">
+        {stage !== "livestream" && <header className="topbar">
           <div><span className="eyebrow">CURRENT EPISODE</span><input className="title-input" value={title} placeholder="Untitled episode" onChange={(e) => { touchProject(); setTitle(e.target.value); }} aria-label="Episode title" /></div>
           <div className="top-actions"><span className={`save-state storage-${storageState}`}>● {storageState === "server" ? "Saved to server" : storageState === "browser" ? "Browser backup only" : storageState === "error" ? "Save failed" : "Saving…"}</span><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
-        </header>
+        </header>}
 
         {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} /> : <>
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} shortClipDuration={shortClipDuration} setShortClipDuration={setShortClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} provider={provider} setProvider={setProvider} speechStatus={providerStatus.speech} analyze={analyze} generateDocumentaryScript={generateDocumentaryScript} scriptDuration={scriptDuration} setScriptDuration={setScriptDuration} busy={busy} />}
@@ -968,12 +987,12 @@ export default function StudioApp() {
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} />}
           {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { touchProject(); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { touchProject(); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { touchProject(); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy} />}
-{stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} />}
+{stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
         </>}
       </section>
 
       <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>
-      {audioData && !episodesOpen && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} continuous={previewActive} shots={stage === "storyboard" ? shots : []} setSelectedId={setSelectedId} setPreviewActive={setPreviewActive} onTimeUpdate={setAudioElapsed} />}
+      {audioData && !episodesOpen && stage !== "livestream" && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} continuous={previewActive} shots={stage === "storyboard" ? shots : []} setSelectedId={setSelectedId} setPreviewActive={setPreviewActive} onTimeUpdate={setAudioElapsed} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
   );
@@ -1119,16 +1138,21 @@ function SubtitleOverlay({ shot, subtitleStyle, audioElapsed }:any) {
   return <div className="preview-captions" style={{ bottom:`${style.position}%`, left:"6.5%", right:"6.5%", backgroundColor:subtitleCssBackground(style), fontFamily:style.fontFamily, fontWeight:style.bold ? 700 : 400, textAlign:style.alignment, textShadow:shadow }}><b style={{ color:style.englishColor, fontSize:`${fontSizeCqh}cqh`, fontWeight:"inherit" }}>{current.english || "Your English subtitle appears here"}</b>{(current.chinese || !shot) && <span style={{ color:style.chineseColor, fontSize:`${fontSizeCqh}cqh` }}>{current.chinese || "中文字幕显示在这里"}</span>}</div>;
 }
 
-function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyle }:any) {
-  const style = normalizeSubtitleStyle(subtitleStyle);
-  const headlineFontSizeCqh = 0.028 * style.fontScale * 1.15;
+function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyle, headlineStyle }:any) {
+  const hs = headlineStyle ? normalizeHeadlineStyle(headlineStyle) : null;
+  const fontFamily = hs?.fontFamily || normalizeSubtitleStyle(subtitleStyle).fontFamily;
+  const fontScale = hs?.fontScale || 100;
+  const textColor = hs?.textColor || "#ffffff";
+  const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt((hs?.bgColor || "#000000").slice(i, i + 2), 16));
+  const bgAlpha = (hs?.bgOpacity ?? 65) / 100;
+  const headlineFontSizeCqh = 0.028 * fontScale * 1.15;
   const outlinePx = Math.max(1, 2.5);
   const outlineColor = "#000000";
   const shadow = [`0 ${outlinePx}px 0 ${outlineColor}`,`0 -${outlinePx}px 0 ${outlineColor}`,`${outlinePx}px 0 0 ${outlineColor}`,`-${outlinePx}px 0 0 ${outlineColor}`].join(", ");
-  return <div className="preview-headline" style={{ top:`${headlinePosition}%`, background:"rgba(0,0,0,.65)", fontFamily:style.fontFamily, fontWeight:700, textAlign:"center", textShadow:shadow }}><span style={{ color:"#ffffff", fontSize:`${headlineFontSizeCqh}cqh`, fontWeight:700 }}>{headlineText}</span></div>;
+  return <div className="preview-headline" style={{ top:`${headlinePosition}%`, background:`rgba(${r},${g},${b},${bgAlpha})`, fontFamily, fontWeight:700, textAlign:"center", textShadow:shadow }}><span style={{ color:textColor, fontSize:`${headlineFontSizeCqh}cqh`, fontWeight:700 }}>{headlineText}</span></div>;
 }
 
-function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle, hideBroadcastToggle }:any) {
+function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle, hideBroadcastToggle, hideHeadlineRow }:any) {
   const currentPresetId = SUBTITLE_PRESETS.find((preset) =>
     JSON.stringify(normalizeSubtitleStyle(preset.style)) === JSON.stringify(subtitleStyle)
   )?.id || "";
@@ -1145,10 +1169,10 @@ function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode,
     setBroadcastMode(on);
   }
 
-  return <section className="subtitle-style-dock" aria-label="Subtitle style"><div className="subtitle-dock-title"><span className="eyebrow">SUBTITLES</span><b>Style</b></div><div className="subtitle-dock-controls">
+  return <section className="subtitle-style-dock" aria-label="Subtitle style"><div className="subtitle-dock-title"><span className="eyebrow">SUBTITLES</span><b>Style</b></div><div className="subtitle-dock-body">
+    {(broadcastMode || hideBroadcastToggle) && !hideHeadlineRow && <div className="subtitle-dock-headline-row"><label className="field headline-field"><span>Headline</span><input type="text" value={headlineText} onChange={(event) => setHeadlineText(event.target.value)} placeholder="Broadcast headline text…"/></label><label className="dock-range"><span>HL pos</span><input aria-label="Headline top position" type="range" min="0" max="100" step="1" value={headlinePosition} onChange={(event) => setHeadlinePosition(Number(event.target.value))}/><output>{headlinePosition}%</output></label></div>}
+    <div className="subtitle-dock-controls">
     {!hideBroadcastToggle && <label className="dock-toggle broadcast-toggle"><input type="checkbox" checked={broadcastMode} onChange={(event) => toggleBroadcastMode(event.target.checked)}/><span><b>Broadcast mode</b><small>Subtitles in middle + headline bar</small></span></label>}
-    {(broadcastMode || hideBroadcastToggle) && <label className="field headline-field"><span>Headline</span><input type="text" value={headlineText} onChange={(event) => setHeadlineText(event.target.value)} placeholder="Broadcast headline text…"/></label>}
-    {(broadcastMode || hideBroadcastToggle) && <label className="dock-range"><span>HL pos</span><input aria-label="Headline top position" type="range" min="0" max="20" step="1" value={headlinePosition} onChange={(event) => setHeadlinePosition(Number(event.target.value))}/><output>{headlinePosition}%</output></label>}
     <label className="dock-select preset-select"><span>Preset</span><select value={currentPresetId} onChange={(event) => { if (!event.target.value) return; const preset = SUBTITLE_PRESETS.find((p) => p.id === event.target.value); if (preset) setSubtitleStyle(preset.style); }}><option value="">{currentPresetId ? "Custom" : "Choose…"}</option>{SUBTITLE_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.label}</option>)}</select></label>
     <label className="dock-select"><span>Font</span><select value={subtitleStyle.fontFamily} onChange={(event)=>setSubtitleStyle({ fontFamily:event.target.value })}>{SUBTITLE_FONTS.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
     <label className="dock-select alignment"><span>Align</span><select value={subtitleStyle.alignment} onChange={(event)=>setSubtitleStyle({ alignment:event.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
@@ -1161,7 +1185,7 @@ function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode,
     <label className="dock-range outline"><span>Outline</span><input aria-label="Subtitle outline size" type="range" min="0" max="5" step="0.5" value={subtitleStyle.outline} onChange={(event)=>setSubtitleStyle({ outline:Number(event.target.value) })}/><output>{subtitleStyle.outline}px</output></label>
     <label className="dock-toggle"><input type="checkbox" checked={subtitleStyle.bold} onChange={(event)=>setSubtitleStyle({ bold:event.target.checked })}/><span>Bold</span></label>
     <button type="button" className="ghost dock-reset" onClick={() => setSubtitleStyle(DEFAULT_SUBTITLE_STYLE)}>Reset</button>
-  </div></section>;
+  </div></div></section>;
 }
 
 function Storyboard({ productionMode, script, transcription, shots, selected, setSelectedId, updateShot, generateOne, generateAll, generateOneVideo, generateAllVideos, handleShotImageUpload, totalDuration, busy, activeManualImageCount, activeManualVideoCount, imageConcurrency, videoConcurrency, screenRatio, setScreenRatio, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle, previewActive, setPreviewActive, regenerateOpeningVisual, audioElapsed }: any) {
@@ -1299,18 +1323,28 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
   return <section className={`cover-studio ratio-${screenRatio.replace(":","-")}`}><div className="build-library-head"><div><span className="eyebrow">VIDEO COVER</span><h2>{currentCover ? "Place the cover title" : "Generate cover artwork"}</h2></div><span>{SCREEN_RATIOS[screenRatio as keyof typeof SCREEN_RATIOS]?.label || screenRatio} · {screenRatio}</span></div><div className="cover-studio-grid"><div className={`cover-preview ${currentCover ? `has-cover title-${coverTitlePosition}` : ""}`} style={{ aspectRatio:screenRatio.replace(":"," / ") }}>{currentCover ? <><img src={currentCover.url} alt={`Generated ${screenRatio} video cover`}/><div className="cover-preview-shade" style={{ background:`linear-gradient(180deg, transparent ${Math.max(0, coverTitleVertical - 35)}%, rgba(0,0,0,.18) ${Math.max(0, coverTitleVertical - 18)}%, rgba(0,0,0,.76) ${coverTitleVertical}%, rgba(0,0,0,.18) ${Math.min(100, coverTitleVertical + 18)}%, transparent)` }}/><div className="cover-preview-copy" style={{ left:titleInset, right:titleInset, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}><i/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})` }}>{headline}</strong></div></> : <div className="empty-visual"><span>✦</span><b>Generate the artwork first</b><small>Then place the title while seeing the real image.</small></div>}</div><div className="cover-controls"><p>{currentCover ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p><label className="field"><span>Artwork direction</span><textarea rows={currentCover ? 3 : 5} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)}/><small>The image model creates artwork without unreliable generated lettering.</small></label>{currentCover && <div className="cover-title-editor"><label className="field cover-headline-field"><span>Cover headline</span><input maxLength={90} value={coverHeadline} placeholder={defaultHeadline || "Add an attention-grabbing headline"} onChange={(event) => setCoverHeadline(event.target.value)}/><small>Keep it short and specific. The episode title is used when this field is empty.</small></label><fieldset className="cover-position-field"><legend>Title position</legend><div>{COVER_TITLE_POSITIONS.map((option) => <button type="button" key={option.id} className={coverTitlePosition === option.id ? "chosen" : ""} title={option.label} aria-label={option.label} aria-pressed={coverTitlePosition === option.id} onClick={() => setCoverTitlePosition(option.id)}><i/></button>)}</div><small>Choose a clear area that does not cover the main subject.</small></fieldset><label className="field cover-title-scale-field"><span>Vertical position</span><div><input aria-label="Cover title vertical position" type="range" min="2" max="92" step="1" value={coverTitleVertical} onChange={(e) => setCoverTitleVertical(Number(e.target.value))}/><output>{coverTitleVertical}%</output></div><small>Fine-tune the title distance from the top.</small></label><label className="field cover-title-scale-field"><span>Title size</span><div><input aria-label="Cover title font size scale" type="range" min="50" max="200" step="5" value={coverTitleScale} onChange={(e) => setCoverTitleScale(Number(e.target.value))}/><output>{coverTitleScale}%</output></div><small>Adjust the title text size independent of position.</small></label><label className="field cover-title-width-field"><span>Text width</span><div><input aria-label="Cover title text width" type="range" min="50" max="95" step="1" value={coverTitleWidth} onChange={(e) => setCoverTitleWidth(Number(e.target.value))}/><output>{coverTitleWidth}%</output></div><small>Narrower text stays clear of the subject.</small></label></div>}<div className="cover-actions"><button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button><button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button>}</div></div></div>{covers.length > 0 && <div className="cover-history"><h3>Saved covers</h3><div>{covers.map((cover:CoverImage) => <article key={cover.id}><div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:cover.screenRatio.replace(":"," / ") }}><img src={cover.url} alt={`${cover.screenRatio} cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`}/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})`, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}>{headline}</strong></div><span><b>{cover.screenRatio}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span><button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button></article>)}</div></div>}</section>;
 }
 
-function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle }: any) {
+function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, headlineStyle, setHeadlineStyle, preBroadcastStyle, setPreBroadcastStyle, episodeHistory, loadEpisodeData, currentEpisodeId }: any) {
   const [livestreamRatio, setLivestreamRatio] = useState("9:16");
   const [customBackground, setCustomBackground] = useState<string | null>(null);
   const defaultBackground = covers.find((c: CoverImage) => c.screenRatio === "9:16")?.url || "";
   const backgroundImage = customBackground ?? defaultBackground;
   const [bgMode, setBgMode] = useState<"cover" | "shots">("cover");
   const [isPlaying, setIsPlaying] = useState(false);
-  const [expanded, setExpanded] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState(currentEpisodeId);
+  const [livestreamShots, setLivestreamShots] = useState(shots);
+  const [livestreamAudio, setLivestreamAudio] = useState(audioData);
+  const [livestreamCovers, setLivestreamCovers] = useState(covers);
+  const [repeatCount, setRepeatCount] = useState(1);
+  const [playCount, setPlayCount] = useState(0);
+  const [autoPlay, setAutoPlay] = useState(false);
+  const [loadingEpisode, setLoadingEpisode] = useState(false);
+
+  const sortedEpisodes = useMemo(() => [...episodeHistory].sort((a: EpisodeSummary, b: EpisodeSummary) => b.savedAt - a.savedAt), [episodeHistory]);
 
   useEffect(() => {
     if (subtitleStyle.position === DEFAULT_SUBTITLE_STYLE.position) setSubtitleStyle({ position: 40 });
@@ -1319,11 +1353,10 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
 
   useEffect(() => {
     function handleSpaceToggle(event: KeyboardEvent) {
-      if (event.code === "Escape" && expanded) { setExpanded(false); return; }
       if (event.code !== "Space" || event.repeat) return;
       const target = event.target as HTMLElement | null;
       if (target && (["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName) || target.isContentEditable)) return;
-      if (!audioRef.current || !audioData || !(backgroundImage || (bgMode === "shots" && shots.length > 0))) return;
+      if (!audioRef.current || !livestreamAudio || !(backgroundImage || (bgMode === "shots" && livestreamShots.length > 0))) return;
       event.preventDefault();
       togglePlayback();
     }
@@ -1331,23 +1364,19 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
     return () => window.removeEventListener("keydown", handleSpaceToggle);
   });
 
-  const currentShot = shots.find((shot: Shot) => currentTime >= shot.start && currentTime < shot.end) || null;
-  const previewShot = currentShot || ((backgroundImage || bgMode === "shots") && !isPlaying ? shots[0] : null);
+  const currentShot = livestreamShots.find((shot: Shot) => currentTime >= shot.start && currentTime < shot.end) || null;
+  const previewShot = currentShot || ((backgroundImage || bgMode === "shots") && !isPlaying ? livestreamShots[0] : null);
   const hasVisual = backgroundImage || (bgMode === "shots" && !!previewShot);
 
   function togglePlayback() {
     const audio = audioRef.current;
-    if (!audio || !audioData) return;
+    if (!audio || !livestreamAudio) return;
     if (audio.paused) {
       if (audio.currentTime >= (duration || audio.duration) - 0.02) audio.currentTime = 0;
       void audio.play().catch(() => setIsPlaying(false));
     } else {
       audio.pause();
     }
-  }
-
-  function toggleFullscreen() {
-    setExpanded((current) => !current);
   }
 
   function handleCoverSelect(url: string) {
@@ -1362,10 +1391,50 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
     event.target.value = "";
   }
 
-  return <div className="panel livestream-panel"><div className="section-head"><div><span className="eyebrow">LIVESTREAM</span><h1>Broadcast</h1><p>Simulate a livestream with a background image and synced subtitles.</p></div><div className="livestream-head-actions"><label className="ratio-select"><span>Screen ratio</span><select value={livestreamRatio} onChange={(event) => setLivestreamRatio(event.target.value)}><option value="9:16">9:16 · Vertical</option><option value="16:9">16:9 · Landscape</option></select></label></div></div>
-    <div className={`livestream-grid ${expanded ? "expanded" : ""}`}>
+  async function switchToEpisode(id: string, autoStart = false) {
+    if (id === selectedEpisodeId) return;
+    setLoadingEpisode(true);
+    setSelectedEpisodeId(id);
+    setPlayCount(0);
+    const data = await loadEpisodeData(id);
+    if (data) {
+      setLivestreamShots(data.shots || []);
+      setLivestreamAudio(data.audioData || null);
+      setLivestreamCovers(data.covers || []);
+      setCustomBackground(null);
+      if (autoStart && data.audioData) {
+        setTimeout(() => {
+          const audio = audioRef.current;
+          if (audio) { audio.currentTime = 0; void audio.play().catch(() => setIsPlaying(false)); }
+        }, 100);
+      }
+    }
+    setLoadingEpisode(false);
+  }
+
+  function handleAudioEnded() {
+    const nextCount = playCount + 1;
+    if (nextCount < repeatCount) {
+      setPlayCount(nextCount);
+      setCurrentTime(0);
+      const audio = audioRef.current;
+      if (audio) { audio.currentTime = 0; void audio.play().catch(() => setIsPlaying(false)); }
+    } else {
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setPlayCount(0);
+      if (autoPlay) {
+        const idx = sortedEpisodes.findIndex((e: EpisodeSummary) => e.id === selectedEpisodeId);
+        if (idx >= 0 && idx < sortedEpisodes.length - 1) {
+          switchToEpisode(sortedEpisodes[idx + 1].id, true);
+        }
+      }
+    }
+  }
+
+  return <div className="panel livestream-panel">
+    <div className="livestream-grid">
       <div className="livestream-preview-col">
-        {expanded && <button type="button" className="livestream-collapse-btn" onClick={() => setExpanded(false)} aria-label="Exit full width">✕</button>}
         <div className={`phone-frame ratio-${livestreamRatio.replace(":", "-")}`}>
           <div className="phone-canvas" style={{ aspectRatio: livestreamRatio.replace(":", " / ") }}>
             {bgMode === "shots" && previewShot ? (
@@ -1375,15 +1444,40 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
                 : <div className="empty-visual"><span>📺</span><b>No shot visual</b></div>
               ) : backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>}
             {hasVisual && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} />}
-{hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} />}
+{hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} headlineStyle={headlineStyle} />}
           </div>
         </div>
-        <button type="button" className="ghost full livestream-fullscreen-btn" onClick={toggleFullscreen} disabled={!hasVisual}>{expanded ? "✕ Exit full width" : "⛶ Full width"}</button>
       </div>
       <div className="livestream-controls">
         <div className="livestream-bg-section">
+          <h3>Episode</h3>
+          <div className="livestream-bg-options">
+            <label className="field"><span>Select episode</span>
+              <select value={selectedEpisodeId} onChange={(e) => switchToEpisode(e.target.value)} disabled={loadingEpisode}>
+                {sortedEpisodes.map((ep: EpisodeSummary) => (
+                  <option key={ep.id} value={ep.id}>{ep.title || "Untitled"} · {formatTime(ep.duration)}</option>
+                ))}
+              </select>
+            </label>
+            {loadingEpisode && <p className="helper-copy">Loading episode…</p>}
+            <label className="field"><span>Repeat <b>{repeatCount}x</b></span>
+              <input type="range" min="1" max="10" step="1" value={repeatCount} onChange={(e) => { setRepeatCount(Number(e.target.value)); setPlayCount(0); }} />
+            </label>
+            <label className="field livestream-checkbox-field">
+              <input type="checkbox" checked={autoPlay} onChange={(e) => setAutoPlay(e.target.checked)} />
+              <span>Auto-play next episode</span>
+            </label>
+          </div>
+        </div>
+        <div className="livestream-bg-section">
           <h3>Background</h3>
           <div className="livestream-bg-options">
+            <label className="field"><span>Screen ratio</span>
+              <select value={livestreamRatio} onChange={(e) => setLivestreamRatio(e.target.value)}>
+                <option value="9:16">9:16 · Vertical</option>
+                <option value="16:9">16:9 · Landscape</option>
+              </select>
+            </label>
             <label className="field"><span>Mode</span>
               <select value={bgMode} onChange={(e) => setBgMode(e.target.value as "cover" | "shots")}>
                 <option value="cover">Cover image</option>
@@ -1391,31 +1485,56 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
               </select>
             </label>
             {bgMode === "cover" && <>
-            <label className="field"><span>From covers</span><select value={backgroundImage} onChange={(event) => handleCoverSelect(event.target.value)}><option value="">Choose a cover…</option>{covers.map((cover: CoverImage) => <option key={cover.id} value={cover.url}>{cover.screenRatio} · {new Date(cover.createdAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</option>)}</select></label>
+            <label className="field"><span>From covers</span><select value={backgroundImage} onChange={(event) => handleCoverSelect(event.target.value)}><option value="">Choose a cover…</option>{livestreamCovers.map((cover: CoverImage) => <option key={cover.id} value={cover.url}>{cover.screenRatio} · {new Date(cover.createdAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</option>)}</select></label>
             <div className="narration-choice"><span>or upload an image</span></div>
             <input ref={fileInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleBackgroundUpload} />
             <button type="button" className="ghost full" onClick={() => fileInputRef.current?.click()}>Upload background image</button>
             </>}
           </div>
         </div>
+        <div className="livestream-bg-section">
+          <h3>Headline</h3>
+          <div className="livestream-bg-options">
+            <label className="field"><span>Text</span><input type="text" value={headlineText} onChange={(e) => setHeadlineText(e.target.value)} placeholder="Broadcast headline…"/></label>
+            <div className="livestream-inline-row">
+              <label className="field"><span>Preset</span><select value={HEADLINE_PRESETS.find((p) => JSON.stringify(p.style) === JSON.stringify(normalizeHeadlineStyle(headlineStyle)))?.id || ""} onChange={(e) => { const preset = HEADLINE_PRESETS.find((p) => p.id === e.target.value); if (preset) setHeadlineStyle(preset.style); }}><option value="">Custom</option>{HEADLINE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></label>
+              <label className="field"><span>Font</span><select value={headlineStyle.fontFamily} onChange={(e) => setHeadlineStyle({ ...headlineStyle, fontFamily: e.target.value })}>{SUBTITLE_FONTS.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
+            </div>
+            <div className="livestream-inline-row">
+              <label className="field"><span>Position <b>{headlinePosition}%</b></span><input type="range" min="0" max="100" step="1" value={headlinePosition} onChange={(e) => setHeadlinePosition(Number(e.target.value))}/></label>
+              <label className="field"><span>Size <b>{headlineStyle.fontScale}%</b></span><input type="range" min="60" max="300" step="5" value={headlineStyle.fontScale} onChange={(e) => setHeadlineStyle({ ...headlineStyle, fontScale: Number(e.target.value) })}/></label>
+            </div>
+            <div className="livestream-inline-row">
+              <label className="field"><span>Opacity <b>{headlineStyle.bgOpacity}%</b></span><input type="range" min="0" max="100" step="5" value={headlineStyle.bgOpacity} onChange={(e) => setHeadlineStyle({ ...headlineStyle, bgOpacity: Number(e.target.value) })}/></label>
+            </div>
+            <div className="livestream-color-swatches">
+              <span>Text</span>
+              {["#ffffff","#ffeb3b","#ff9800","#ff5252","#4caf50","#2196f3","#9c27b0","#000000"].map((c) => <button key={"t"+c} type="button" className={`swatch ${headlineStyle.textColor === c ? "active" : ""}`} style={{ background:c }} onClick={() => setHeadlineStyle({ ...headlineStyle, textColor: c })} aria-label={`Text color ${c}`}/>)}
+            </div>
+            <div className="livestream-color-swatches">
+              <span>BG</span>
+              {["#000000","#cc0000","#1a1a2e","#3e2723","#1b5e20","#0d47a1","#4a148c","#ffffff"].map((c) => <button key={"b"+c} type="button" className={`swatch ${headlineStyle.bgColor === c ? "active" : ""}`} style={{ background:c }} onClick={() => setHeadlineStyle({ ...headlineStyle, bgColor: c })} aria-label={`BG color ${c}`}/>)}
+            </div>
+          </div>
+        </div>
         <div className="livestream-playback">
           <h3>Playback</h3>
-          <audio ref={audioRef} src={audioData} preload="metadata"
+          <audio ref={audioRef} src={livestreamAudio} preload="metadata" style={{ display: "none" }}
             onLoadedMetadata={(event) => { const meta = event.currentTarget.duration; if (Number.isFinite(meta) && meta > 0) setDuration(meta); }}
             onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-            onEnded={() => { setIsPlaying(false); setCurrentTime(0); }} />
-          <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!audioData || !(backgroundImage || (bgMode === "shots" && shots.length > 0))}>
+            onEnded={handleAudioEnded} />
+          <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!livestreamAudio || !(backgroundImage || (bgMode === "shots" && livestreamShots.length > 0))}>
             {isPlaying ? "❚❚ Pause" : "▶ Start broadcast"}
           </button>
-          {isPlaying && <div className="livestream-status"><span className="live-dot" />LIVE</div>}
-          {!audioData && <p className="helper-copy">Add narration audio in Episode or Captions before starting.</p>}
-          {audioData && bgMode === "cover" && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
-          {audioData && bgMode === "shots" && shots.length === 0 && <p className="helper-copy">Generate shots in the Storyboard before starting.</p>}
+          {isPlaying && <div className="livestream-status"><span className="live-dot" />LIVE{repeatCount > 1 ? ` · ${playCount + 1}/${repeatCount}` : ""}</div>}
+          {!livestreamAudio && <p className="helper-copy">Add narration audio in Episode or Captions before starting.</p>}
+          {livestreamAudio && bgMode === "cover" && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
+          {livestreamAudio && bgMode === "shots" && livestreamShots.length === 0 && <p className="helper-copy">Generate shots in the Storyboard before starting.</p>}
         </div>
+        <SubtitleStyleControls subtitleStyle={subtitleStyle} setSubtitleStyle={setSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} hideBroadcastToggle hideHeadlineRow />
       </div>
     </div>
-    <SubtitleStyleControls subtitleStyle={subtitleStyle} setSubtitleStyle={setSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} hideBroadcastToggle />
   </div>;
 }
 

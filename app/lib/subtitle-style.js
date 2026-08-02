@@ -61,6 +61,33 @@ export const BROADCAST_MODE_STYLE = Object.freeze({
   outline:2.5,
 });
 
+export const DEFAULT_HEADLINE_STYLE = Object.freeze({
+  fontFamily:"Arial",
+  fontScale:100,
+  textColor:"#ffffff",
+  bgColor:"#000000",
+  bgOpacity:65,
+});
+
+export const HEADLINE_PRESETS = Object.freeze([
+  { id:"clean", label:"Clean", style:{ fontFamily:"Arial", fontScale:100, textColor:"#ffffff", bgColor:"#000000", bgOpacity:65 } },
+  { id:"breaking", label:"Breaking", style:{ fontFamily:"Arial", fontScale:115, textColor:"#ffffff", bgColor:"#cc0000", bgOpacity:85 } },
+  { id:"minimal", label:"Minimal", style:{ fontFamily:"Helvetica", fontScale:95, textColor:"#ffffff", bgColor:"#000000", bgOpacity:0 } },
+  { id:"warm", label:"Warm", style:{ fontFamily:"Georgia", fontScale:105, textColor:"#fff3e0", bgColor:"#3e2723", bgOpacity:75 } },
+  { id:"bold", label:"Bold", style:{ fontFamily:"Arial", fontScale:120, textColor:"#ffeb3b", bgColor:"#1a1a1a", bgOpacity:80 } },
+]);
+
+export function normalizeHeadlineStyle(value = {}) {
+  const source = value && typeof value === "object" ? value : {};
+  return {
+    fontFamily: SUBTITLE_FONTS.some((font) => font.value === source.fontFamily) ? source.fontFamily : DEFAULT_HEADLINE_STYLE.fontFamily,
+    fontScale: Math.round(clamp(source.fontScale, 60, 300, DEFAULT_HEADLINE_STYLE.fontScale)),
+    textColor: normalizeColor(source.textColor, DEFAULT_HEADLINE_STYLE.textColor),
+    bgColor: normalizeColor(source.bgColor, DEFAULT_HEADLINE_STYLE.bgColor),
+    bgOpacity: Math.round(clamp(source.bgOpacity, 0, 100, DEFAULT_HEADLINE_STYLE.bgOpacity)),
+  };
+}
+
 function clamp(value, minimum, maximum, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? Math.max(minimum, Math.min(maximum, number)) : fallback;
