@@ -118,11 +118,11 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   const longScenes = options.productionMode === "long-scenes";
   const mixedMode = options.productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(options.targetClipDuration) || 10)));
-  const shortClipDuration = Math.max(5, Math.min(10, Math.round(Number(options.shortClipDuration) || 6)));
+  const shortClipDuration = Math.max(5, Math.min(20, Math.round(Number(options.shortClipDuration) || 15)));
   let source = usable.map((item, index) => {
     const narration = String(item?.narration || item?.text || item?.voiceover || "").trim();
     const type = allowedTypes.has(item?.type) ? item.type : (index === 0 ? "Opening" : "Narrative");
-    const duration = Math.max(.6, Math.min(longScenes ? 12 : 10, Number(item?.duration) || (longScenes ? targetClipDuration : shortClipDuration)));
+    const duration = Math.max(.6, Math.min(longScenes ? 12 : 20, Number(item?.duration) || (longScenes ? targetClipDuration : shortClipDuration)));
     const contentFormat = String(options.contentFormat || "short-form video");
     const visualStyle = String(options.visualStyle || "photorealistic");
     const creativeDirection = String(options.creativeDirection || "").trim();
