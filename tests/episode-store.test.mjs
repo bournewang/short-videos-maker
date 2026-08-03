@@ -51,6 +51,17 @@ test("episode store persists metadata in SQLite and media in named episode direc
   assert.match(episode.shots[0].video, /\/episodes\/episode-rome\/files\/videos\//);
 });
 
+test("episodes stay ordered by creation time even after older episodes are re-saved", async (t) => {
+  const storageRoot = await mkdtemp(path.join(tmpdir(), "shortform-episode-order-"));
+  const store = new EpisodeStore({ storageRoot });
+  t.after(() => store.close());
+  await store.saveEpisode({ id:"episode-first", title:"First", shots:[], savedAt:1000 });
+  await store.saveEpisode({ id:"episode-second", title:"Second", shots:[], savedAt:1001 });
+  const first = store.getEpisode("episode-first");
+  await store.saveEpisode({ ...first, savedAt:9999 });
+  assert.deepEqual(store.listEpisodes().map((episode) => episode.id), ["episode-second", "episode-first"]);
+});
+
 test("renames keep an episode organized and deletion moves files to recoverable trash", async (t) => {
   const storageRoot = await mkdtemp(path.join(tmpdir(), "shortform-episode-rename-"));
   const store = new EpisodeStore({ storageRoot });

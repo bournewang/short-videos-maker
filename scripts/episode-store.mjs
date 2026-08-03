@@ -342,7 +342,7 @@ export class EpisodeStore {
   }
 
   listEpisodes() {
-    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration FROM episodes ORDER BY saved_at DESC").all();
+    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration FROM episodes ORDER BY created_at DESC, id DESC").all();
     return rows.map((row) => ({
       id:row.id, title:row.title || "Untitled episode", slug:row.slug, savedAt:row.saved_at,
       stage:row.stage, shotCount:row.shot_count, duration:row.duration, hasNarration:Boolean(row.has_narration),

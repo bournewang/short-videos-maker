@@ -447,7 +447,7 @@ export default function StudioApp() {
     await refreshEpisodeHistory();
   }
 
-  async function newEpisode(keepCurrent = true) {
+  async function newEpisode(keepCurrent = true, saveBlank = true) {
     if (keepCurrent && allowSave.current) await persistProject();
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -455,6 +455,7 @@ export default function StudioApp() {
     const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
+    if (!saveBlank) { allowSave.current = false; return; }
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(blank)); } catch { /* server and IndexedDB writes below remain available */ }
     await persistProject(blank);
   }
@@ -485,7 +486,7 @@ export default function StudioApp() {
       deleteProjectCache(summary.id),
     ]).then(() => true).catch(() => { setMessage("Could not delete the saved episode."); return false; });
     if (!deleted) return;
-    if (summary.id === episodeId) { await newEpisode(false); return; }
+    if (summary.id === episodeId) { await newEpisode(false, false); setEpisodesOpen(true); }
     setMessage(`${summary.title} deleted from local history.`);
     await refreshEpisodeHistory();
   }
@@ -501,6 +502,7 @@ export default function StudioApp() {
         shots: parsed.shots || [],
         covers: parsed.covers || [],
         title: parsed.title || "",
+        screenRatio: parsed.screenRatio || "9:16",
       };
     } catch { return null; }
   }
@@ -1138,7 +1140,7 @@ function SubtitleOverlay({ shot, subtitleStyle, audioElapsed }:any) {
   return <div className="preview-captions" style={{ bottom:`${style.position}%`, left:"6.5%", right:"6.5%", backgroundColor:subtitleCssBackground(style), fontFamily:style.fontFamily, fontWeight:style.bold ? 700 : 400, textAlign:style.alignment, textShadow:shadow }}><b style={{ color:style.englishColor, fontSize:`${fontSizeCqh}cqh`, fontWeight:"inherit" }}>{current.english || "Your English subtitle appears here"}</b>{(current.chinese || !shot) && <span style={{ color:style.chineseColor, fontSize:`${fontSizeCqh}cqh` }}>{current.chinese || "中文字幕显示在这里"}</span>}</div>;
 }
 
-function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyle, headlineStyle }:any) {
+function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyle, headlineStyle, subHeadlineText, subHeadlineStyle }:any) {
   const hs = headlineStyle ? normalizeHeadlineStyle(headlineStyle) : null;
   const fontFamily = hs?.fontFamily || normalizeSubtitleStyle(subtitleStyle).fontFamily;
   const fontScale = hs?.fontScale || 100;
@@ -1149,7 +1151,10 @@ function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyl
   const outlinePx = Math.max(1, 2.5);
   const outlineColor = "#000000";
   const shadow = [`0 ${outlinePx}px 0 ${outlineColor}`,`0 -${outlinePx}px 0 ${outlineColor}`,`${outlinePx}px 0 0 ${outlineColor}`,`-${outlinePx}px 0 0 ${outlineColor}`].join(", ");
-  return <div className="preview-headline" style={{ top:`${headlinePosition}%`, background:`rgba(${r},${g},${b},${bgAlpha})`, fontFamily, fontWeight:700, textAlign:"center", textShadow:shadow }}><span style={{ color:textColor, fontSize:`${headlineFontSizeCqh}cqh`, fontWeight:700, whiteSpace:"pre-line" }}>{headlineText}</span></div>;
+  const subScale = subHeadlineStyle?.fontScale || 70;
+  const subColor = subHeadlineStyle?.textColor || "#e0d5c0";
+  const subFontSizeCqh = 0.028 * subScale * 0.85;
+  return <div className="preview-headline" style={{ top:`${headlinePosition}%`, background:`rgba(${r},${g},${b},${bgAlpha})`, fontFamily, fontWeight:700, textAlign:hs?.textAlign || "center" }}><span style={{ color:textColor, fontSize:`${headlineFontSizeCqh}cqh`, fontWeight:700, whiteSpace:"pre-line", textShadow:shadow, display:"block" }}>{headlineText}</span>{subHeadlineText && <span style={{ color:subColor, fontSize:`${subFontSizeCqh}cqh`, fontWeight:400, whiteSpace:"pre-line", marginTop:"0.3em", display:"block" }}>{subHeadlineText}</span>}</div>;
 }
 
 function SubtitleStyleControls({ subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, preBroadcastStyle, setPreBroadcastStyle, hideBroadcastToggle, hideHeadlineRow }:any) {
@@ -1329,6 +1334,9 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const [livestreamRatio, setLivestreamRatio] = useState("9:16");
   const [customBackground, setCustomBackground] = useState<string | null>(null);
   const [bgMode, setBgMode] = useState<"cover" | "shots">("cover");
+  const [videoPosition, setVideoPosition] = useState(50);
+  const [subHeadlineText, setSubHeadlineText] = useState("");
+  const [subHeadlineStyle, setSubHeadlineStyle] = useState({ fontScale: 70, textColor: "#e0d5c0" });
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -1355,6 +1363,10 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   useEffect(() => () => clearCountdownTimer(), []);
 
   useEffect(() => {
+    setSubHeadlineText(selectedEpisodeTitle);
+  }, [selectedEpisodeId]);
+
+  useEffect(() => {
     if (subtitleStyle.position === DEFAULT_SUBTITLE_STYLE.position) setSubtitleStyle({ fontScale: 100, position: 30 });
     if (headlinePosition === 4) setHeadlinePosition(10);
     if (headlineStyle === DEFAULT_HEADLINE_STYLE) setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: 100, bgOpacity: 20 }));
@@ -1362,9 +1374,18 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
 
   function handleRatioChange(ratio: string) {
     setLivestreamRatio(ratio);
-    setSubtitleStyle(ratio === "16:9" ? { fontScale: 260, position: 5 } : { fontScale: 100, position: 30 });
+    if (ratio === "16:9") {
+      setSubtitleStyle({ fontScale: 260, position: 5 });
+      setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: 280, bgOpacity: 20 }));
+    } else if (ratio === "9:16c") {
+      setSubtitleStyle({ fontScale: 100, position: 14 });
+      setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: 100, bgOpacity: 20 }));
+    } else {
+      setSubtitleStyle({ fontScale: 100, position: 30 });
+      setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: 100, bgOpacity: 20 }));
+    }
     setHeadlinePosition(10);
-    setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: ratio === "16:9" ? 280 : 100, bgOpacity: 20 }));
+    setVideoPosition(50);
   }
 
   useEffect(() => {
@@ -1468,6 +1489,13 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
       setLivestreamAudio(data.audioData || null);
       setLivestreamCovers(data.covers || []);
       setCustomBackground(null);
+      const savedRatio = data.screenRatio || "9:16";
+      const hasLandscapeCovers = (data.covers || []).some((c: any) => c.screenRatio === "16:9");
+      const shots = data.shots || [];
+      const hasLandscapeShots = shots.some((s: any) => /Landscape\s+16\s*:\s*9/i.test(s.prompt || ""));
+      const isLandscape = savedRatio === "16:9" || hasLandscapeCovers || hasLandscapeShots;
+      const targetRatio = isLandscape ? "9:16c" : savedRatio;
+      setLivestreamRatio(targetRatio);
       if (data.audioData) startIntroCountdown();
     }
     setLoadingEpisode(false);
@@ -1493,19 +1521,26 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
     }
   }
 
+  const isCenteredLayout = livestreamRatio === "9:16c";
+  const phoneFrameClass = `phone-frame ratio-${isCenteredLayout ? "9-16" : livestreamRatio.replace(":", "-")}`;
+  const phoneCanvasClass = `phone-canvas${isCenteredLayout ? " centered-layout" : ""}`;
+  const phoneCanvasRatio = isCenteredLayout ? "9 / 16" : livestreamRatio.replace(":", " / ");
+
+  const visualContent = bgMode === "shots" && previewShot ? (
+      previewShot.video ? <video key={previewShot.id} src={previewShot.video} autoPlay muted loop playsInline aria-label="Shot video background" />
+      : previewShot.image ? <img src={previewShot.image} alt="Shot visual background" />
+      : backgroundImage ? <img src={backgroundImage} alt="Livestream background" />
+      : <div className="empty-visual"><span>📺</span><b>No shot visual</b></div>
+    ) : backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>;
+
   return <div className="panel livestream-panel">
     <div className="livestream-grid">
       <div className="livestream-preview-col">
-        <div className={`phone-frame ratio-${livestreamRatio.replace(":", "-")}`}>
-          <div className="phone-canvas" style={{ aspectRatio: livestreamRatio.replace(":", " / ") }}>
-            {bgMode === "shots" && previewShot ? (
-                previewShot.video ? <video key={previewShot.id} src={previewShot.video} autoPlay muted loop playsInline aria-label="Shot video background" />
-                : previewShot.image ? <img src={previewShot.image} alt="Shot visual background" />
-                : backgroundImage ? <img src={backgroundImage} alt="Livestream background" />
-                : <div className="empty-visual"><span>📺</span><b>No shot visual</b></div>
-              ) : backgroundImage ? <img src={backgroundImage} alt="Livestream background" /> : <div className="empty-visual"><span>📺</span><b>Select a background</b></div>}
-            {hasVisual && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} />}
-{hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} headlineStyle={headlineStyle} />}
+        <div className={phoneFrameClass}>
+          <div className={phoneCanvasClass} style={{ aspectRatio: phoneCanvasRatio }}>
+            {isCenteredLayout ? <div className="video-middle" style={{ top: `${videoPosition}%` }}>{visualContent}</div> : visualContent}
+            {hasVisual && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} audioElapsed={currentTime} />}
+{hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} headlineStyle={headlineStyle} subHeadlineText={subHeadlineText} subHeadlineStyle={subHeadlineStyle} />}
             {countdown !== null && <div className="livestream-intro" onClick={skipIntro} role="button" aria-label="Skip countdown and start now">
               {backgroundImage && <img src={backgroundImage} alt="" />}
               <div className="livestream-intro-info">
@@ -1562,6 +1597,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
               <label className="field"><span>Screen ratio</span>
                 <select value={livestreamRatio} onChange={(e) => handleRatioChange(e.target.value)}>
                   <option value="9:16">9:16 · Vertical</option>
+                  <option value="9:16c">9:16 · Centered 16:9</option>
                   <option value="16:9">16:9 · Landscape</option>
                 </select>
               </label>
@@ -1572,6 +1608,13 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
                 </select>
               </label>
             </div>
+            {isCenteredLayout && <label className="field"><span>Video position <b>{videoPosition}%</b></span>
+              <div className="livestream-stepper">
+                <button type="button" onClick={() => setVideoPosition(Math.max(0, videoPosition - 5))} aria-label="Move video up">−</button>
+                <input type="range" min="0" max="100" step="1" value={videoPosition} onChange={(e) => setVideoPosition(Number(e.target.value))}/>
+                <button type="button" onClick={() => setVideoPosition(Math.min(100, videoPosition + 5))} aria-label="Move video down">+</button>
+              </div>
+            </label>}
             {bgMode === "cover" && <>
             <div className="livestream-inline-row">
               <label className="field"><span>From covers</span><select value={backgroundImage} onChange={(event) => handleCoverSelect(event.target.value)}><option value="">Choose a cover…</option>{livestreamCovers.map((cover: CoverImage) => <option key={cover.id} value={cover.url}>{cover.screenRatio} · {new Date(cover.createdAt).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}</option>)}</select></label>
@@ -1586,8 +1629,9 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
           <div className="livestream-bg-options">
             <label className="field"><span>Text</span><textarea value={headlineText} onChange={(e) => setHeadlineText(e.target.value)} placeholder="Broadcast headline…" rows={2}/></label>
             <div className="livestream-inline-row">
-              <label className="field"><span>Preset</span><select value={HEADLINE_PRESETS.find((p) => JSON.stringify(p.style) === JSON.stringify(normalizeHeadlineStyle(headlineStyle)))?.id || ""} onChange={(e) => { const preset = HEADLINE_PRESETS.find((p) => p.id === e.target.value); if (preset) setHeadlineStyle(preset.style); }}><option value="">Custom</option>{HEADLINE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></label>
+              <label className="field"><span>Preset</span><select value={HEADLINE_PRESETS.find((p) => JSON.stringify(p.style) === JSON.stringify(normalizeHeadlineStyle(headlineStyle)))?.id || ""} onChange={(e) => { const preset = HEADLINE_PRESETS.find((p) => p.id === e.target.value); if (preset) { setHeadlineStyle(preset.style); if (preset.sub) setSubHeadlineStyle(preset.sub); } }}><option value="">Custom</option>{HEADLINE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></label>
               <label className="field"><span>Font</span><select value={headlineStyle.fontFamily} onChange={(e) => setHeadlineStyle({ ...headlineStyle, fontFamily: e.target.value })}>{SUBTITLE_FONTS.map((font) => <option key={font.value} value={font.value}>{font.label}</option>)}</select></label>
+              <label className="field"><span>Align</span><select value={headlineStyle.textAlign || "center"} onChange={(e) => setHeadlineStyle({ ...headlineStyle, textAlign: e.target.value })}><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></label>
             </div>
             <div className="livestream-inline-row">
               <label className="field"><span>Position <b>{headlinePosition}%</b></span>
@@ -1613,6 +1657,23 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
             <div className="livestream-color-swatches">
               <span>BG</span>
               {["#000000","#cc0000","#1a1a2e","#3e2723","#1b5e20","#0d47a1","#4a148c","#ffffff"].map((c) => <button key={"b"+c} type="button" className={`swatch ${headlineStyle.bgColor === c ? "active" : ""}`} style={{ background:c }} onClick={() => setHeadlineStyle({ ...headlineStyle, bgColor: c })} aria-label={`BG color ${c}`}/>)}
+            </div>
+            <div style={{ borderTop:"1px solid var(--line)", paddingTop:"8px", marginTop:"2px" }}>
+              <label className="field"><span>Subtitle</span><input value={subHeadlineText} onChange={(e) => setSubHeadlineText(e.target.value)} placeholder="Episode title or subtitle…" /></label>
+              <div className="livestream-inline-row" style={{ marginTop:"6px" }}>
+                <label className="field"><span>Size <b>{subHeadlineStyle.fontScale}%</b></span>
+                  <div className="livestream-stepper">
+                    <button type="button" onClick={() => setSubHeadlineStyle({ ...subHeadlineStyle, fontScale: Math.max(40, subHeadlineStyle.fontScale - 10) })} aria-label="Decrease subtitle size">−</button>
+                    <input type="range" min="40" max="200" step="5" value={subHeadlineStyle.fontScale} onChange={(e) => setSubHeadlineStyle({ ...subHeadlineStyle, fontScale: Number(e.target.value) })}/>
+                    <button type="button" onClick={() => setSubHeadlineStyle({ ...subHeadlineStyle, fontScale: Math.min(200, subHeadlineStyle.fontScale + 10) })} aria-label="Increase subtitle size">+</button>
+                  </div>
+                </label>
+                <label className="field"><span>Color</span>
+                  <div className="livestream-color-swatches" style={{ marginTop:0 }}>
+                    {["#e0d5c0","#ffffff","#ffeb3b","#ff9800","#ff5252","#4caf50","#2196f3","#9c27b0","#000000"].map((c) => <button key={"sub"+c} type="button" className={`swatch ${subHeadlineStyle.textColor === c ? "active" : ""}`} style={{ background:c }} onClick={() => setSubHeadlineStyle({ ...subHeadlineStyle, textColor: c })} aria-label={`Subtitle color ${c}`}/>)}
+                  </div>
+                </label>
+              </div>
             </div>
           </div>
         </div>

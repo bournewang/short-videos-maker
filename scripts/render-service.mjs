@@ -550,12 +550,21 @@ export function renderDimensions(payload = {}) {
   };
 }
 
+// "fill" crops sources to cover the whole canvas; "fit" keeps the source's
+// original aspect ratio and centers it with black bars (headline on top,
+// subtitles at the bottom bar).
+export function segmentFrameFilter(width, height, layout = "fill") {
+  if (layout === "fit") return `scale=${width}:${height}:force_original_aspect_ratio=decrease:out_range=tv:out_color_matrix=bt709:flags=lanczos,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,fps=30,setsar=1`;
+  return `scale=${width}:${height}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709:flags=lanczos,crop=${width}:${height},fps=30,setsar=1`;
+}
+
 export async function renderEpisode(payload, options = {}) {
   if (!Array.isArray(payload.shots) || !payload.shots.length) throw new Error("At least one shot is required");
   if (payload.shots.length > 80) throw new Error("The MVP supports up to 80 shots per episode");
   const started = Date.now(); const id = options.id || randomUUID(); const jobDir = path.join(workRoot, "jobs", id);
   await mkdir(jobDir, { recursive: true }); await mkdir(exportRoot, { recursive: true });
   const { width, height } = renderDimensions(payload); const subtitleStyle = normalizeSubtitleStyle(payload.subtitleStyle);
+  const frameLayout = payload.frameLayout === "fit" ? "fit" : "fill";
   const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
   const totalShots = payload.shots.length;
   const report = (stage, percent, completedShots = 0) => { if (typeof options.onProgress === "function") options.onProgress({ stage, percent, completedShots, totalShots }); };
@@ -567,7 +576,7 @@ export async function renderEpisode(payload, options = {}) {
     const sourceValue = payload.shots[i].video || payload.shots[i].image;
     const source = await saveMedia(sourceValue, path.join(jobDir, `source-${String(i).padStart(3,"0")}`));
     const segment = path.join(jobDir, `segment-${String(i).padStart(3,"0")}.mp4`);
-    const scale = `scale=${width}:${height}:force_original_aspect_ratio=increase:out_range=tv:out_color_matrix=bt709:flags=lanczos,crop=${width}:${height},fps=30,setsar=1`;
+    const scale = segmentFrameFilter(width, height, frameLayout);
     const normalizedFormat = "format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
     const colorMetadata = ["-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"];
     // Intermediate segments are encoded near-lossless so the single final
@@ -575,6 +584,10 @@ export async function renderEpisode(payload, options = {}) {
     const segmentEncoding = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"];
     if (payload.shots[i].video) {
       await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
+    } else if (frameLayout === "fit") {
+      // Letterboxed layouts keep the whole still visible, so Ken Burns motion
+      // is skipped in favor of a static fit.
+      await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     } else {
       const stillMotion = stillMotionFilter(payload.shots[i].motion, width, height, duration, i);
       await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);

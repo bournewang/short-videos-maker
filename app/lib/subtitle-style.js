@@ -67,14 +67,17 @@ export const DEFAULT_HEADLINE_STYLE = Object.freeze({
   textColor:"#ffffff",
   bgColor:"#000000",
   bgOpacity:65,
+  textAlign:"center",
 });
 
 export const HEADLINE_PRESETS = Object.freeze([
-  { id:"clean", label:"Clean", style:{ fontFamily:"Arial", fontScale:100, textColor:"#ffffff", bgColor:"#000000", bgOpacity:65 } },
-  { id:"breaking", label:"Breaking", style:{ fontFamily:"Arial", fontScale:115, textColor:"#ffffff", bgColor:"#cc0000", bgOpacity:85 } },
-  { id:"minimal", label:"Minimal", style:{ fontFamily:"Helvetica", fontScale:95, textColor:"#ffffff", bgColor:"#000000", bgOpacity:0 } },
-  { id:"warm", label:"Warm", style:{ fontFamily:"Georgia", fontScale:105, textColor:"#fff3e0", bgColor:"#3e2723", bgOpacity:75 } },
-  { id:"bold", label:"Bold", style:{ fontFamily:"Arial", fontScale:120, textColor:"#ffeb3b", bgColor:"#1a1a1a", bgOpacity:80 } },
+  { id:"clean", label:"Clean", style:{ fontFamily:"Arial", fontScale:100, textColor:"#ffffff", bgColor:"#000000", bgOpacity:65, textAlign:"center" }, sub:{ fontScale:70, textColor:"#c0b8a8" } },
+  { id:"breaking", label:"Breaking", style:{ fontFamily:"Arial", fontScale:115, textColor:"#ffffff", bgColor:"#cc0000", bgOpacity:85, textAlign:"center" }, sub:{ fontScale:75, textColor:"#ffcccc" } },
+  { id:"minimal", label:"Minimal", style:{ fontFamily:"Helvetica", fontScale:95, textColor:"#ffffff", bgColor:"#000000", bgOpacity:0, textAlign:"center" }, sub:{ fontScale:65, textColor:"#999999" } },
+  { id:"warm", label:"Warm", style:{ fontFamily:"Georgia", fontScale:105, textColor:"#fff3e0", bgColor:"#3e2723", bgOpacity:75, textAlign:"center" }, sub:{ fontScale:70, textColor:"#d4a574" } },
+  { id:"bold", label:"Bold", style:{ fontFamily:"Arial", fontScale:120, textColor:"#ffeb3b", bgColor:"#1a1a1a", bgOpacity:80, textAlign:"center" }, sub:{ fontScale:75, textColor:"#ffe082" } },
+  { id:"cinematic", label:"Cinematic", style:{ fontFamily:"Georgia", fontScale:110, textColor:"#f5f0e8", bgColor:"#0a0a0a", bgOpacity:70, textAlign:"center" }, sub:{ fontScale:65, textColor:"#b0a898" } },
+  { id:"modern", label:"Modern", style:{ fontFamily:"Helvetica", fontScale:100, textColor:"#ffffff", bgColor:"#1a1a2e", bgOpacity:70, textAlign:"left" }, sub:{ fontScale:70, textColor:"#9098b0" } },
 ]);
 
 export function normalizeHeadlineStyle(value = {}) {
@@ -85,6 +88,7 @@ export function normalizeHeadlineStyle(value = {}) {
     textColor: normalizeColor(source.textColor, DEFAULT_HEADLINE_STYLE.textColor),
     bgColor: normalizeColor(source.bgColor, DEFAULT_HEADLINE_STYLE.bgColor),
     bgOpacity: Math.round(clamp(source.bgOpacity, 0, 100, DEFAULT_HEADLINE_STYLE.bgOpacity)),
+    textAlign: ["left","center","right"].includes(source.textAlign) ? source.textAlign : DEFAULT_HEADLINE_STYLE.textAlign,
   };
 }
 
