@@ -1339,7 +1339,6 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const [subHeadlineStyle, setSubHeadlineStyle] = useState({ fontScale: 70, textColor: "#e0d5c0" });
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1350,6 +1349,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const [repeatCount, setRepeatCount] = useState(1);
   const [playCount, setPlayCount] = useState(0);
   const [autoPlay, setAutoPlay] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
   const [loadingEpisode, setLoadingEpisode] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -1361,6 +1361,10 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const selectedEpisodeTitle = sortedEpisodes.find((e: EpisodeSummary) => e.id === selectedEpisodeId)?.title || "Untitled";
 
   useEffect(() => () => clearCountdownTimer(), []);
+
+  useEffect(() => {
+    if (audioRef.current) audioRef.current.playbackRate = playbackRate;
+  }, [playbackRate]);
 
   useEffect(() => {
     setSubHeadlineText(selectedEpisodeTitle);
@@ -1454,7 +1458,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
     const audio = audioRef.current;
     if (!audio || !livestreamAudio) return;
     if (audio.paused) {
-      if (audio.currentTime >= (duration || audio.duration) - 0.02) audio.currentTime = 0;
+      if (audio.currentTime >= (audio.duration || 0) - 0.02) audio.currentTime = 0;
       void audio.play().catch(() => setIsPlaying(false));
     } else {
       audio.pause();
@@ -1553,14 +1557,29 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
           </div>
         </div>
         <div className="livestream-playback">
-          <audio ref={audioRef} src={livestreamAudio} preload="metadata" style={{ display: "none" }}
-            onLoadedMetadata={(event) => { const meta = event.currentTarget.duration; if (Number.isFinite(meta) && meta > 0) setDuration(meta); }}
+          <audio ref={audioRef} key={livestreamAudio} src={livestreamAudio} controls className="livestream-audio"
             onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)}
             onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-            onEnded={handleAudioEnded} />
-          <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!livestreamAudio || !(backgroundImage || (bgMode === "shots" && livestreamShots.length > 0))}>
-            {countdown !== null ? "▶ Start now" : isPlaying ? "❚❚ Pause" : "▶ Start broadcast"}
-          </button>
+            onEnded={handleAudioEnded}
+            onError={(e) => console.error("Audio load error:", e)} />
+          <div className="livestream-playback-row">
+            <button type="button" className={`primary large livestream-play-btn ${isPlaying ? "paused" : ""}`} onClick={togglePlayback} disabled={!livestreamAudio || !(backgroundImage || (bgMode === "shots" && livestreamShots.length > 0))}>
+              {countdown !== null ? "▶ Start now" : isPlaying ? "❚❚ Pause" : "▶ Start broadcast"}
+            </button>
+            <label className="field livestream-speed-field">
+              <select value={playbackRate} onChange={(e) => setPlaybackRate(Number(e.target.value))}>
+                <option value={0.5}>0.5x</option>
+                <option value={0.75}>0.75x</option>
+                <option value={0.8}>0.8x</option>
+                <option value={0.85}>0.85x</option>
+                <option value={0.9}>0.9x</option>
+                <option value={1}>1x</option>
+                <option value={1.25}>1.25x</option>
+                <option value={1.5}>1.5x</option>
+                <option value={2}>2x</option>
+              </select>
+            </label>
+          </div>
           {isPlaying && <div className="livestream-status"><span className="live-dot" />LIVE{repeatCount > 1 ? ` · ${playCount + 1}/${repeatCount}` : ""}</div>}
           {!livestreamAudio && <p className="helper-copy">Add narration audio in Episode or Captions before starting.</p>}
           {livestreamAudio && bgMode === "cover" && !backgroundImage && <p className="helper-copy">Select or upload a background image to start.</p>}
@@ -1569,7 +1588,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
       </div>
       <div className="livestream-controls">
         <div className="livestream-bg-section">
-          <h3>Episode</h3>
+          {/* <h3>Episode</h3> */}
           <div className="livestream-bg-options">
             <div className="livestream-inline-row">
               <label className="field" style={{ flex: 2 }}><span>Select episode</span>
@@ -1591,7 +1610,7 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
           </div>
         </div>
         <div className="livestream-bg-section">
-          <h3>Background</h3>
+          {/* <h3>Background</h3> */}
           <div className="livestream-bg-options">
             <div className="livestream-inline-row">
               <label className="field"><span>Screen ratio</span>
