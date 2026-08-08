@@ -7,19 +7,33 @@ function subtitleText(value) {
 export function splitSentences(text) {
   const raw = String(text || "").trim();
   if (!raw) return [];
-  return raw.split(/(?<=[.!?;。！？；，])\s*/).filter(Boolean);
+  return raw.split(/(?<=[.!?;！？。])\s*/).filter(Boolean);
 }
 
 export function splitLongSentence(text, maxWords = 15) {
-  const words = text.trim().split(/\s+/).filter(Boolean);
-  if (words.length <= maxWords) return [text];
-  const partCount = Math.ceil(words.length / maxWords);
-  const wordsPerPart = Math.ceil(words.length / partCount);
-  const parts = [];
-  for (let i = 0; i < words.length; i += wordsPerPart) {
-    parts.push(words.slice(i, i + wordsPerPart).join(" "));
+  const trimmed = text.trim();
+  if (!trimmed) return [text];
+  const words = trimmed.split(/\s+/).filter(Boolean);
+  if (words.length > 1) {
+    if (words.length <= maxWords) return [text];
+    const partCount = Math.ceil(words.length / maxWords);
+    const wordsPerPart = Math.ceil(words.length / partCount);
+    const parts = [];
+    for (let i = 0; i < words.length; i += wordsPerPart) {
+      parts.push(words.slice(i, i + wordsPerPart).join(" "));
+    }
+    return parts;
   }
-  return parts;
+  if (trimmed.length > 30) {
+    const partCount = Math.ceil(trimmed.length / 30);
+    const charsPerPart = Math.ceil(trimmed.length / partCount);
+    const parts = [];
+    for (let i = 0; i < trimmed.length; i += charsPerPart) {
+      parts.push(trimmed.slice(i, i + charsPerPart).trim());
+    }
+    return parts.filter(Boolean);
+  }
+  return [text];
 }
 
 export function alignBilingualChunks(englishText, chineseText) {
@@ -87,8 +101,8 @@ export function buildSrt(shots, language = "bilingual") {
 export function subtitleFileName(title, language = "bilingual") {
   const base = String(title || "")
     .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "-")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-zA-Z0-9一-鿿]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase() || "shortform-video"
   const suffix = language === "english" ? "en" : language === "chinese" ? "zh-cn" : "bilingual"

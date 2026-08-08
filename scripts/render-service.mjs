@@ -874,7 +874,7 @@ async function parseOrRepairProviderJson(raw, config, options, expectedShape) {
 
 async function translate(data) {
   if (!Array.isArray(data.lines)) throw new Error("Subtitle lines are required");
-  const raw = await completeText(data, [{role:"system",content:"Translate English short-video subtitles into concise, natural Simplified Chinese. Preserve names, numbers, dates, tone, and factual meaning. Return one compact RFC 8259 JSON object with a translations array in the same order. Do not use Markdown. Escape all quotes, backslashes, and line breaks inside strings."},{role:"user",content:JSON.stringify({lines:data.lines})}], { temperature:.2, maxTokens:8000 });
+  const raw = await completeText(data, [{role:"system",content:"Translate English short-video subtitles into concise, natural Simplified Chinese. Preserve names, numbers, dates, tone, and factual meaning. Keep the exact same sentence boundaries as the English source — every period, exclamation, and question mark must correspond to a matching Chinese sentence break. Never merge two English sentences into one Chinese sentence or split one English sentence into multiple Chinese sentences. Return one compact RFC 8259 JSON object with a translations array in the same order. Do not use Markdown. Escape all quotes, backslashes, and line breaks inside strings."},{role:"user",content:JSON.stringify({lines:data.lines})}], { temperature:.2, maxTokens:8000 });
   const parsed = await parseOrRepairProviderJson(raw, resolveTextProvider(data), {}, "an object with a translations array"); if (!Array.isArray(parsed.translations)) throw new Error("Translation provider returned an unexpected format"); return parsed.translations;
 }
 

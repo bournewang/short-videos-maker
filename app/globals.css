@@ -13,9 +13,11 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .brand-mark { width:38px; height:38px; border:1px solid #9c8255; display:grid; place-items:center; font:700 24px Georgia,serif; color:#d9bb81; transform:rotate(-3deg); }
 .brand strong { display:block; font:600 19px Georgia,serif; letter-spacing:.2px; }.brand span { font-size:9px; letter-spacing:3.2px; color:#978f82; }
 .sidebar nav { display:grid; gap:7px; }.sidebar nav button { appearance:none; border:0; background:transparent; color:#aaa59c; text-align:left; padding:12px 13px; border-radius:6px; display:flex; align-items:center; gap:13px; font-size:13px; transition:.2s; }
-.sidebar nav button span { font:600 9px ui-monospace,monospace; color:#686961; }.sidebar nav button:hover { background:#252722; color:#f4eee4; }.sidebar nav .nav-active { background:#303229; color:#f4eee4; box-shadow:inset 2px 0 #c19852; }.sidebar nav .nav-active span { color:#caa66c; }
+.sidebar nav button span { font:600 9px ui-monospace,monospace; color:#686961; }.sidebar nav button:hover,.sidebar nav .nav-prompter-link:hover { background:#252722; color:#f4eee4; }.sidebar nav .nav-active { background:#303229; color:#f4eee4; box-shadow:inset 2px 0 #c19852; }.sidebar nav .nav-active span { color:#caa66c; }
+.sidebar nav .nav-prompter-link { appearance:none; border:0; background:transparent; color:#aaa59c; text-align:left; padding:12px 13px; border-radius:6px; display:flex; align-items:center; gap:13px; font-size:13px; text-decoration:none; transition:.2s; }
 .sidebar-foot { margin-top:auto; border-top:1px solid #343530; padding:18px 8px 4px; color:#c0baaf; font-size:11px; }.sidebar-foot div { color:#777871; margin-top:7px; line-height:1.45; }.local-dot { display:inline-block; width:6px; height:6px; border-radius:50%; background:#8da071; margin-right:8px; box-shadow:0 0 0 4px #30362b; }
 .workspace { min-width:0; padding-bottom:28px; }
+.workspace.workspace-prompter { padding-bottom:0; display:flex; flex-direction:column; }
 .topbar { min-height:84px; background:rgba(255,253,250,.9); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; padding:16px 30px; position:sticky; top:0; z-index:5; backdrop-filter:blur(10px); }
 .eyebrow { display:block; color:var(--gold); font-size:9px; letter-spacing:2px; font-weight:700; margin-bottom:5px; }
 .title-input { border:0; background:transparent; font:600 20px Georgia,serif; color:var(--ink); min-width:390px; padding:2px 0; outline:none; }
@@ -91,3 +93,75 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .build-progress-fill { height:100%; border-radius:99px; background:linear-gradient(90deg,var(--gold),var(--gold-dark)); transition:width .5s ease; }
 .build-progress-meta { display:flex; justify-content:space-between; align-items:baseline; color:var(--muted); font-size:10px; letter-spacing:.4px; }
 .build-progress-meta b { color:var(--ink); font:700 11px ui-monospace,monospace; }
+
+/* ---- prompter page ---- */
+.prompter-shell { min-height:100vh; display:flex; flex-direction:column; background:#0f0f0e; color:#e8e3d8; font-family:Inter,ui-sans-serif,sans-serif; }
+.prompter-panel { height:100%; display:flex; flex-direction:column; background:#0f0f0e; color:#e8e3d8; font-family:Inter,ui-sans-serif,sans-serif; }
+.prompter-topbar { display:flex; justify-content:space-between; align-items:center; padding:14px 24px; background:#1a1a17; border-bottom:1px solid #2a2a25; }
+.prompter-topbar-left { display:flex; align-items:center; gap:16px; }
+.prompter-back { color:#8a857a; text-decoration:none; font-size:12px; font-weight:600; }
+.prompter-back:hover { color:#c0b698; }
+.prompter-title { font:600 18px Georgia,serif; color:#e0dbcf; }
+.prompter-topbar-right { display:flex; align-items:center; gap:10px; }
+.prompter-episode-select { min-width:220px; padding:8px 10px; border:1px solid #3a3a35; border-radius:5px; background:#1f1f1c; color:#e0dbcf; font-size:12px; outline:none; }
+.prompter-episode-select:focus { border-color:#9a7b4a; }
+.prompter-settings-btn { width:32px; height:32px; padding:0; border:1px solid #3a3a35; border-radius:5px; background:#1f1f1c; color:#8a857a; font-size:14px; cursor:pointer; display:grid; place-items:center; }
+.prompter-settings-btn:hover { border-color:#6a6a5e; color:#c0b698; }
+.prompter-settings { display:flex; gap:18px; padding:12px 24px; background:#1a1a17; border-bottom:1px solid #2a2a25; }
+.prompter-setting { display:grid; gap:4px; }
+.prompter-setting>span { font-size:9px; font-weight:700; letter-spacing:.8px; text-transform:uppercase; color:#8a857a; }
+.prompter-setting select { padding:6px 8px; border:1px solid #3a3a35; border-radius:4px; background:#1f1f1c; color:#e0dbcf; font-size:12px; outline:none; }
+.prompter-stepper { display:flex; align-items:center; gap:8px; }
+.prompter-stepper button { width:24px; height:24px; padding:0; border:1px solid #3a3a35; border-radius:4px; background:#1f1f1c; color:#e0dbcf; font-size:14px; cursor:pointer; display:grid; place-items:center; }
+.prompter-stepper button:hover { border-color:#9a7b4a; }
+.prompter-stepper output { min-width:36px; text-align:center; font:12px ui-monospace,monospace; color:#c0b698; }
+.prompter-body { flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; padding:20px; overflow:hidden; }
+.prompter-phone-frame { background:#191a18; border-radius:22px; padding:9px; box-shadow:0 14px 30px rgba(34,26,18,.18); max-width:330px; width:100%; }
+.prompter-phone-canvas { aspect-ratio:9/16; border-radius:15px; overflow:hidden auto; background:linear-gradient(150deg,#1d2625,#75654f 58%,#b48a58); position:relative; container-type:size; }
+.prompter-chunk-list { padding:12px 0; min-height:100%; display:flex; flex-direction:column; justify-content:center; }
+.prompter-headline { position:absolute; top:0; left:0; right:0; padding:10px 12px; z-index:2; text-align:center; }
+.prompter-headline span { display:block; line-height:1.3; }
+.prompter-settings-divider { width:1px; background:#2a2a25; align-self:stretch; }
+.prompter-headline-text { min-width:160px; }
+.prompter-headline-text input { padding:6px 8px; border:1px solid #3a3a35; border-radius:4px; background:#1f1f1c; color:#e0dbcf; font-size:12px; outline:none; }
+.prompter-headline-text input:focus { border-color:#9a7b4a; }
+.prompter-setting input[type="color"] { width:28px; height:28px; padding:0; border:0; border-radius:4px; cursor:pointer; background:transparent; }
+.prompter-message { display:grid; gap:12px; justify-items:center; text-align:center; color:#8a857a; }
+.prompter-message span { font:600 18px Georgia,serif; color:#a8a395; }
+.prompter-message small { font-size:11px; color:#6a655e; }
+.prompter-message.prompter-error span { color:#c47060; }
+.prompter-btn { padding:8px 16px; border:1px solid #3a3a35; border-radius:5px; background:#1f1f1c; color:#e0dbcf; font-size:12px; cursor:pointer; }
+.prompter-btn:hover { border-color:#9a7b4a; }
+.prompter-spinner { width:28px; height:28px; border:3px solid #2a2a25; border-top-color:#9a7b4a; border-radius:50%; animation:prompter-spin .7s linear infinite; }
+@keyframes prompter-spin { to { transform:rotate(360deg); } }
+.prompter-window { width:100%; max-width:800px; height:calc(100vh - 180px); overflow:hidden auto; }
+.prompter-chunk-list { }
+.prompter-chunk { padding:14px 18px; border-left:3px solid transparent; cursor:pointer; transition:opacity .25s,background .25s,border-color .25s; }
+.prompter-chunk:hover { background:rgba(255,255,255,.03); }
+.prompter-chunk.past { opacity:.25; }
+.prompter-chunk.active { background:rgba(154,123,74,.12); border-left-color:#c09852; }
+.prompter-chunk-en { color:#e8e3d8; font-family:Georgia,serif; line-height:1.45; font-weight:600; }
+.prompter-chunk-zh { color:#c0b698; font-family:Georgia,serif; line-height:1.4; margin-top:4px; }
+.prompter-chunk.past .prompter-chunk-en,
+.prompter-chunk.past .prompter-chunk-zh { color:inherit; }
+.prompter-end { text-align:center; padding:24px; color:#4a4a44; font:12px Georgia,serif; }
+.prompter-bottombar { display:flex; align-items:center; gap:14px; padding:12px 24px; background:#1a1a17; border-top:1px solid #2a2a25; }
+.prompter-play-btn { width:42px; height:42px; padding:0; border:1px solid #3a3a35; border-radius:50%; background:#1f1f1c; color:#e0dbcf; font-size:16px; cursor:pointer; display:grid; place-items:center; }
+.prompter-play-btn:hover:not(:disabled) { border-color:#9a7b4a; background:#2a2a22; }
+.prompter-play-btn:disabled,.prompter-mute-btn:disabled { opacity:.35; cursor:not-allowed; }
+.prompter-mute-btn { width:36px; height:36px; padding:0; border:1px solid #3a3a35; border-radius:6px; background:#1f1f1c; color:#e0dbcf; font-size:14px; cursor:pointer; display:grid; place-items:center; }
+.prompter-mute-btn:hover:not(:disabled) { border-color:#9a7b4a; background:#2a2a22; }
+.prompter-time { font:11px ui-monospace,monospace; color:#8a857a; min-width:90px; }
+.prompter-chunk-indicator { font:10px ui-monospace,monospace; color:#6a655e; }
+.prompter-bottombar-spacer { flex:1; }
+.prompter-hint { font-size:10px; color:#4a4a44; }
+@media (max-width:600px) {
+  .prompter-topbar { padding:10px 14px; }
+  .prompter-topbar-left { gap:10px; }
+  .prompter-title { font-size:14px; }
+  .prompter-episode-select { min-width:140px; font-size:10px; }
+  .prompter-settings { flex-wrap:wrap; padding:10px 14px; gap:10px; }
+  .prompter-phone-frame { max-width:260px; }
+  .prompter-bottombar { padding:8px 14px; gap:8px; }
+  .prompter-hint { display:none; }
+}
