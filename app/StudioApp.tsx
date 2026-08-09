@@ -963,7 +963,7 @@ export default function StudioApp() {
     activeManualImageCount ? `Generating images · ${activeManualImageCount}/${manualImageLimit}` : "",
     activeManualVideoCount ? `Animating clips · ${activeManualVideoCount}/${manualVideoLimit}` : "",
   ].filter(Boolean).join(" · ");
-  const activityLabel = busy || (manualActivity ? `${manualActivity} manual jobs active` : "");
+  const activityLabel = manualActivity ? `${manualActivity} manual jobs active` : "";
 
   return (
     <main className={`studio-shell ${audioData && !episodesOpen && stage !== "prompter" ? "has-narration-bar" : ""}`}>
@@ -996,7 +996,7 @@ export default function StudioApp() {
         </>}
       </section>
 
-      {stage !== "prompter" && <div className="statusbar"><span>{activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>}
+      {stage !== "prompter" && <div className="statusbar"><span>{busy ? <><i className="spinner"/>{busy}</> : activityLabel ? <><i className="spinner"/>{activityLabel}</> : message}</span><span>{shots.length} {productionMode === "long-scenes" ? "scenes" : "shots"} · {shots.filter((shot)=>shot.video).length} clips · {formatTime(totalDuration)} · {screenRatio}</span></div>}
       {audioData && !episodesOpen && stage !== "livestream" && stage !== "prompter" && <NarrationBar audioData={audioData} audioName={audioName} audioDuration={audioDuration} autoplayRequest={narrationAutoplayRequest} previewShot={stage === "storyboard" && selected ? { id:selected.id, start:selected.start, end:selected.end } : null} continuous={previewActive} shots={stage === "storyboard" ? shots : []} setSelectedId={setSelectedId} setPreviewActive={setPreviewActive} onTimeUpdate={setAudioElapsed} />}
       {settingsOpen && <Settings provider={provider} setProvider={setProvider} status={providerStatus} refreshStatus={refreshProviderStatus} close={() => setSettingsOpen(false)} />}
     </main>
@@ -1358,6 +1358,13 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
   const [countdown, setCountdown] = useState<number | null>(null);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  const [prompterVisible, setPrompterVisible] = useState(false);
+  const [prompterVisibleCount, setPrompterVisibleCount] = useState(3);
+  const [prompterFontScale, setPrompterFontScale] = useState(100);
+  const [prompterChunks, setPrompterChunks] = useState<Array<{ english: string; chinese: string; startTime: number; endTime: number }>>([]);
+  const [currentChunkIndex, setCurrentChunkIndex] = useState(-1);
+  const [scrollOffset, setScrollOffset] = useState(0);
+
   const defaultBackground = livestreamCovers.find((c: CoverImage) => c.screenRatio === livestreamRatio)?.url || livestreamCovers[0]?.url || "";
   const backgroundImage = customBackground ?? defaultBackground;
 
@@ -1379,6 +1386,44 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
     if (headlinePosition === 4) setHeadlinePosition(10);
     if (headlineStyle === DEFAULT_HEADLINE_STYLE) setHeadlineStyle((current: HeadlineStyle) => ({ ...current, fontScale: 100, bgOpacity: 20 }));
   }, []);
+
+  useEffect(() => {
+    const chunks: Array<{ english: string; chinese: string; startTime: number; endTime: number }> = [];
+    for (const shot of livestreamShots) {
+      const start = Math.max(0, Number(shot.start) || 0);
+      const shotDuration = Math.max(0.6, Number(shot.duration) || 2);
+      const end = Number.isFinite(Number(shot.end)) && Number(shot.end) > start
+        ? Number(shot.end) : start + shotDuration;
+      const realDuration = end - start;
+      const aligned = alignBilingualChunks(String(shot.narration || ""), String(shot.chinese || ""));
+      if (aligned.length === 0) continue;
+      const weights = aligned.map((c) => Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length));
+      const totalWeight = weights.reduce((s, w) => s + w, 0);
+      let cueStart = start;
+      for (let i = 0; i < aligned.length; i++) {
+        const cueDuration = Math.max(0.5, realDuration * weights[i] / totalWeight);
+        const cueEnd = i === aligned.length - 1 ? end : Math.min(end, cueStart + cueDuration);
+        chunks.push({ english: aligned[i].english, chinese: aligned[i].chinese, startTime: cueStart, endTime: cueEnd });
+        cueStart = cueEnd;
+      }
+    }
+    setPrompterChunks(chunks);
+    setCurrentChunkIndex(-1);
+    setScrollOffset(0);
+  }, [livestreamShots]);
+
+  useEffect(() => {
+    if (prompterChunks.length === 0) { setCurrentChunkIndex(-1); return; }
+    const idx = prompterChunks.findIndex((c) => currentTime >= c.startTime && currentTime < c.endTime);
+    setCurrentChunkIndex(idx >= 0 ? idx : currentTime >= (prompterChunks[prompterChunks.length - 1]?.endTime || 0) ? prompterChunks.length - 1 : 0);
+  }, [currentTime, prompterChunks]);
+
+  useEffect(() => {
+    if (currentChunkIndex < 0) return;
+    const targetOffset = Math.max(0, currentChunkIndex - Math.floor(prompterVisibleCount / 2));
+    const maxOffset = Math.max(0, prompterChunks.length - prompterVisibleCount);
+    setScrollOffset(Math.min(targetOffset, maxOffset));
+  }, [currentChunkIndex, prompterVisibleCount, prompterChunks.length]);
 
   function handleRatioChange(ratio: string) {
     setLivestreamRatio(ratio);
@@ -1547,8 +1592,31 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
         <div className={phoneFrameClass}>
           <div className={phoneCanvasClass} style={{ aspectRatio: phoneCanvasRatio }}>
             {isCenteredLayout ? <div className="video-middle" style={{ top: `${videoPosition}%` }}>{visualContent}</div> : visualContent}
-            {hasVisual && previewShot && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} audioElapsed={currentTime} />}
+            {hasVisual && previewShot && !prompterVisible && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} audioElapsed={currentTime} />}
 {hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} headlineStyle={headlineStyle} subHeadlineText={subHeadlineText} subHeadlineStyle={subHeadlineStyle} />}
+{prompterVisible && prompterChunks.length > 0 && (
+  <div className="livestream-prompter-overlay">
+    <div className="livestream-prompter-chunks">
+      {prompterChunks.slice(scrollOffset, scrollOffset + prompterVisibleCount).map((chunk, i) => {
+        const globalIndex = scrollOffset + i;
+        const isActive = globalIndex === currentChunkIndex;
+        const isPast = globalIndex < currentChunkIndex;
+        return (
+          <div key={globalIndex} className={`livestream-prompter-chunk${isActive ? " active" : ""}${isPast ? " past" : ""}`}>
+            <div className="livestream-prompter-en" style={{ fontSize: `${prompterFontScale * 0.028}cqh` }}>
+              {chunk.english || " "}
+            </div>
+            {chunk.chinese && (
+              <div className="livestream-prompter-zh" style={{ fontSize: `${prompterFontScale * 0.022}cqh` }}>
+                {chunk.chinese}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  </div>
+)}
             {countdown !== null && <div className="livestream-intro" onClick={skipIntro} role="button" aria-label="Skip countdown and start now">
               {backgroundImage && <img src={backgroundImage} alt="" />}
               <div className="livestream-intro-info">
@@ -1650,6 +1718,26 @@ function LivestreamPage({ shots, audioData, covers, subtitleStyle, setSubtitleSt
         <div className="livestream-bg-section">
           <h3>Headline</h3>
           <div className="livestream-bg-options">
+            <label className="field livestream-checkbox-field">
+              <input type="checkbox" checked={prompterVisible} onChange={(e) => setPrompterVisible(e.target.checked)} />
+              <span>Teleprompter overlay</span>
+            </label>
+            {prompterVisible && <div className="livestream-inline-row">
+              <label className="field"><span>Lines <b>{prompterVisibleCount}</b></span>
+                <div className="livestream-stepper">
+                  <button type="button" onClick={() => setPrompterVisibleCount(Math.max(1, prompterVisibleCount - 1))}>−</button>
+                  <input type="range" min="1" max="8" step="1" value={prompterVisibleCount} onChange={(e) => setPrompterVisibleCount(Number(e.target.value))} />
+                  <button type="button" onClick={() => setPrompterVisibleCount(Math.min(8, prompterVisibleCount + 1))}>+</button>
+                </div>
+              </label>
+              <label className="field"><span>Size <b>{prompterFontScale}%</b></span>
+                <div className="livestream-stepper">
+                  <button type="button" onClick={() => setPrompterFontScale(Math.max(60, prompterFontScale - 10))}>−</button>
+                  <input type="range" min="60" max="300" step="10" value={prompterFontScale} onChange={(e) => setPrompterFontScale(Number(e.target.value))} />
+                  <button type="button" onClick={() => setPrompterFontScale(Math.min(300, prompterFontScale + 10))}>+</button>
+                </div>
+              </label>
+            </div>}
             <label className="field"><span>Text</span><textarea value={headlineText} onChange={(e) => setHeadlineText(e.target.value)} placeholder="Broadcast headline…" rows={2}/></label>
             <div className="livestream-inline-row">
               <label className="field"><span>Preset</span><select value={HEADLINE_PRESETS.find((p) => JSON.stringify(p.style) === JSON.stringify(normalizeHeadlineStyle(headlineStyle)))?.id || ""} onChange={(e) => { const preset = HEADLINE_PRESETS.find((p) => p.id === e.target.value); if (preset) { setHeadlineStyle(preset.style); if (preset.sub) setSubHeadlineStyle(preset.sub); } }}><option value="">Custom</option>{HEADLINE_PRESETS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></label>
