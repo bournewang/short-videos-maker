@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import https from "node:https";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
@@ -11,6 +12,7 @@ import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/au
 import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } from "../app/lib/subtitle-style.js";
 import { alignBilingualChunks } from "../app/lib/subtitles.js";
 import { EpisodeStore } from "./episode-store.mjs";
+import { DigitalHumanStore } from "./digital-human-store.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -42,6 +44,7 @@ const assetRoot = path.join(workRoot, "assets");
 const audioPreviewRoot = path.join(workRoot, "audio-previews");
 const bgmRoot = path.join(root, "public", "bgm");
 const episodeStore = new EpisodeStore({ storageRoot:workRoot, assetRoot, exportRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
+const digitalHumanStore = new DigitalHumanStore({ storageRoot:workRoot });
 
 const providerDefaults = {
   image: {
@@ -309,6 +312,45 @@ export async function synthesizeSpeech(payload = {}, options = {}) {
     voice:config.voice,
     language:config.language,
     speed:config.speed,
+  };
+}
+
+async function synthesizeSpeechMiniMax({ script, voiceId, model = "speech-2.8-hd", speed = 1 }) {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  if (!apiKey) throw new Error("MINIMAX_API_KEY is not configured");
+  if (!script) throw new Error("Script is required for TTS");
+  if (!voiceId) throw new Error("MiniMax voice_id is required");
+
+  const response = await fetch("https://api.minimaxi.com/v1/t2a_v2", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      text: script,
+      stream: false,
+      voice_setting: { voice_id: voiceId, speed },
+      audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
+    }),
+  });
+  const result = await response.json();
+  if (!response.ok || result.base_resp?.status_code !== 0) {
+    throw new Error(result.base_resp?.status_msg || result.error?.message || `MiniMax returned ${response.status}`);
+  }
+
+  const audioHex = result.data?.audio;
+  if (!audioHex) throw new Error("MiniMax returned no audio data");
+
+  const audioBuffer = Buffer.from(audioHex, "hex");
+  return {
+    audioData: `data:audio/mp3;base64,${audioBuffer.toString("base64")}`,
+    filename: `minimax-${voiceId}.mp3`,
+    mimeType: "audio/mp3",
+    model,
+    voice: voiceId,
+    speed,
   };
 }
 
@@ -1078,6 +1120,212 @@ export function createRenderServer() {
       if (req.method === "POST" && url.pathname === "/audio/transcribe") { json(res, 200, await transcribeAudio(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/audio/process") { json(res, 200, await processNarration(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/providers/test") { json(res, 200, await testProviderConnection(await body(req, 2*1024*1024))); return; }
+
+      /* Digital Human CRUD */
+      if (req.method === "GET" && url.pathname === "/digital-humans") {
+        json(res, 200, { humans: await digitalHumanStore.list() }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/digital-humans") {
+        const payload = await body(req, 16 * 1024 * 1024);
+        if (!payload.name) throw new Error("Digital human name is required");
+        const human = await digitalHumanStore.create(payload);
+        json(res, 201, human); return;
+      }
+      const dhMatch = /^\/digital-humans\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "PUT" && dhMatch) {
+        const payload = await body(req, 16 * 1024 * 1024);
+        const human = await digitalHumanStore.update(decodeURIComponent(dhMatch[1]), payload);
+        json(res, 200, human); return;
+      }
+      if (req.method === "DELETE" && dhMatch) {
+        await digitalHumanStore.delete(decodeURIComponent(dhMatch[1]));
+        json(res, 200, { ok: true }); return;
+      }
+
+      /* Digital Human TTS */
+      if (req.method === "GET" && url.pathname === "/digital-human/voices") {
+        const provider = String(new URLSearchParams(url.search).get("provider") || "minimax").trim().toLowerCase();
+        if (provider === "minimax") {
+          const apiKey = process.env.MINIMAX_API_KEY;
+          if (!apiKey) throw new Error("MINIMAX_API_KEY is not configured");
+          const voices = [];
+
+          // Try different endpoints — MiniMax voice list API varies by account
+          const urls = [
+            "https://api.minimaxi.com/v1/voice/list",
+            "https://api.minimaxi.com/v1/voices",
+            "https://api.minimax.chat/v1/voice/list",
+          ];
+          for (const url of urls) {
+            try {
+              const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+              const text = await resp.text();
+              console.error("[MiniMax voices] %s → HTTP %s", url, resp.status);
+              console.error("[MiniMax voices] body: %s", text.slice(0, 500));
+
+              let data;
+              try { data = JSON.parse(text); } catch { continue; }
+
+              const voiceList =
+                data.data?.voice_list ||
+                data.data?.voices ||
+                data.data?.list ||
+                data.voice_list ||
+                data.voices ||
+                data.list ||
+                [];
+              const ok = data.base_resp?.status_code === 0 || data.code === 0 || data.status === 0 || resp.ok;
+
+              if (ok && Array.isArray(voiceList) && voiceList.length > 0) {
+                for (const v of voiceList) {
+                  voices.push({
+                    voice_id: v.voice_id,
+                    name: v.name || v.voice_name || v.voice_id,
+                    type: v.type || "system",
+                    language: v.language || "",
+                  });
+                }
+              }
+            } catch (err) {
+              console.error("[MiniMax voices] %s → %s", url, err.message);
+            }
+          }
+          // deduplicate by voice_id
+          const seen = new Set();
+          const unique = voices.filter((v) => !seen.has(v.voice_id) && seen.add(v.voice_id));
+          json(res, 200, { voices: unique }); return;
+        }
+        json(res, 200, { voices: [] }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/digital-human/tts") {
+        const payload = await body(req, 2 * 1024 * 1024);
+        const provider = String(payload.provider || "mlx").trim().toLowerCase();
+        if (provider === "minimax") {
+          const result = await synthesizeSpeechMiniMax({
+            script: payload.script,
+            voiceId: payload.voice,
+            model: payload.model || "speech-2.8-hd",
+            speed: payload.speed ?? 1,
+          });
+          json(res, 200, result); return;
+        }
+        const result = await synthesizeSpeech({
+          input: payload.script,
+          voice: payload.voice,
+          speed: payload.speed ?? 1,
+          language: payload.language ?? "zh",
+        });
+        json(res, 200, result); return;
+      }
+
+      /* HeyGen video generation */
+      if (req.method === "POST" && url.pathname === "/digital-human/video/generate") {
+        const payload = await body(req, 32 * 1024 * 1024);
+        const apiKey = process.env.HEYGEN_API_KEY;
+        if (!apiKey) throw new Error("HEYGEN_API_KEY is not configured");
+        if (!payload.photo) throw new Error("Photo data is required");
+        if (!payload.audio) throw new Error("Audio data is required");
+
+        const videoName = payload.videoName || "Digital Human Video";
+
+        const apiHeaders = { "x-api-key": apiKey };
+
+        // Helper: upload a buffer as a HeyGen asset via https.request (manual multipart)
+        function uploadHeyGenAsset(buf, filename, contentType) {
+          return new Promise((resolve, reject) => {
+            const boundary = `----FormBoundary${Date.now()}`;
+            const header = `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`;
+            const footer = `\r\n--${boundary}--\r\n`;
+            const body = Buffer.concat([Buffer.from(header), buf, Buffer.from(footer)]);
+
+            const req = https.request({
+              hostname: "api.heygen.com",
+              path: "/v3/assets",
+              method: "POST",
+              headers: {
+                "x-api-key": apiKey,
+                "Content-Type": `multipart/form-data; boundary=${boundary}`,
+                "Content-Length": String(body.length),
+              },
+            }, (heyRes) => {
+              let data = "";
+              heyRes.on("data", (chunk) => data += chunk);
+              heyRes.on("end", () => {
+                try { resolve(JSON.parse(data)); } catch { resolve(data); }
+              });
+            });
+            req.on("error", reject);
+            req.write(body);
+            req.end();
+          });
+        }
+
+        // Step 1: upload image as asset
+        const imgMatch = payload.photo.match(/^data:image\/(\w+);base64,(.+)$/);
+        if (!imgMatch) throw new Error("Photo must be a base64 data URL");
+        const imgExt = imgMatch[1] === "jpeg" ? "jpg" : imgMatch[1];
+        const imgBuffer = Buffer.from(imgMatch[2], "base64");
+
+        const imgAssetData = await uploadHeyGenAsset(imgBuffer, `avatar.${imgExt}`, `image/${imgExt}`);
+        if (!imgAssetData.data?.asset_id) {
+          throw new Error(imgAssetData.error?.message || "HeyGen image upload failed");
+        }
+        const imageAssetId = imgAssetData.data.asset_id;
+
+        // Step 2: upload audio as asset
+        const audioMatch = payload.audio.match(/^data:audio\/(\w+);base64,(.+)$/);
+        if (!audioMatch) throw new Error("Audio must be a base64 data URL");
+        const audioMime = audioMatch[1] === "mpeg" ? "mp3" : audioMatch[1];
+        const audioBuffer = Buffer.from(audioMatch[2], "base64");
+
+        const audioAssetData = await uploadHeyGenAsset(audioBuffer, `tts.${audioMime}`, `audio/${audioMime}`);
+        if (!audioAssetData.data?.asset_id) {
+          throw new Error(audioAssetData.error?.message || "HeyGen audio upload failed");
+        }
+        const audioAssetId = audioAssetData.data.asset_id;
+
+        // Step 3: create video
+        const videoBody = {
+          type: "image",
+          image: { type: "asset_id", asset_id: imageAssetId },
+          audio_asset_id: audioAssetId,
+          title: videoName,
+          resolution: "720p",
+          aspect_ratio: "9:16",
+        };
+
+        const videoRes = await fetch("https://api.heygen.com/v3/videos", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...apiHeaders },
+          body: JSON.stringify(videoBody),
+        });
+        const videoData = await videoRes.json();
+        console.error("[HeyGen] create video → HTTP %s body: %s", videoRes.status, JSON.stringify(videoData).slice(0, 500));
+        if (!videoRes.ok || !videoData.data?.video_id) {
+          throw new Error(videoData.error?.message || `HeyGen video creation failed (HTTP ${videoRes.status})`);
+        }
+        json(res, 200, { taskId: videoData.data.video_id }); return;
+      }
+
+      const dhVideoStatusMatch = /^\/digital-human\/video\/status\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && dhVideoStatusMatch) {
+        const apiKey = process.env.HEYGEN_API_KEY;
+        if (!apiKey) throw new Error("HEYGEN_API_KEY is not configured");
+        const taskId = decodeURIComponent(dhVideoStatusMatch[1]);
+        const heyGenRes = await fetch(`https://api.heygen.com/v3/videos/${taskId}`, {
+          headers: { "x-api-key": apiKey },
+        });
+        const heyGenData = await heyGenRes.json();
+        if (!heyGenRes.ok) {
+          throw new Error(heyGenData.error?.message || `HeyGen status check failed (HTTP ${heyGenRes.status})`);
+        }
+        json(res, 200, {
+          status: heyGenData.data?.status || "unknown",
+          videoUrl: heyGenData.data?.video_url || "",
+          error: heyGenData.data?.error || "",
+        }); return;
+      }
+
       json(res, 404, { error:"Not found" });
     } catch (error) { json(res, 500, { error:error instanceof Error ? error.message : "Unexpected error" }); }
   });

@@ -975,6 +975,7 @@ export default function StudioApp() {
             <button key={id} onClick={() => goToStage(id)} className={!episodesOpen && stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
           ))}
           <button onClick={() => goToStage("prompter")} className={!episodesOpen && stage === "prompter" ? "nav-active" : ""}><span>07</span>Prompter</button>
+          <a href="/digital-human" className="nav-prompter-link"><span>08</span>Digital Human</a>
         </nav>
         <div className="sidebar-foot"><span className="local-dot"/>Local workspace<div>Nothing leaves this device until a provider is called.</div></div>
       </aside>
