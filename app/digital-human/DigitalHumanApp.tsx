@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 const SERVICE = "http://127.0.0.1:4317";
 
+const LAST_PROJECT_KEY = "dh:last-open-project";
+
 const KOKORO_VOICES = [
   { value: "af_heart", label: "Heart (American Female)" },
   { value: "af_bella", label: "Bella (American Female)" },
@@ -30,7 +32,6 @@ const LANGUAGES = [
 ];
 
 function inferGender(voiceId: string, name?: string): "male" | "female" | "other" {
-  // Replace underscores so \b works on snake_case ids
   const id = voiceId.toLowerCase().replace(/_/g, " ");
   const label = (name || "").toLowerCase();
   const maleEn = /\b(?:male|boy|man|didi|nanyou|xuedi|xiongzhang|shaoye|elder|santa|grinch|rudolph|arnold|bloke|gentleman)\b/.test(id);
@@ -156,10 +157,50 @@ type DigitalHuman = {
   updatedAt: number;
 };
 
+type DHProject = {
+  id: string;
+  humanId: string;
+  name: string;
+  script: string;
+  audioPath: string;
+  audioUrl: string;
+  audioProvider: string;
+  audioVoice: string;
+  audioModel: string;
+  audioSpeed: number;
+  audioLanguage: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type DHVideo = {
+  id: string;
+  projectId: string;
+  type: "preview" | "full";
+  videoUrl: string;
+  heygenTaskId: string;
+  status: string;
+  createdAt: number;
+};
+
+type DHAudioVersion = {
+  id: string;
+  projectId: string;
+  audioPath: string;
+  audioUrl: string;
+  provider: string;
+  voice: string;
+  voiceLabel: string;
+  model: string;
+  speed: number;
+  language: string;
+  createdAt: number;
+};
+
 type StepState = "idle" | "loading" | "done" | "error";
 
 export default function DigitalHumanApp() {
-  const [tab, setTab] = useState<"manage" | "generate">("manage");
+  const [tab, setTab] = useState<"manage" | "projects">("projects");
   const [humans, setHumans] = useState<DigitalHuman[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -174,9 +215,20 @@ export default function DigitalHumanApp() {
   const [formError, setFormError] = useState("");
   const photoInputRef = useRef<HTMLInputElement>(null);
 
-  /* Generate tab state */
-  const [selectedHumanId, setSelectedHumanId] = useState("");
+  /* Projects tab state */
+  const [projects, setProjects] = useState<DHProject[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [projectVideos, setProjectVideos] = useState<DHVideo[]>([]);
+  const [projectSaving, setProjectSaving] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const lastSavedRef = useRef("");
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const restoredProjectRef = useRef(false);
+
+  /* Workspace state (loaded from selected project) */
+  const [projectName, setProjectName] = useState("");
   const [script, setScript] = useState("");
+  const [selectedHumanId, setSelectedHumanId] = useState("");
   const [ttsProvider, setTtsProvider] = useState<"mlx" | "minimax">("minimax");
   const [ttsVoice, setTtsVoice] = useState("af_heart");
   const [ttsCustomVoiceId, setTtsCustomVoiceId] = useState("");
@@ -193,6 +245,10 @@ export default function DigitalHumanApp() {
   const [ttsError, setTtsError] = useState("");
   const [ttsAudio, setTtsAudio] = useState("");
   const [ttsAudioUrl, setTtsAudioUrl] = useState("");
+
+  /* Multi-version audio */
+  const [audioVersions, setAudioVersions] = useState<DHAudioVersion[]>([]);
+  const [selectedAudioVersionId, setSelectedAudioVersionId] = useState("");
 
   /* Step 2: 15s Preview */
   const [previewStep, setPreviewStep] = useState<StepState>("idle");
@@ -225,6 +281,44 @@ export default function DigitalHumanApp() {
   }, []);
 
   useEffect(() => { loadHumans(); }, [loadHumans]);
+
+  /* ---- load projects ---- */
+  const loadProjects = useCallback(async () => {
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects`);
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const data = await res.json();
+      setProjects(data.projects || []);
+    } catch (err) {
+      console.error("Failed to load projects:", err);
+    }
+  }, []);
+
+  useEffect(() => { loadProjects(); }, [loadProjects]);
+
+  /* ---- load project videos when selected project changes ---- */
+  useEffect(() => {
+    if (!selectedProjectId) { setProjectVideos([]); return; }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    async function load() {
+      try {
+        const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/videos`);
+        const data = await res.json();
+        if (cancelled) return;
+        const videos = data.videos || [];
+        setProjectVideos(videos);
+        // Keep polling while any video is still being generated
+        if (videos.some((v: DHVideo) => v.status !== "completed" && v.status !== "failed")) {
+          timer = setTimeout(load, 5000);
+        }
+      } catch {
+        if (!cancelled) setProjectVideos([]);
+      }
+    }
+    load();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [selectedProjectId]);
 
   /* ---- fetch MiniMax voices on mount ---- */
   useEffect(() => {
@@ -360,20 +454,208 @@ export default function DigitalHumanApp() {
     }
   }
 
-  /* ---- Generate tab: select human ---- */
-  function selectHuman(id: string) {
-    setSelectedHumanId(id);
-    const human = humans.find((h) => h.id === id);
-    if (human?.voice) setTtsVoice(human.voice);
-    resetGenerate();
-  }
-
-  function resetGenerate() {
-    setTtsStep("idle"); setTtsError(""); setTtsAudio(""); setTtsAudioUrl("");
+  /* ---- Projects tab: project handlers ---- */
+  function resetWorkspace() {
+    setProjectName(""); setScript(""); setSelectedHumanId(""); setTtsStep("idle"); setTtsError(""); setTtsAudio(""); setTtsAudioUrl("");
+    lastSavedRef.current = "";
+    setSaveState("idle");
+    setAudioVersions([]); setSelectedAudioVersionId("");
     setPreviewStep("idle"); setPreviewTaskId(""); setPreviewStatus(""); setPreviewVideoUrl(""); setPreviewError("");
     setFullStep("idle"); setFullTaskId(""); setFullStatus(""); setFullVideoUrl(""); setFullError("");
     if (previewPollRef.current) { clearInterval(previewPollRef.current); previewPollRef.current = null; }
     if (fullPollRef.current) { clearInterval(fullPollRef.current); fullPollRef.current = null; }
+  }
+
+  async function loadProjectIntoWorkspace(project: DHProject & { audioVersions?: DHAudioVersion[] }) {
+    resetWorkspace();
+    setSelectedProjectId(project.id);
+    setProjectName(project.name || "");
+    setSelectedHumanId(project.humanId || "");
+    setScript(project.script || "");
+    lastSavedRef.current = JSON.stringify({
+      name: project.name || "",
+      script: project.script || "",
+      humanId: project.humanId || "",
+    });
+    setSaveState("saved");
+    const versions = project.audioVersions;
+    if (versions && versions.length > 0) {
+      setAudioVersions(versions);
+      setSelectedAudioVersionId(versions[0].id);
+      setTtsAudioUrl(`${versions[0].audioUrl}?t=${Date.now()}`);
+      setTtsAudio(`${versions[0].audioUrl}?t=${Date.now()}`);
+      setTtsStep("done");
+      if (versions[0].voice) setTtsVoice(versions[0].voice);
+      if (versions[0].provider) setTtsProvider(versions[0].provider as "mlx" | "minimax");
+      if (versions[0].model) setTtsMiniMaxModel(versions[0].model);
+      if (versions[0].speed) setTtsSpeed(versions[0].speed);
+      if (versions[0].language) setTtsLanguage(versions[0].language);
+    } else if (project.audioUrl) {
+      setTtsAudioUrl(`${project.audioUrl}?t=${project.updatedAt}`);
+      setTtsAudio(`${project.audioUrl}?t=${project.updatedAt}`);
+      setTtsStep("done");
+      if (project.audioVoice) setTtsVoice(project.audioVoice);
+      if (project.audioProvider) setTtsProvider(project.audioProvider as "mlx" | "minimax");
+      if (project.audioModel) setTtsMiniMaxModel(project.audioModel);
+      if (project.audioSpeed) setTtsSpeed(project.audioSpeed);
+      if (project.audioLanguage) setTtsLanguage(project.audioLanguage);
+    }
+  }
+
+  async function selectProject(project: DHProject) {
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(project.id)}`);
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const full = await res.json();
+      loadProjectIntoWorkspace(full);
+      localStorage.setItem(LAST_PROJECT_KEY, project.id);
+    } catch (err) {
+      console.error("Failed to load project:", err);
+    }
+  }
+
+  /* ---- restore the last opened project after a page reload ---- */
+  useEffect(() => {
+    if (restoredProjectRef.current || projects.length === 0) return;
+    restoredProjectRef.current = true;
+    const lastId = localStorage.getItem(LAST_PROJECT_KEY);
+    if (!lastId) return;
+    if (!projects.some((p) => p.id === lastId)) {
+      localStorage.removeItem(LAST_PROJECT_KEY);
+      return;
+    }
+    let cancelled = false;
+    fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(lastId)}`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`Server returned ${res.status}`);
+        return res.json();
+      })
+      .then((full) => { if (!cancelled) loadProjectIntoWorkspace(full); })
+      .catch((err) => console.error("Failed to restore project:", err));
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projects]);
+
+  async function createProject() {
+    setProjectSaving(true);
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: "New Project", script: "", humanId: "" }),
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const project = await res.json();
+      await loadProjects();
+      loadProjectIntoWorkspace(project);
+      localStorage.setItem(LAST_PROJECT_KEY, project.id);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to create project");
+    } finally {
+      setProjectSaving(false);
+    }
+  }
+
+  function workspaceSnapshot() {
+    return JSON.stringify({ name: projectName, script, humanId: selectedHumanId });
+  }
+
+  async function persistProject({ keepalive = false }: { keepalive?: boolean } = {}) {
+    if (!selectedProjectId) return;
+    const snapshot = workspaceSnapshot();
+    if (snapshot === lastSavedRef.current) return;
+    const payload = {
+      name: projectName.trim() || script.trim().slice(0, 50) || "Untitled Project",
+      script,
+      humanId: selectedHumanId,
+    };
+    setSaveState("saving");
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        keepalive,
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      lastSavedRef.current = snapshot;
+      setSaveState("saved");
+      setProjects((prev) => prev.map((p) => (p.id === selectedProjectId ? { ...p, name: payload.name } : p)));
+    } catch (err) {
+      setSaveState("error");
+      console.error("Failed to save project:", err);
+    }
+  }
+
+  async function saveProject() {
+    if (!selectedProjectId) return;
+    setProjectSaving(true);
+    try {
+      await persistProject();
+      await loadProjects();
+    } finally {
+      setProjectSaving(false);
+    }
+  }
+
+  /* ---- autosave workspace (title / script / human) with debounce ---- */
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    if (workspaceSnapshot() === lastSavedRef.current) return;
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = setTimeout(() => {
+      autosaveTimerRef.current = null;
+      persistProject();
+    }, 800);
+    return () => {
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, projectName, script, selectedHumanId]);
+
+  /* ---- flush any pending save when the page unloads ---- */
+  useEffect(() => {
+    function flush() {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+      persistProject({ keepalive: true });
+    }
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, projectName, script, selectedHumanId]);
+
+  async function deleteProject(id: string) {
+    if (!confirm("Delete this project and all its videos? This cannot be undone.")) return;
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      await loadProjects();
+      if (selectedProjectId === id) {
+        setSelectedProjectId("");
+        resetWorkspace();
+        localStorage.removeItem(LAST_PROJECT_KEY);
+      }
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to delete project");
+    }
+  }
+
+  async function deleteVideo(videoId: string) {
+    if (!confirm("Delete this video?")) return;
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/videos/${encodeURIComponent(videoId)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      setProjectVideos((prev) => prev.filter((v) => v.id !== videoId));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to delete video");
+    }
   }
 
   /* ---- Step 1: TTS ---- */
@@ -385,6 +667,9 @@ export default function DigitalHumanApp() {
       const voice = ttsProvider === "minimax"
         ? (ttsVoice === "custom" ? ttsCustomVoiceId : ttsVoice)
         : ttsVoice;
+      const voiceLabel = ttsProvider === "minimax"
+        ? (miniMaxVoices.find((v) => v.voice_id === ttsVoice)?.name || ttsVoice)
+        : (KOKORO_VOICES.find((v) => v.value === ttsVoice)?.label || ttsVoice);
       const res = await fetch(`${SERVICE}/digital-human/tts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -392,9 +677,11 @@ export default function DigitalHumanApp() {
           script: script.trim(),
           provider: ttsProvider,
           voice,
+          voiceLabel,
           language: ttsLanguage,
           speed: ttsSpeed,
           model: ttsProvider === "minimax" ? ttsMiniMaxModel : undefined,
+          projectId: selectedProjectId || undefined,
         }),
       });
       if (!res.ok) {
@@ -407,6 +694,21 @@ export default function DigitalHumanApp() {
       setTtsStep("done");
       setPreviewStep("idle"); setPreviewVideoUrl(""); setPreviewError("");
       setFullStep("idle"); setFullVideoUrl(""); setFullError("");
+      // Refresh audio versions list (don't let this clobber ttsStep)
+      if (selectedProjectId) {
+        fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/audio-versions`)
+          .then((r) => r.ok ? r.json() : null)
+          .then((data) => {
+            if (data?.versions?.length) {
+              setAudioVersions(data.versions);
+              setSelectedAudioVersionId(data.versions[0].id);
+              setTtsAudioUrl(`${data.versions[0].audioUrl}?t=${Date.now()}`);
+              setTtsAudio(`${data.versions[0].audioUrl}?t=${Date.now()}`);
+            }
+          })
+          .catch(() => {});
+        loadProjects();
+      }
     } catch (err) {
       setTtsStep("error");
       setTtsError(err instanceof Error ? err.message : "TTS generation failed");
@@ -414,20 +716,43 @@ export default function DigitalHumanApp() {
   }
 
   /* ---- Step 2: 15s Preview ---- */
+  async function getSelectedAudioAsBase64(): Promise<string> {
+    if (!ttsAudio) throw new Error("No audio selected");
+    if (ttsAudio.startsWith("data:audio/")) return ttsAudio;
+    const res = await fetch(ttsAudio);
+    if (!res.ok) throw new Error("Failed to fetch audio");
+    const blob = await res.blob();
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(new Error("Failed to read audio blob"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
   async function generatePreview() {
     const human = humans.find((h) => h.id === selectedHumanId);
     if (!human || !ttsAudio) return;
     setPreviewStep("loading");
     setPreviewError("");
+    let audioForGen: string;
+    try {
+      audioForGen = await getSelectedAudioAsBase64();
+    } catch (err) {
+      setPreviewStep("error");
+      setPreviewError("Failed to load selected audio for generation");
+      return;
+    }
     try {
       const res = await fetch(`${SERVICE}/digital-human/video/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           photo: human.photo,
-          audio: ttsAudio,
+          audio: audioForGen,
           duration: 15,
           videoName: `${human.name} - Preview`,
+          projectId: selectedProjectId || undefined,
         }),
       });
       if (!res.ok) {
@@ -455,10 +780,12 @@ export default function DigitalHumanApp() {
           setPreviewVideoUrl(data.videoUrl);
           setPreviewStep("done");
           if (previewPollRef.current) { clearInterval(previewPollRef.current); previewPollRef.current = null; }
+          refreshVideos();
         } else if (data.status === "failed") {
           setPreviewStep("error");
           setPreviewError(data.error || "HeyGen preview generation failed");
           if (previewPollRef.current) { clearInterval(previewPollRef.current); previewPollRef.current = null; }
+          refreshVideos();
         }
       } catch (err) {
         setPreviewStep("error");
@@ -474,15 +801,24 @@ export default function DigitalHumanApp() {
     if (!human || !ttsAudio) return;
     setFullStep("loading");
     setFullError("");
+    let audioForGen: string;
+    try {
+      audioForGen = await getSelectedAudioAsBase64();
+    } catch (err) {
+      setFullStep("error");
+      setFullError("Failed to load selected audio for generation");
+      return;
+    }
     try {
       const res = await fetch(`${SERVICE}/digital-human/video/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           photo: human.photo,
-          audio: ttsAudio,
+          audio: audioForGen,
           duration: 0,
           videoName: `${human.name} - Full`,
+          projectId: selectedProjectId || undefined,
         }),
       });
       if (!res.ok) {
@@ -510,10 +846,12 @@ export default function DigitalHumanApp() {
           setFullVideoUrl(data.videoUrl);
           setFullStep("done");
           if (fullPollRef.current) { clearInterval(fullPollRef.current); fullPollRef.current = null; }
+          refreshVideos();
         } else if (data.status === "failed") {
           setFullStep("error");
           setFullError(data.error || "HeyGen full video generation failed");
           if (fullPollRef.current) { clearInterval(fullPollRef.current); fullPollRef.current = null; }
+          refreshVideos();
         }
       } catch (err) {
         setFullStep("error");
@@ -523,7 +861,22 @@ export default function DigitalHumanApp() {
     }, 3000);
   }
 
+  function refreshVideos() {
+    if (!selectedProjectId) return;
+    fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/videos`)
+      .then((res) => res.json())
+      .then((data) => setProjectVideos(data.videos || []))
+      .catch(() => {});
+  }
+
   const selectedHuman = humans.find((h) => h.id === selectedHumanId);
+  const selectedProject = projects.find((p) => p.id === selectedProjectId);
+
+  function formatTime(ts: number) {
+    return new Date(ts).toLocaleString();
+  }
+
+  const videoTypeLabel: Record<string, string> = { preview: "15s Preview", full: "Full Video" };
 
   return (
     <div className="dh-shell">
@@ -538,8 +891,8 @@ export default function DigitalHumanApp() {
       {/* tabs */}
       <div className="dh-panel">
         <div className="dh-tabs">
+          <button className={`dh-tab${tab === "projects" ? " active" : ""}`} onClick={() => setTab("projects")}>Projects</button>
           <button className={`dh-tab${tab === "manage" ? " active" : ""}`} onClick={() => setTab("manage")}>Manage</button>
-          <button className={`dh-tab${tab === "generate" ? " active" : ""}`} onClick={() => setTab("generate")}>Generate Video</button>
         </div>
 
         {/* ---- Manage Tab ---- */}
@@ -644,26 +997,50 @@ export default function DigitalHumanApp() {
           </div>
         )}
 
-        {/* ---- Generate Tab ---- */}
-        {tab === "generate" && (
-          <div>
-            <div className="section-head compact">
-              <h1>Generate Video</h1>
-            </div>
+        {/* ---- Projects Tab ---- */}
+        {tab === "projects" && (
+          <div className="dh-projects-layout">
+            {/* Main workspace */}
+            <div className="dh-workspace">
+              {!selectedProjectId ? (
+                <div className="dh-empty">
+                  <em>+</em>
+                  <h2>Select or create a project</h2>
+                  <p>Choose a project from the right panel or create a new one to get started.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="section-head compact">
+                    <input
+                      className="dh-project-title"
+                      type="text"
+                      value={projectName}
+                      onChange={(e) => setProjectName(e.target.value)}
+                      placeholder="Project title…"
+                    />
+                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                      {saveState === "saving" && <span className="dh-save-state">Saving…</span>}
+                      {saveState === "saved" && <span className="dh-save-state">Saved</span>}
+                      {saveState === "error" && <span className="dh-save-state error">Save failed</span>}
+                      <button className="primary" onClick={saveProject} disabled={projectSaving}>
+                        {projectSaving ? "Saving…" : "Save"}
+                      </button>
+                    </div>
+                  </div>
 
-            {humans.length === 0 ? (
-              <div className="dh-empty">
-                <em>1</em>
-                <h2>No digital humans available</h2>
-                <p>Switch to the Manage tab and create a digital human first.</p>
-              </div>
-            ) : (
-              <div className="dh-generate-layout">
-                {/* left: script + steps */}
-                <div className="dh-generate-main">
                   <label className="field">
                     <span>Digital Human</span>
-                    <select value={selectedHumanId} onChange={(e) => selectHuman(e.target.value)}>
+                    <select value={selectedHumanId} onChange={async (e) => {
+                      setSelectedHumanId(e.target.value);
+                      if (selectedProjectId) {
+                        await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}`, {
+                          method: "PUT",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ humanId: e.target.value }),
+                        });
+                        await loadProjects();
+                      }
+                    }}>
                       <option value="">Select a digital human…</option>
                       {humans.map((h) => (
                         <option key={h.id} value={h.id}>{h.name} ({h.voiceLabel || h.voice})</option>
@@ -677,7 +1054,6 @@ export default function DigitalHumanApp() {
                       value={script}
                       onChange={(e) => setScript(e.target.value)}
                       placeholder="Paste your script here…"
-                      disabled={!selectedHumanId}
                     />
                     <small>{script.length} chars</small>
                   </label>
@@ -764,10 +1140,74 @@ export default function DigitalHumanApp() {
                         {ttsStep === "loading" ? "Generating…" : ttsStep === "done" ? "Re-generate Speech" : "Generate Speech"}
                       </button>
                       {ttsStep === "error" && <p className="dh-status-error">{ttsError}</p>}
-                      {ttsAudio && (
-                        <div className="dh-audio-preview">
-                          <div className="dh-audio-preview-head"><span>Generated Audio</span></div>
-                          <audio controls src={ttsAudioUrl} />
+                      {audioVersions.length > 0 && (
+                        <div className="dh-audio-versions">
+                          <div className="dh-audio-preview-head"><span>Audio Versions ({audioVersions.length})</span></div>
+                          <div className="dh-audio-version-list">
+                            {audioVersions.map((ver) => {
+                              const isSelected = selectedAudioVersionId === ver.id;
+                              const voiceName = ver.voiceLabel || ver.voice;
+                              return (
+                                <div
+                                  key={ver.id}
+                                  className={`dh-audio-version-item${isSelected ? " selected" : ""}`}
+                                >
+                                  <label className="dh-audio-version-radio">
+                                    <input
+                                      type="radio"
+                                      name="audioVersion"
+                                      checked={isSelected}
+                                      onChange={() => {
+                                        setSelectedAudioVersionId(ver.id);
+                                        setTtsAudioUrl(`${ver.audioUrl}?t=${Date.now()}`);
+                                        setTtsAudio(`${ver.audioUrl}?t=${Date.now()}`);
+                                      }}
+                                    />
+                                  </label>
+                                  <div className="dh-audio-version-player">
+                                    <audio controls src={`${ver.audioUrl}?t=${ver.createdAt}`} />
+                                  </div>
+                                  <div className="dh-audio-version-info">
+                                    <span className="dh-audio-version-voice">{voiceName}</span>
+                                    <span className="dh-audio-version-meta">
+                                      {ver.provider} / {ver.model || "default"} / {ver.speed}x
+                                    </span>
+                                  </div>
+                                  <button
+                                    className="danger dh-audio-version-delete"
+                                    onClick={async () => {
+                                      if (!confirm("Delete this audio version?")) return;
+                                      try {
+                                        await fetch(
+                                          `${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/audio-versions/${encodeURIComponent(ver.id)}`,
+                                          { method: "DELETE" }
+                                        );
+                                        setAudioVersions((prev) => {
+                                          const next = prev.filter((v) => v.id !== ver.id);
+                                          if (isSelected && next.length > 0) {
+                                            setSelectedAudioVersionId(next[0].id);
+                                            setTtsAudioUrl(`${next[0].audioUrl}?t=${Date.now()}`);
+                                            setTtsAudio(`${next[0].audioUrl}?t=${Date.now()}`);
+                                          } else if (next.length === 0) {
+                                            setSelectedAudioVersionId("");
+                                            setTtsAudioUrl("");
+                                            setTtsAudio("");
+                                            setTtsStep("idle");
+                                          }
+                                          return next;
+                                        });
+                                      } catch {
+                                        alert("Failed to delete audio version");
+                                      }
+                                    }}
+                                    title="Delete this version"
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -778,11 +1218,12 @@ export default function DigitalHumanApp() {
                     <div className="dh-step-head">
                       <span className={`dh-step-num${previewStep === "done" ? " done" : previewStep === "loading" ? " active" : ""}`}>2</span>
                       <b>15s Preview — HeyGen</b>
+                      <small>Optional</small>
                       {previewStep === "done" && <small>Confirmed</small>}
                     </div>
                     <div className="dh-step-body">
                       <p style={{ margin: 0, color: "var(--muted)", fontSize: 11, lineHeight: 1.5 }}>
-                        Generate a 15-second preview first. Check voice, lip-sync, facial stability, and composition before committing to the full video.
+                        Optionally generate a 15-second preview to check voice, lip-sync, facial stability, and composition before committing to the full video. You can skip this and go straight to the full video.
                       </p>
                       <button className="primary" onClick={generatePreview} disabled={previewStep === "loading" || ttsStep !== "done"}>
                         {previewStep === "loading" ? "Generating Preview…" : previewStep === "done" ? "Re-generate Preview" : "Generate 15s Preview"}
@@ -810,9 +1251,9 @@ export default function DigitalHumanApp() {
                     </div>
                     <div className="dh-step-body">
                       <p style={{ margin: 0, color: "var(--muted)", fontSize: 11, lineHeight: 1.5 }}>
-                        After confirming the preview looks good, generate the full video with the complete audio.
+                        Generate the full video with the complete audio. No preview required — skip step 2 if you are confident in the setup.
                       </p>
-                      <button className="primary large" onClick={generateFullVideo} disabled={fullStep === "loading" || previewStep !== "done"}>
+                      <button className="primary large" onClick={generateFullVideo} disabled={fullStep === "loading" || ttsStep !== "done"}>
                         {fullStep === "loading" ? "Generating Full Video…" : fullStep === "done" ? "Re-generate Full Video" : "Generate Full Video"}
                       </button>
                       {fullStep === "loading" && (
@@ -831,56 +1272,74 @@ export default function DigitalHumanApp() {
                       )}
                     </div>
                   </div>
-                </div>
 
-                {/* right: selected human preview */}
-                <div className="dh-generate-side">
-                  {selectedHuman ? (
-                    <div className="dh-card" style={{ display: "block" }}>
-                      {selectedHuman.photo ? (
-                        <img src={selectedHuman.photo} alt={selectedHuman.name} style={{ width: "100%", aspectRatio: "9/10", objectFit: "cover" }} />
-                      ) : (
-                        <div style={{ width: "100%", aspectRatio: "9/10", background: "linear-gradient(145deg,#303531,#80725c)", display: "grid", placeItems: "center", color: "#ded0b5", font: "600 32px Georgia,serif" }}>No photo</div>
-                      )}
-                      <div style={{ padding: 14 }}>
-                        <b style={{ font: "600 16px Georgia,serif" }}>{selectedHuman.name}</b>
-                        <p style={{ color: "var(--muted)", fontSize: 11, margin: "4px 0 0" }}>{selectedHuman.voiceLabel || selectedHuman.voice}</p>
+                  {/* Video History Strip */}
+                  {projectVideos.length > 0 && (
+                    <div className="dh-video-strip-section">
+                      <h3>Generated Videos</h3>
+                      <div className="dh-video-strip">
+                        {projectVideos.map((video) => (
+                          <div key={video.id} className={`dh-video-card${video.status === "completed" ? "" : " pending"}`}>
+                            <div className="dh-video-card-type">
+                              <span className={`dh-video-badge ${video.type}`}>{videoTypeLabel[video.type] || video.type}</span>
+                              <span className={`dh-video-status ${video.status}`}>{video.status}</span>
+                            </div>
+                            {video.status === "completed" && video.videoUrl ? (
+                              <video controls src={video.videoUrl} className="dh-video-card-player" />
+                            ) : (
+                              <div className="dh-video-card-placeholder">
+                                {video.status === "processing" ? "Processing…" : video.status}
+                              </div>
+                            )}
+                            <div className="dh-video-card-footer">
+                              <small>{formatTime(video.createdAt)}</small>
+                              <button className="danger" onClick={() => deleteVideo(video.id)} title="Delete video">✕</button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
-                    </div>
-                  ) : (
-                    <div className="dh-empty" style={{ minHeight: 120 }}>
-                      <p>Select a digital human to see preview</p>
                     </div>
                   )}
+                </>
+              )}
+            </div>
 
-                  <div className="dh-status-panel">
-                    <h3>Checklist</h3>
-                    <div style={{ display: "grid", gap: 6, fontSize: 11, color: "var(--muted)" }}>
-                      <div className={selectedHuman?.photo ? "ok" : ""} style={{ paddingLeft: 18, position: "relative" }}>
-                        <span style={{ position: "absolute", left: 2 }}>{selectedHuman?.photo ? "●" : "○"}</span>
-                        Photo uploaded (front-facing, mouth visible)
-                      </div>
-                      <div className={script.trim() ? "ok" : ""} style={{ paddingLeft: 18, position: "relative" }}>
-                        <span style={{ position: "absolute", left: 2 }}>{script.trim() ? "●" : "○"}</span>
-                        Script ready
-                      </div>
-                      <div className={ttsStep === "done" ? "ok" : ""} style={{ paddingLeft: 18, position: "relative" }}>
-                        <span style={{ position: "absolute", left: 2 }}>{ttsStep === "done" ? "●" : "○"}</span>
-                        TTS audio generated
-                      </div>
-                      <div className={previewStep === "done" ? "ok" : ""} style={{ paddingLeft: 18, position: "relative" }}>
-                        <span style={{ position: "absolute", left: 2 }}>{previewStep === "done" ? "●" : "○"}</span>
-                        15s preview confirmed
-                      </div>
-                      <div className={fullStep === "done" ? "ok" : ""} style={{ paddingLeft: 18, position: "relative" }}>
-                        <span style={{ position: "absolute", left: 2 }}>{fullStep === "done" ? "●" : "○"}</span>
-                        Full video ready
-                      </div>
-                    </div>
-                  </div>
-                </div>
+            {/* Right panel: Projects list */}
+            <div className="dh-projects-panel">
+              <div className="dh-projects-panel-head">
+                <h3>Projects</h3>
+                <button className="primary" onClick={createProject} disabled={projectSaving}>+ New</button>
               </div>
-            )}
+              {projects.length === 0 ? (
+                <div className="dh-projects-empty">
+                  <p>No projects yet. Create one to start.</p>
+                </div>
+              ) : (
+                <div className="dh-projects-list">
+                  {projects.map((project) => {
+                    const human = humans.find((h) => h.id === project.humanId);
+                    return (
+                      <div
+                        key={project.id}
+                        className={`dh-project-item${selectedProjectId === project.id ? " active" : ""}`}
+                        onClick={() => selectProject(project)}
+                      >
+                        <div className="dh-project-item-info">
+                          <b>{project.name || "Untitled Project"}</b>
+                          <span>{human ? human.name : "No human selected"}</span>
+                          <small>{formatTime(project.updatedAt)}</small>
+                        </div>
+                        <button
+                          className="danger"
+                          onClick={(e) => { e.stopPropagation(); deleteProject(project.id); }}
+                          title="Delete project"
+                        >✕</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

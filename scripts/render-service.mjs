@@ -13,6 +13,7 @@ import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } fr
 import { alignBilingualChunks } from "../app/lib/subtitles.js";
 import { EpisodeStore } from "./episode-store.mjs";
 import { DigitalHumanStore } from "./digital-human-store.mjs";
+import { DigitalHumanProjectStore } from "./digital-human-project-store.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -45,6 +46,33 @@ const audioPreviewRoot = path.join(workRoot, "audio-previews");
 const bgmRoot = path.join(root, "public", "bgm");
 const episodeStore = new EpisodeStore({ storageRoot:workRoot, assetRoot, exportRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
 const digitalHumanStore = new DigitalHumanStore({ storageRoot:workRoot });
+const dhProjectStore = new DigitalHumanProjectStore({ storageRoot:workRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
+
+/* Re-check a non-terminal HeyGen video record against the API and persist the result. */
+async function syncHeyGenVideoRecord(video) {
+  if (!video || !video.heygenTaskId) return video;
+  if (video.status === "completed" || video.status === "failed") return video;
+  const apiKey = process.env.HEYGEN_API_KEY;
+  if (!apiKey) return video;
+  try {
+    const heyGenRes = await fetch(`https://api.heygen.com/v3/videos/${video.heygenTaskId}`, {
+      headers: { "x-api-key": apiKey },
+    });
+    const heyGenData = await heyGenRes.json();
+    if (!heyGenRes.ok) return video;
+    const status = heyGenData.data?.status || "unknown";
+    const videoUrl = heyGenData.data?.video_url || "";
+    if (status === "completed" && videoUrl) {
+      return dhProjectStore.updateVideo(video.id, { status, videoUrl });
+    }
+    if (status === "failed") {
+      return dhProjectStore.updateVideo(video.id, { status, videoUrl: heyGenData.data?.error || "" });
+    }
+  } catch (err) {
+    console.error(`[HeyGen] status sync failed for ${video.heygenTaskId}:`, err instanceof Error ? err.message : err);
+  }
+  return video;
+}
 
 const providerDefaults = {
   image: {
@@ -843,7 +871,7 @@ STRUCTURE:
 1. HOOK (${hookTimes[duration]}): Open immediately with a question, surprising contrast, or urgent historical problem. Create an honest curiosity gap. Promise what the viewer will understand. Never begin with greetings or "Today we will learn."
 2. SETUP (${setupTimes[duration]}): Establish when, where, who, and why this moment matters. State what could be gained, lost, changed, or remembered.
 3. CONFLICT & PAYOFF (${coreTimes[duration]}): Build the decisive sequence through actions, choices, pressure, setbacks, and rising consequences. Add one natural midpoint re-hook (new danger, reversal, or surprising fact). Reach a clear turning point, then deliver the answer promised by the opening.
-4. GLOBAL VIEW & CLOSE (${closeTimes[duration]}): Show why the payoff mattered. Pull back to a global-history perspective — compare what was happening in Eastern and Western societies in the same period with at least one meaningful contemporaneous reference from each. End with one memorable, reflective sentence.
+4. GLOBAL VIEW & CLOSE (${closeTimes[duration]}): Show why the payoff mattered. Pull back to a wider global-history perspective on the event's consequences and legacy. End with one memorable, reflective sentence.
 
 NARRATIVE VOICE: Calm, confident, cinematic, humane at a measured documentary pace. Create tension from real stakes and uncertainty — not clickbait. Center human agency while acknowledging institutions, geography, technology, belief, and chance. Do not add shot lists, editing directions, or music cues.
 
@@ -1200,21 +1228,34 @@ export function createRenderServer() {
       if (req.method === "POST" && url.pathname === "/digital-human/tts") {
         const payload = await body(req, 2 * 1024 * 1024);
         const provider = String(payload.provider || "mlx").trim().toLowerCase();
+        let result;
         if (provider === "minimax") {
-          const result = await synthesizeSpeechMiniMax({
+          result = await synthesizeSpeechMiniMax({
             script: payload.script,
             voiceId: payload.voice,
             model: payload.model || "speech-2.8-hd",
             speed: payload.speed ?? 1,
           });
-          json(res, 200, result); return;
+        } else {
+          result = await synthesizeSpeech({
+            input: payload.script,
+            voice: payload.voice,
+            speed: payload.speed ?? 1,
+            language: payload.language ?? "zh",
+          });
         }
-        const result = await synthesizeSpeech({
-          input: payload.script,
-          voice: payload.voice,
-          speed: payload.speed ?? 1,
-          language: payload.language ?? "zh",
-        });
+        // Persist audio to project if projectId is provided
+        if (payload.projectId) {
+          await dhProjectStore.update(payload.projectId, {
+            audioData: result.audioData,
+            audioProvider: provider,
+            audioVoice: payload.voice,
+            audioModel: payload.model || "",
+            audioSpeed: payload.speed ?? 1,
+            audioLanguage: payload.language ?? "zh",
+            voiceLabel: payload.voiceLabel || payload.voice,
+          });
+        }
         json(res, 200, result); return;
       }
 
@@ -1304,6 +1345,15 @@ export function createRenderServer() {
         if (!videoRes.ok || !videoData.data?.video_id) {
           throw new Error(videoData.error?.message || `HeyGen video creation failed (HTTP ${videoRes.status})`);
         }
+        // Save video record to project if projectId provided
+        if (payload.projectId) {
+          await dhProjectStore.addVideo(payload.projectId, {
+            type: payload.duration === 15 ? "preview" : "full",
+            videoUrl: "",
+            heygenTaskId: videoData.data.video_id,
+            status: "processing",
+          });
+        }
         json(res, 200, { taskId: videoData.data.video_id }); return;
       }
 
@@ -1319,11 +1369,112 @@ export function createRenderServer() {
         if (!heyGenRes.ok) {
           throw new Error(heyGenData.error?.message || `HeyGen status check failed (HTTP ${heyGenRes.status})`);
         }
+        const status = heyGenData.data?.status || "unknown";
+        const videoUrl = heyGenData.data?.video_url || "";
+        // Update video record if it exists
+        const video = await dhProjectStore.findVideoByTaskId(taskId);
+        if (video) {
+          if (status === "completed" && videoUrl) {
+            await dhProjectStore.updateVideo(video.id, { status, videoUrl });
+          } else if (status === "failed") {
+            await dhProjectStore.updateVideo(video.id, { status, videoUrl: heyGenData.data?.error || "" });
+          }
+        }
         json(res, 200, {
-          status: heyGenData.data?.status || "unknown",
-          videoUrl: heyGenData.data?.video_url || "",
+          status,
+          videoUrl,
           error: heyGenData.data?.error || "",
         }); return;
+      }
+
+      /* Digital Human Project CRUD */
+      if (req.method === "GET" && url.pathname === "/digital-human/projects") {
+        const projects = await dhProjectStore.list();
+        json(res, 200, { projects }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/digital-human/projects") {
+        const payload = await body(req, 2 * 1024 * 1024);
+        const project = await dhProjectStore.create(payload);
+        json(res, 201, project); return;
+      }
+
+      /* Audio version list/delete */
+      const dhAudioVersionDeleteMatch = /^\/digital-human\/projects\/([^/]+)\/audio-versions\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "DELETE" && dhAudioVersionDeleteMatch) {
+        await dhProjectStore.deleteAudioVersion(
+          decodeURIComponent(dhAudioVersionDeleteMatch[1]),
+          decodeURIComponent(dhAudioVersionDeleteMatch[2])
+        );
+        json(res, 200, { ok: true }); return;
+      }
+      const dhProjectAudioVersionsMatch = /^\/digital-human\/projects\/([^/]+)\/audio-versions$/.exec(url.pathname);
+      if (req.method === "GET" && dhProjectAudioVersionsMatch) {
+        const versions = await dhProjectStore.listAudioVersions(decodeURIComponent(dhProjectAudioVersionsMatch[1]));
+        json(res, 200, { versions }); return;
+      }
+
+      const dhProjectMatch = /^\/digital-human\/projects\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && dhProjectMatch) {
+        const project = await dhProjectStore.get(decodeURIComponent(dhProjectMatch[1]));
+        if (!project) { json(res, 404, { error: "Project not found" }); return; }
+        const versions = await dhProjectStore.listAudioVersions(project.id);
+        json(res, 200, { ...project, audioVersions: versions }); return;
+      }
+      if (req.method === "PUT" && dhProjectMatch) {
+        const payload = await body(req, 32 * 1024 * 1024);
+        const project = await dhProjectStore.update(decodeURIComponent(dhProjectMatch[1]), payload);
+        json(res, 200, project); return;
+      }
+      if (req.method === "DELETE" && dhProjectMatch) {
+        await dhProjectStore.delete(decodeURIComponent(dhProjectMatch[1]));
+        json(res, 200, { ok: true }); return;
+      }
+
+      /* Digital Human Project Videos */
+      const dhProjectVideosMatch = /^\/digital-human\/projects\/([^/]+)\/videos$/.exec(url.pathname);
+      if (req.method === "GET" && dhProjectVideosMatch) {
+        const videos = await dhProjectStore.listVideos(decodeURIComponent(dhProjectVideosMatch[1]));
+        const synced = await Promise.all(videos.map((v) => syncHeyGenVideoRecord(v)));
+        json(res, 200, { videos: synced }); return;
+      }
+      const dhVideoDeleteMatch = /^\/digital-human\/projects\/([^/]+)\/videos\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "DELETE" && dhVideoDeleteMatch) {
+        await dhProjectStore.deleteVideo(decodeURIComponent(dhVideoDeleteMatch[2]));
+        json(res, 200, { ok: true }); return;
+      }
+      const dhVideoUpdateMatch = /^\/digital-human\/projects\/([^/]+)\/videos\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "PUT" && dhVideoUpdateMatch) {
+        const payload = await body(req, 2 * 1024 * 1024);
+        const video = await dhProjectStore.updateVideo(decodeURIComponent(dhVideoUpdateMatch[2]), payload);
+        json(res, 200, video); return;
+      }
+
+      /* Serve a specific audio version file */
+      const dhAudioVersionMatch = /^\/dh-projects\/([^/]+)\/audio\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && dhAudioVersionMatch) {
+        const projectId = decodeURIComponent(dhAudioVersionMatch[1]);
+        const versionId = decodeURIComponent(dhAudioVersionMatch[2]);
+        const version = await dhProjectStore.getAudioVersion(projectId, versionId);
+        if (!version || !version.audioPath) { json(res, 404, { error: "Audio version not found" }); return; }
+        const audioFile = version.audioPath;
+        await readFile(audioFile);
+        const ext = path.extname(audioFile).toLowerCase();
+        const contentType = ext === ".mp3" ? "audio/mpeg" : ext === ".wav" ? "audio/wav" : "audio/mp4";
+        res.writeHead(200, cors({ "Content-Type": contentType, "Content-Disposition": "inline" }));
+        createReadStream(audioFile).pipe(res); return;
+      }
+
+      /* Serve project audio files */
+      const dhAudioMatch = /^\/dh-projects\/([^/]+)\/audio$/.exec(url.pathname);
+      if (req.method === "GET" && dhAudioMatch) {
+        const project = await dhProjectStore.get(decodeURIComponent(dhAudioMatch[1]));
+        if (!project?.audioPath) { json(res, 404, { error: "Audio not found" }); return; }
+        const audioFile = project.audioPath;
+        await readFile(audioFile);
+        const ext = path.extname(audioFile).toLowerCase();
+        const contentType = ext === ".mp3" ? "audio/mpeg" : ext === ".wav" ? "audio/wav" : "audio/mp4";
+        res.writeHead(200, cors({ "Content-Type": contentType, "Content-Disposition": "inline" }));
+        createReadStream(audioFile).pipe(res); return;
       }
 
       json(res, 404, { error:"Not found" });
