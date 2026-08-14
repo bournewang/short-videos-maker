@@ -781,20 +781,30 @@ export async function generateVideo(data, options = {}) {
     ? `${motionPrompt}. Camera direction: ${direction}. Generate the full scene directly from this description as one continuous take with coherent visual beats, stable identity and anatomy, consistent setting, lighting, and style; avoid text, logos, cuts, flicker, warping, morphing, or unrelated subjects.`
     : `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects.`;
   const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
-  const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
-    model:data.model,
-    content:directTextToVideo ? [{ type:"text", text:prompt }] : [
-      { type:"text", text:prompt },
-      { type:"image_url", image_url:{ url:image }, role:"first_frame" },
-    ],
-    duration,
-    ratio:screenRatio,
-    resolution:"1080p",
-    generate_audio:false,
-    watermark:false,
-  }) });
-  const created = await createdResponse.json();
-  if (!createdResponse.ok) throw new Error(providerError(created, createdResponse.status));
+  // Some Seedance variants (e.g. *-fast) reject higher resolutions, especially
+  // for image-to-video. Start high and fall back when the provider complains.
+  const requestedResolution = /^(1080|720|480)p$/.test(String(data.resolution || "")) ? String(data.resolution) : "1080p";
+  const resolutionCandidates = [...new Set([requestedResolution, "720p", "480p"])];
+  let created = null;
+  for (const resolution of resolutionCandidates) {
+    const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
+      model:data.model,
+      content:directTextToVideo ? [{ type:"text", text:prompt }] : [
+        { type:"text", text:prompt },
+        { type:"image_url", image_url:{ url:image }, role:"first_frame" },
+      ],
+      duration,
+      ratio:screenRatio,
+      resolution,
+      generate_audio:false,
+      watermark:false,
+    }) });
+    created = await createdResponse.json();
+    if (createdResponse.ok) break;
+    const message = providerError(created, createdResponse.status);
+    const resolutionRejected = /resolution/i.test(message) && resolutionCandidates.indexOf(resolution) < resolutionCandidates.length - 1;
+    if (!resolutionRejected) throw new Error(message);
+  }
   if (!created.id) throw new Error("Video provider returned no task ID");
 
   const deadline = Date.now() + timeoutMs;
@@ -1418,7 +1428,8 @@ export function createRenderServer() {
         const project = await dhProjectStore.get(decodeURIComponent(dhProjectMatch[1]));
         if (!project) { json(res, 404, { error: "Project not found" }); return; }
         const versions = await dhProjectStore.listAudioVersions(project.id);
-        json(res, 200, { ...project, audioVersions: versions }); return;
+        const covers = await dhProjectStore.listCovers(project.id);
+        json(res, 200, { ...project, audioVersions: versions, covers }); return;
       }
       if (req.method === "PUT" && dhProjectMatch) {
         const payload = await body(req, 32 * 1024 * 1024);
@@ -1447,6 +1458,50 @@ export function createRenderServer() {
         const payload = await body(req, 2 * 1024 * 1024);
         const video = await dhProjectStore.updateVideo(decodeURIComponent(dhVideoUpdateMatch[2]), payload);
         json(res, 200, video); return;
+      }
+
+      /* Digital Human Project Covers */
+      const dhProjectCoversMatch = /^\/digital-human\/projects\/([^/]+)\/covers$/.exec(url.pathname);
+      if (req.method === "GET" && dhProjectCoversMatch) {
+        const covers = await dhProjectStore.listCovers(decodeURIComponent(dhProjectCoversMatch[1]));
+        json(res, 200, { covers }); return;
+      }
+      if (req.method === "POST" && dhProjectCoversMatch) {
+        const projectId = decodeURIComponent(dhProjectCoversMatch[1]);
+        const project = await dhProjectStore.get(projectId);
+        if (!project) { json(res, 404, { error: "Project not found" }); return; }
+        const payload = await body(req, 2 * 1024 * 1024);
+        const prompt = String(payload.prompt || "").trim();
+        if (!prompt) throw new Error("A cover prompt is required");
+        const generated = await generateImage({ prompt, screenRatio: payload.screenRatio });
+        const coverId = randomUUID();
+        const cached = await persistGeneratedImage(generated, {
+          directory: dhProjectStore.coversDir(projectId),
+          urlPrefix: `/dh-projects/${encodeURIComponent(projectId)}/covers`,
+          baseName: coverId,
+          screenRatio: payload.screenRatio,
+        });
+        const cover = await dhProjectStore.addCover(projectId, { id: coverId, imagePath: cached.path, prompt });
+        json(res, 201, cover); return;
+      }
+      const dhCoverDeleteMatch = /^\/digital-human\/projects\/([^/]+)\/covers\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "DELETE" && dhCoverDeleteMatch) {
+        await dhProjectStore.deleteCover(
+          decodeURIComponent(dhCoverDeleteMatch[1]),
+          decodeURIComponent(dhCoverDeleteMatch[2])
+        );
+        json(res, 200, { ok: true }); return;
+      }
+
+      /* Serve project cover images */
+      const dhCoverFileMatch = /^\/dh-projects\/([^/]+)\/covers\/([^/]+)$/.exec(url.pathname);
+      if (req.method === "GET" && dhCoverFileMatch) {
+        const projectId = decodeURIComponent(dhCoverFileMatch[1]);
+        const filename = path.basename(decodeURIComponent(dhCoverFileMatch[2]));
+        const coverFile = path.join(dhProjectStore.coversDir(projectId), filename);
+        await readFile(coverFile);
+        res.writeHead(200, cors({ "Content-Type": assetContentType(coverFile), "Content-Disposition": "inline" }));
+        createReadStream(coverFile).pipe(res); return;
       }
 
       /* Serve a specific audio version file */

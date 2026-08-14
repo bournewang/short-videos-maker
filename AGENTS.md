@@ -82,6 +82,7 @@ These modules run in both the browser and the local Node bridge (the bridge impo
 - `timeline.js` — `normalizePlannedShots()` stretches AI-planned shots across narration duration, derives word-timestamp boundaries from transcription data, and fills fallback image/video prompts from episode-level creative direction.
 - `audio.js` — voice presets (`original`, `denoise`) and FFmpeg cleanup filter chains.
 - `video.js` — vertical resolution presets (`480p`, `720p`, `1080p`).
+- `cover.js` — shared cover-art helpers (title positions, prompt suggestion, canvas download with baked-in headline) used by both `StudioApp.tsx` and `app/digital-human/DigitalHumanApp.tsx`. Browser-only (uses canvas/DOM).
 - `project-cache.js` — IndexedDB read/write/clear for the active episode.
 
 ### Local render bridge (`scripts/render-service.mjs`)
@@ -92,7 +93,7 @@ This is a plain Node.js HTTP server listening on `127.0.0.1:4317` by default. It
 - Provider API keys (read from `.env.local` / `.env`).
 - Local speech-to-text transcription endpoints.
 
-The bridge exposes JSON/REST endpoints such as `/episodes`, `/render`, `/image/generate`, `/video/generate`, `/text/plan`, `/text/translate`, `/audio/transcribe`, `/audio/process`, `/config/status`, and `/providers/test`. `scripts/episode-store.mjs` maintains the SQLite catalog, JSON backups, browser-cache migration, and per-episode media layout. Legacy global `/assets/` and `/renders/` paths remain readable for existing projects.
+The bridge exposes JSON/REST endpoints such as `/episodes`, `/render`, `/image/generate`, `/video/generate`, `/text/plan`, `/text/translate`, `/audio/transcribe`, `/audio/process`, `/config/status`, and `/providers/test`. Digital-human projects have their own CRUD under `/digital-human/projects/:id` (audio versions, videos, and generated covers under `/covers`, with files served from `/dh-projects/:id/covers/<file>`). `scripts/episode-store.mjs` maintains the SQLite catalog, JSON backups, browser-cache migration, and per-episode media layout. `scripts/digital-human-project-store.mjs` does the same for digital-human projects (`dh_projects`, `dh_videos`, `dh_audio_versions`, `dh_covers` tables). Legacy global `/assets/` and `/renders/` paths remain readable for existing projects.
 
 ### Cloudflare Worker (`worker/index.ts`)
 

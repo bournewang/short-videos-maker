@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { COVER_TITLE_POSITIONS, coverPromptSuggestion, downloadCoverFile, safeFileStem } from "../lib/cover";
 
 const SERVICE = "http://127.0.0.1:4317";
 
@@ -199,6 +200,16 @@ type DHAudioVersion = {
 
 type StepState = "idle" | "loading" | "done" | "error";
 
+type DHCover = {
+  id: string;
+  projectId: string;
+  imageUrl: string;
+  prompt: string;
+  createdAt: number;
+};
+
+const COVER_RATIO = "9:16";
+
 export default function DigitalHumanApp() {
   const [tab, setTab] = useState<"manage" | "projects">("projects");
   const [humans, setHumans] = useState<DigitalHuman[]>([]);
@@ -265,6 +276,17 @@ export default function DigitalHumanApp() {
   const [fullVideoUrl, setFullVideoUrl] = useState("");
   const [fullError, setFullError] = useState("");
   const fullPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /* Step 4: Cover artwork */
+  const [covers, setCovers] = useState<DHCover[]>([]);
+  const [coverPrompt, setCoverPrompt] = useState("");
+  const [coverHeadline, setCoverHeadline] = useState("");
+  const [coverTitlePosition, setCoverTitlePosition] = useState("bottom-left");
+  const [coverTitleVertical, setCoverTitleVertical] = useState(90);
+  const [coverTitleScale, setCoverTitleScale] = useState(100);
+  const [coverTitleWidth, setCoverTitleWidth] = useState(84);
+  const [coverStep, setCoverStep] = useState<StepState>("idle");
+  const [coverError, setCoverError] = useState("");
 
   /* ---- load digital humans on mount ---- */
   const loadHumans = useCallback(async () => {
@@ -462,16 +484,18 @@ export default function DigitalHumanApp() {
     setAudioVersions([]); setSelectedAudioVersionId("");
     setPreviewStep("idle"); setPreviewTaskId(""); setPreviewStatus(""); setPreviewVideoUrl(""); setPreviewError("");
     setFullStep("idle"); setFullTaskId(""); setFullStatus(""); setFullVideoUrl(""); setFullError("");
+    setCovers([]); setCoverPrompt(""); setCoverHeadline(""); setCoverStep("idle"); setCoverError("");
     if (previewPollRef.current) { clearInterval(previewPollRef.current); previewPollRef.current = null; }
     if (fullPollRef.current) { clearInterval(fullPollRef.current); fullPollRef.current = null; }
   }
 
-  async function loadProjectIntoWorkspace(project: DHProject & { audioVersions?: DHAudioVersion[] }) {
+  async function loadProjectIntoWorkspace(project: DHProject & { audioVersions?: DHAudioVersion[]; covers?: DHCover[] }) {
     resetWorkspace();
     setSelectedProjectId(project.id);
     setProjectName(project.name || "");
     setSelectedHumanId(project.humanId || "");
     setScript(project.script || "");
+    setCovers(Array.isArray(project.covers) ? project.covers : []);
     lastSavedRef.current = JSON.stringify({
       name: project.name || "",
       script: project.script || "",
@@ -867,6 +891,51 @@ export default function DigitalHumanApp() {
       .then((res) => res.json())
       .then((data) => setProjectVideos(data.videos || []))
       .catch(() => {});
+  }
+
+  /* ---- Step 4: Cover artwork ---- */
+  const suggestedCoverPrompt = coverPromptSuggestion(projectName, script, "Talking-head video", "Photorealistic", "");
+
+  async function generateCover() {
+    if (!selectedProjectId) return;
+    const prompt = coverPrompt.trim() || suggestedCoverPrompt;
+    setCoverPrompt(prompt);
+    setCoverStep("loading");
+    setCoverError("");
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/covers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, screenRatio: COVER_RATIO }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Server returned ${res.status}`);
+      setCovers((prev) => [data as DHCover, ...prev]);
+      setCoverStep("done");
+    } catch (err) {
+      setCoverStep("error");
+      setCoverError(err instanceof Error ? `${err.message}. Start the local render service with “npm run render-service”.` : "Cover generation failed");
+    }
+  }
+
+  async function deleteCover(coverId: string) {
+    if (!confirm("Delete this cover?")) return;
+    try {
+      const res = await fetch(`${SERVICE}/digital-human/projects/${encodeURIComponent(selectedProjectId)}/covers/${encodeURIComponent(coverId)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      setCovers((prev) => prev.filter((cover) => cover.id !== coverId));
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Failed to delete cover");
+    }
+  }
+
+  async function downloadCover(cover: DHCover) {
+    try {
+      const headline = coverHeadline.trim() || projectName.trim() || "Watch this story";
+      await downloadCoverFile(cover.imageUrl, `${safeFileStem(projectName)}-cover-9x16.png`, headline, coverTitlePosition, COVER_RATIO, coverTitleScale, coverTitleWidth, coverTitleVertical);
+    } catch (err) {
+      setCoverError(err instanceof Error ? err.message : "Cover download failed");
+    }
   }
 
   const selectedHuman = humans.find((h) => h.id === selectedHumanId);
@@ -1273,6 +1342,41 @@ export default function DigitalHumanApp() {
                     </div>
                   </div>
 
+                  {/* Step 4: Cover artwork */}
+                  <div className="dh-step">
+                    <div className="dh-step-head">
+                      <span className={`dh-step-num${covers.length ? " done" : coverStep === "loading" ? " active" : ""}`}>4</span>
+                      <b>Cover Artwork</b>
+                      <small>Optional</small>
+                      {covers.length > 0 && <small>{covers.length} saved</small>}
+                    </div>
+                    <div className="dh-step-body">
+                      <DHCoverStudio
+                        projectName={projectName}
+                        humanPhoto={selectedHuman?.photo || ""}
+                        covers={covers}
+                        coverPrompt={coverPrompt}
+                        setCoverPrompt={setCoverPrompt}
+                        suggestedCoverPrompt={suggestedCoverPrompt}
+                        coverHeadline={coverHeadline}
+                        setCoverHeadline={setCoverHeadline}
+                        coverTitlePosition={coverTitlePosition}
+                        setCoverTitlePosition={setCoverTitlePosition}
+                        coverTitleVertical={coverTitleVertical}
+                        setCoverTitleVertical={setCoverTitleVertical}
+                        coverTitleScale={coverTitleScale}
+                        setCoverTitleScale={setCoverTitleScale}
+                        coverTitleWidth={coverTitleWidth}
+                        setCoverTitleWidth={setCoverTitleWidth}
+                        coverStep={coverStep}
+                        coverError={coverError}
+                        generateCover={generateCover}
+                        downloadCover={downloadCover}
+                        deleteCover={deleteCover}
+                      />
+                    </div>
+                  </div>
+
                   {/* Video History Strip */}
                   {projectVideos.length > 0 && (
                     <div className="dh-video-strip-section">
@@ -1344,5 +1448,120 @@ export default function DigitalHumanApp() {
         )}
       </div>
     </div>
+  );
+}
+
+type DHCoverStudioProps = {
+  projectName: string;
+  humanPhoto: string;
+  covers: DHCover[];
+  coverPrompt: string;
+  setCoverPrompt: (value: string) => void;
+  suggestedCoverPrompt: string;
+  coverHeadline: string;
+  setCoverHeadline: (value: string) => void;
+  coverTitlePosition: string;
+  setCoverTitlePosition: (value: string) => void;
+  coverTitleVertical: number;
+  setCoverTitleVertical: (value: number) => void;
+  coverTitleScale: number;
+  setCoverTitleScale: (value: number) => void;
+  coverTitleWidth: number;
+  setCoverTitleWidth: (value: number) => void;
+  coverStep: StepState;
+  coverError: string;
+  generateCover: () => void;
+  downloadCover: (cover: DHCover) => Promise<void>;
+  deleteCover: (coverId: string) => Promise<void>;
+};
+
+function DHCoverStudio({ projectName, humanPhoto, covers, coverPrompt, setCoverPrompt, suggestedCoverPrompt, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverStep, coverError, generateCover, downloadCover, deleteCover }: DHCoverStudioProps) {
+  const photoCover: DHCover | undefined = humanPhoto ? { id:"human-photo", projectId:"", imageUrl:humanPhoto, prompt:"", createdAt:0 } : undefined;
+  const currentCover = covers[0] ?? photoCover;
+  const headline = coverHeadline.trim() || projectName.trim() || "Watch this story";
+  const titleWidthPercent = coverTitleWidth / 100;
+  const titleInset = `${((1 - titleWidthPercent) / 2 * 100).toFixed(1)}%`;
+  const busy = coverStep === "loading";
+  return (
+    <section className="cover-studio ratio-9-16">
+      <div className="build-library-head">
+        <div><span className="eyebrow">VIDEO COVER</span><h2>{currentCover ? "Place the cover title" : "Generate cover artwork"}</h2></div>
+        <span>Vertical · {COVER_RATIO}</span>
+      </div>
+      <div className="cover-studio-grid">
+        <div className={`cover-preview ${currentCover ? `has-cover title-${coverTitlePosition}` : ""}`} style={{ aspectRatio:"9 / 16" }}>
+          {currentCover ? (
+            <>
+              <img src={currentCover.imageUrl} alt="Generated video cover" />
+              <div className="cover-preview-shade" style={{ background:`linear-gradient(180deg, transparent ${Math.max(0, coverTitleVertical - 35)}%, rgba(0,0,0,.18) ${Math.max(0, coverTitleVertical - 18)}%, rgba(0,0,0,.76) ${coverTitleVertical}%, rgba(0,0,0,.18) ${Math.min(100, coverTitleVertical + 18)}%, transparent)` }} />
+              <div className="cover-preview-copy" style={{ left:titleInset, right:titleInset, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}><i /><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})` }}>{headline}</strong></div>
+            </>
+          ) : (
+            <div className="empty-visual"><span>✦</span><b>Generate the artwork first</b><small>Then place the title while seeing the real image.</small></div>
+          )}
+        </div>
+        <div className="cover-controls">
+          <p>{covers.length ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : photoCover ? "Using the digital human photo as the background. Choose a headline and position, or generate custom artwork to replace it." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p>
+          <label className="field">
+            <span>Artwork direction</span>
+            <textarea rows={currentCover ? 3 : 5} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)} />
+            <small>The image model creates artwork without unreliable generated lettering.</small>
+          </label>
+          {currentCover && (
+            <div className="cover-title-editor">
+              <label className="field cover-headline-field">
+                <span>Cover headline</span>
+                <input maxLength={90} value={coverHeadline} placeholder={projectName || "Add an attention-grabbing headline"} onChange={(event) => setCoverHeadline(event.target.value)} />
+                <small>Keep it short and specific. The project title is used when this field is empty.</small>
+              </label>
+              <fieldset className="cover-position-field">
+                <legend>Title position</legend>
+                <div>{COVER_TITLE_POSITIONS.map((option) => <button type="button" key={option.id} className={coverTitlePosition === option.id ? "chosen" : ""} title={option.label} aria-label={option.label} aria-pressed={coverTitlePosition === option.id} onClick={() => setCoverTitlePosition(option.id)}><i /></button>)}</div>
+                <small>Choose a clear area that does not cover the main subject.</small>
+              </fieldset>
+              <label className="field cover-title-scale-field">
+                <span>Vertical position</span>
+                <div><input aria-label="Cover title vertical position" type="range" min="2" max="92" step="1" value={coverTitleVertical} onChange={(e) => setCoverTitleVertical(Number(e.target.value))} /><output>{coverTitleVertical}%</output></div>
+                <small>Fine-tune the title distance from the top.</small>
+              </label>
+              <label className="field cover-title-scale-field">
+                <span>Title size</span>
+                <div><input aria-label="Cover title font size scale" type="range" min="50" max="200" step="5" value={coverTitleScale} onChange={(e) => setCoverTitleScale(Number(e.target.value))} /><output>{coverTitleScale}%</output></div>
+                <small>Adjust the title text size independent of position.</small>
+              </label>
+              <label className="field cover-title-width-field">
+                <span>Text width</span>
+                <div><input aria-label="Cover title text width" type="range" min="50" max="95" step="1" value={coverTitleWidth} onChange={(e) => setCoverTitleWidth(Number(e.target.value))} /><output>{coverTitleWidth}%</output></div>
+                <small>Narrower text stays clear of the subject.</small>
+              </label>
+            </div>
+          )}
+          <div className="cover-actions">
+            <button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button>
+            <button type="button" className="primary" onClick={generateCover} disabled={busy}>{busy ? "Generating…" : covers.length ? "Generate another" : "Generate cover"}</button>
+            {currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button>}
+          </div>
+          {coverStep === "error" && <p className="dh-status-error">{coverError}</p>}
+        </div>
+      </div>
+      {covers.length > 0 && (
+        <div className="cover-history">
+          <h3>Saved covers</h3>
+          <div>
+            {covers.map((cover: DHCover) => (
+              <article key={cover.id}>
+                <div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:"9 / 16" }}>
+                  <img src={cover.imageUrl} alt={`Cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`} />
+                  <strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})`, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}>{headline}</strong>
+                </div>
+                <span><b>{COVER_RATIO}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span>
+                <button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button>
+                <button type="button" className="ghost" onClick={() => void deleteCover(cover.id)}>Delete</button>
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
   );
 }

@@ -84,9 +84,18 @@ export class DigitalHumanProjectStore {
         created_at INTEGER NOT NULL,
         FOREIGN KEY (project_id) REFERENCES dh_projects(id) ON DELETE CASCADE
       );
+      CREATE TABLE IF NOT EXISTS dh_covers (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        image_path TEXT NOT NULL DEFAULT '',
+        prompt TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES dh_projects(id) ON DELETE CASCADE
+      );
       CREATE INDEX IF NOT EXISTS dh_projects_updated_at_idx ON dh_projects(updated_at DESC);
       CREATE INDEX IF NOT EXISTS dh_videos_project_id_idx ON dh_videos(project_id);
       CREATE INDEX IF NOT EXISTS dh_audio_versions_project_id_idx ON dh_audio_versions(project_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS dh_covers_project_id_idx ON dh_covers(project_id, created_at DESC);
     `);
     return this;
   }
@@ -102,6 +111,10 @@ export class DigitalHumanProjectStore {
 
   audioDir(id) {
     return path.join(this.projectDir(id), "audio");
+  }
+
+  coversDir(id) {
+    return path.join(this.projectDir(id), "covers");
   }
 
   hydrateProject(row) {
@@ -342,5 +355,55 @@ export class DigitalHumanProjectStore {
       "SELECT * FROM dh_videos WHERE heygen_task_id = ?"
     ).get(heygenTaskId);
     return row ? this.hydrateVideo(row) : null;
+  }
+
+  hydrateCover(row) {
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      imagePath: row.image_path,
+      imageUrl: row.image_path
+        ? `${this.publicBaseUrl}/dh-projects/${encodeURIComponent(row.project_id)}/covers/${encodeURIComponent(path.basename(row.image_path))}`
+        : "",
+      prompt: row.prompt,
+      createdAt: row.created_at,
+    };
+  }
+
+  async listCovers(projectId) {
+    await this.initialize();
+    const rows = this.database.prepare(
+      "SELECT * FROM dh_covers WHERE project_id = ? ORDER BY created_at DESC"
+    ).all(projectId);
+    return rows.map((r) => this.hydrateCover(r));
+  }
+
+  async getCover(projectId, coverId) {
+    await this.initialize();
+    const row = this.database.prepare(
+      "SELECT * FROM dh_covers WHERE id = ? AND project_id = ?"
+    ).get(coverId, projectId);
+    return row ? this.hydrateCover(row) : null;
+  }
+
+  async addCover(projectId, { id, imagePath, prompt }) {
+    await this.initialize();
+    const coverId = id || randomUUID();
+    this.database.prepare(`
+      INSERT INTO dh_covers (id, project_id, image_path, prompt, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(coverId, projectId, imagePath || "", prompt || "", Date.now());
+    return this.getCover(projectId, coverId);
+  }
+
+  async deleteCover(projectId, coverId) {
+    await this.initialize();
+    const cover = this.database.prepare(
+      "SELECT * FROM dh_covers WHERE id = ? AND project_id = ?"
+    ).get(coverId, projectId);
+    if (!cover) return false;
+    try { await rm(cover.image_path, { force: true }); } catch {}
+    this.database.prepare("DELETE FROM dh_covers WHERE id = ?").run(coverId);
+    return true;
   }
 }

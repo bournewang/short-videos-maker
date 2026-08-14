@@ -10,6 +10,7 @@ import { BROADCAST_MODE_STYLE, DEFAULT_HEADLINE_STYLE, DEFAULT_SUBTITLE_STYLE, H
 import { alignBilingualChunks, buildSrt, subtitleFileName } from "./lib/subtitles";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
 import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution, visualCoverage } from "./lib/video";
+import { COVER_TITLE_POSITIONS, coverPromptSuggestion, downloadCoverFile, normalizeCoverTitlePosition } from "./lib/cover";
 
 type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
@@ -64,16 +65,6 @@ const BGM_TRACKS = [
   { id:"paulyudin-history", label:"History Storytelling", artist:"Paul Yudin", path:"/bgm/paulyudin-documentary-history-storytelling-155326.mp3" },
   { id:"solarflex-documentary", label:"Documentary", artist:"Solarflex", path:"/bgm/solarflex-documentary-documentary-music-558248.mp3" },
 ];
-const COVER_TITLE_POSITIONS = [
-  { id:"top-left", label:"Top left" }, { id:"top-center", label:"Top center" }, { id:"top-right", label:"Top right" },
-  { id:"middle-left", label:"Middle left" }, { id:"middle-center", label:"Center" }, { id:"middle-right", label:"Middle right" },
-  { id:"bottom-left", label:"Bottom left" }, { id:"bottom-center", label:"Bottom center" }, { id:"bottom-right", label:"Bottom right" },
-] as const;
-
-function normalizeCoverTitlePosition(value:unknown) {
-  const position = String(value || "");
-  return COVER_TITLE_POSITIONS.some((option) => option.id === position) ? position : "bottom-left";
-}
 
 function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -102,111 +93,8 @@ function downloadSubtitleFile(title:string, shots:Shot[], language:string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function coverPromptSuggestion(title:string, script:string, contentFormat:string, visualStyle:string, creativeDirection:string) {
-  const story = script.trim().replace(/\s+/g, " ").slice(0, 320);
-  return [
-    `High-impact video cover artwork for a ${contentFormat.toLowerCase()} titled “${title.trim() || "Untitled episode"}”.`,
-    `${visualStyle} visual style.`,
-    creativeDirection.trim(),
-    story ? `Visually summarize this story: ${story}` : "",
-    "One unmistakable focal subject, bold cinematic composition, strong contrast, emotional clarity, and a clean title-safe area. Readable at thumbnail size. No text, letters, logos, borders, or watermark.",
-  ].filter(Boolean).join(" ");
-}
-
 function safeFileStem(value:string) {
   return String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9\u4e00-\u9fff]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase() || "shortform-video";
-}
-
-function wrapCoverText(context:CanvasRenderingContext2D, value:string, maxWidth:number) {
-  const text = value.trim().replace(/\s+/g, " ");
-  const spaced = /\s/.test(text);
-  const tokens = spaced ? text.split(/\s+/) : Array.from(text);
-  const separator = spaced ? " " : "";
-  const lines:string[] = [];
-  let line = "";
-  for (const token of tokens) {
-    const candidate = line ? `${line}${separator}${token}` : token;
-    if (!line || context.measureText(candidate).width <= maxWidth) line = candidate;
-    else { lines.push(line); line = token; }
-  }
-  if (line) lines.push(line);
-  return lines;
-}
-
-async function downloadCoverFile(url:string, filename:string, headline:string, titlePosition:string, screenRatio:string, titleScale = 100, titleWidth = 84, titleVertical = 90) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Download failed (${response.status})`);
-  const sourceUrl = URL.createObjectURL(await response.blob());
-  const image = new Image();
-  await new Promise<void>((resolve, reject) => {
-    image.onload = () => resolve();
-    image.onerror = () => reject(new Error("Could not prepare the cover image"));
-    image.src = sourceUrl;
-  });
-  const canvas = document.createElement("canvas");
-  const ratio = normalizeScreenRatio(screenRatio);
-  const dimensions = ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
-  canvas.width = dimensions.width; canvas.height = dimensions.height;
-  const context = canvas.getContext("2d");
-  if (!context) { URL.revokeObjectURL(sourceUrl); throw new Error("Cover text rendering is unavailable"); }
-  const scale = Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
-  const sourceWidth = canvas.width / scale; const sourceHeight = canvas.height / scale;
-  const sourceX = (image.naturalWidth - sourceWidth) / 2; const sourceY = (image.naturalHeight - sourceHeight) / 2;
-  context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
-  const text = headline.trim();
-  if (text) {
-    const width = canvas.width; const height = canvas.height;
-    const horizontal = normalizeCoverTitlePosition(titlePosition).split("-")[1];
-    const v = titleVertical / 100;
-    const gradient = context.createLinearGradient(0, 0, 0, height);
-    gradient.addColorStop(0, "rgba(0,0,0,0)");
-    gradient.addColorStop(Math.max(0, v - .35), "rgba(0,0,0,0)");
-    gradient.addColorStop(Math.max(0, v - .18), "rgba(0,0,0,.18)");
-    gradient.addColorStop(v, "rgba(0,0,0,.76)");
-    gradient.addColorStop(Math.min(1, v + .18), "rgba(0,0,0,.18)");
-    gradient.addColorStop(1, "rgba(0,0,0,0)");
-    context.fillStyle = gradient; context.fillRect(0, 0, width, height);
-    const maxWidth = width * (titleWidth / 100);
-    let fontSize = Math.round(width * .085 * titleScale / 100);
-    let lines:string[] = [];
-    do {
-      context.font = `800 ${fontSize}px Arial, sans-serif`;
-      lines = wrapCoverText(context, text, maxWidth);
-      if (lines.length <= 3) break;
-      fontSize -= Math.max(2, Math.round(width * .004));
-    } while (fontSize > width * .045);
-    lines = lines.slice(0, 3);
-    const lineHeight = fontSize * 1.06;
-    const marginX = (1 - titleWidth / 100) / 2;
-    const x = horizontal === "center" ? width * .5 : horizontal === "right" ? width * (1 - marginX) : width * marginX;
-    const firstBaseline = height * v - lineHeight * (lines.length - 1) * .5 + fontSize * .35;
-    const accentWidth = width * .13;
-    const accentX = horizontal === "center" ? x - accentWidth * .5 : horizontal === "right" ? x - accentWidth : x;
-    const strokeWidth = Math.max(5, fontSize * .12);
-    const textAscent = Math.max(fontSize * .82, context.measureText(lines[0] || text).actualBoundingBoxAscent || 0);
-    const accentHeight = Math.max(6, width * .008);
-    const accentGap = Math.max(8, fontSize * .18);
-    const accentY = Math.max(height * .025, firstBaseline - textAscent - strokeWidth * .5 - accentGap - accentHeight);
-    context.fillStyle = "#d7a552";
-    context.fillRect(accentX, accentY, accentWidth, accentHeight);
-    context.textBaseline = "alphabetic";
-    context.textAlign = horizontal === "center" ? "center" : horizontal === "right" ? "right" : "left";
-    context.lineJoin = "round";
-    context.strokeStyle = "rgba(0,0,0,.82)";
-    context.lineWidth = strokeWidth;
-    context.fillStyle = "#fffdf7";
-    lines.forEach((line, index) => {
-      const y = firstBaseline + index * lineHeight;
-      context.strokeText(line, x, y, maxWidth);
-      context.fillText(line, x, y, maxWidth);
-    });
-  }
-  URL.revokeObjectURL(sourceUrl);
-  const result = await new Promise<Blob>((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Could not create the cover download")), "image/png"));
-  const objectUrl = URL.createObjectURL(result);
-  const link = document.createElement("a");
-  link.href = objectUrl; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
 }
 
 export default function StudioApp() {
@@ -257,6 +145,7 @@ export default function StudioApp() {
   const [coverTitleWidth, setCoverTitleWidth] = useState(84);
   const [coverPrompt, setCoverPrompt] = useState("");
   const [covers, setCovers] = useState<CoverImage[]>([]);
+  const [coverShotId, setCoverShotId] = useState("");
   const [videoBuilds, setVideoBuilds] = useState<VideoBuild[]>([]);
   const [downloadResolution, setDownloadResolution] = useState("1080");
   const [screenRatio, setScreenRatio] = useState("9:16");
@@ -286,7 +175,7 @@ export default function StudioApp() {
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, coverShotId, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
   async function persistProject(snapshot = projectSnapshot()) {
@@ -333,6 +222,7 @@ export default function StudioApp() {
     setCoverTitlePosition(normalizeCoverTitlePosition(parsed.coverTitlePosition)); setCoverTitleVertical(Math.max(2, Math.min(92, Math.round(Number(parsed.coverTitleVertical) || 90)))); setCoverTitleScale(Math.max(50, Math.min(200, Math.round(Number(parsed.coverTitleScale) || 100)))); setCoverTitleWidth(Math.max(50, Math.min(95, Math.round(Number(parsed.coverTitleWidth) || 84))));
     setCoverPrompt(String(parsed.coverPrompt || ""));
     setCovers((Array.isArray(parsed.covers) ? parsed.covers : []).map((cover:CoverImage) => ({ ...cover, url:cover.url || (cover.path.startsWith("/") ? `${SERVICE}${cover.path}` : cover.path) })));
+    setCoverShotId(String(parsed.coverShotId || ""));
     const savedBuilds = Array.isArray(parsed.videoBuilds) ? parsed.videoBuilds : [];
     const legacyUrl = String(parsed.downloadUrl || parsed.previewUrl || "");
     setVideoBuilds(savedBuilds.length ? savedBuilds.map((build:VideoBuild) => ({ ...build, url:build.url || (build.path.startsWith("/") ? `${SERVICE}${build.path}` : build.path) })) : legacyUrl ? [{ id:"legacy-build", path:"", url:legacyUrl, screenRatio:normalizeScreenRatio(parsed.screenRatio), resolution:String(parsed.downloadResolution || "1080"), ...videoResolution(parsed.downloadResolution, parsed.screenRatio), duration:Number(parsed.audioDuration) || 0, createdAt:Number(parsed.savedAt) || 0 }] : []);
@@ -391,7 +281,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, videoBuilds, downloadResolution, screenRatio]);
+  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, coverShotId, videoBuilds, downloadResolution, screenRatio]);
 
   async function refreshProviderStatus() {
     try {
@@ -453,7 +343,7 @@ export default function StudioApp() {
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     const id = createEpisodeId();
-    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
+    const blank = { id, stage:"episode", title:"", script:"", contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], coverShotId:"", videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
     if (!saveBlank) { allowSave.current = false; return; }
@@ -991,7 +881,7 @@ export default function StudioApp() {
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} handleShotImageUpload={handleShotImageUpload} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} previewActive={previewActive} setPreviewActive={setPreviewActive} regenerateOpeningVisual={regenerateOpeningVisual} audioElapsed={audioElapsed} translateAll={translateAll} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} />}
-          {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { touchProject(); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { touchProject(); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { touchProject(); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy} />}
+          {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { touchProject(); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { touchProject(); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { touchProject(); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={(value:string) => { touchProject(); setCoverShotId(value); }} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy} />}
 {stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
 {stage === "prompter" && <PrompterPanel currentEpisodeId={episodeId} />}
         </>}
@@ -1321,16 +1211,21 @@ function ExportPanel({ title, productionMode, shots, approved, duration, audioNa
   </div>{videoBuilds.length > 0 && <section className="build-library"><div className="build-library-head"><div><span className="eyebrow">CREATED VIDEOS</span><h2>All builds</h2></div><span>{videoBuilds.length} saved {videoBuilds.length === 1 ? "video" : "videos"}</span></div><div className="build-library-grid">{videoBuilds.map((item:VideoBuild) => <article className="saved-build" key={item.id}><div className={`saved-build-preview ratio-${item.screenRatio.replace(':','-')}`}><video controls preload="metadata" src={item.url} aria-label={`${item.screenRatio} video built ${item.createdAt ? new Date(item.createdAt).toLocaleString() : ""}`}/></div><div className="saved-build-body"><div className="saved-build-title"><div><span>{item.screenRatio}</span><b>{item.width} × {item.height}</b></div><time>{item.createdAt ? new Date(item.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier build"}</time></div><code title={item.path || item.url}>{item.path || item.url}</code><a className="ghost" href={item.url} download>Download video</a><button className="ghost build-delete" onClick={() => deleteBuild(item.id)} title="Delete this build">Delete</button></div></article>)}</div></section>}</div>;
 }
 
-function CoverPanel({ title, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, screenRatio, busy }: any) {
-  return <div className={`panel cover-panel ratio-${screenRatio.replace(':','-')}`}><div className="section-head"><div><span className="eyebrow">PUBLISHING ASSETS</span><h1>Cover artwork</h1><p>Generate a striking cover image for your episode. Add your headline and position it to avoid the main subject.</p></div></div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={setCoverTitleVertical} coverTitleScale={coverTitleScale} setCoverTitleScale={setCoverTitleScale} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={setCoverTitleWidth} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy}/></div>;
+function CoverPanel({ title, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, generateCover, downloadCover, screenRatio, busy }: any) {
+  return <div className={`panel cover-panel ratio-${screenRatio.replace(':','-')}`}><div className="section-head"><div><span className="eyebrow">PUBLISHING ASSETS</span><h1>Cover artwork</h1><p>Generate a striking cover image for your episode, or pick a storyboard frame as the background. Add your headline and position it to avoid the main subject.</p></div></div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={setCoverTitleVertical} coverTitleScale={coverTitleScale} setCoverTitleScale={setCoverTitleScale} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={setCoverTitleWidth} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={setCoverShotId} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy}/></div>;
 }
 
-function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, generateCover, downloadCover, screenRatio, busy }:any) {
-  const currentCover = covers.find((cover:CoverImage) => cover.screenRatio === screenRatio);
+function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, generateCover, downloadCover, screenRatio, busy }:any) {
+  const generatedCover = covers.find((cover:CoverImage) => cover.screenRatio === screenRatio);
+  const shotBackgrounds = (shots || []).filter((shot:Shot) => shot.image);
+  const backgroundShot = shotBackgrounds.find((shot:Shot) => shot.id === coverShotId);
+  const currentCover = backgroundShot
+    ? { id:`shot-${backgroundShot.id}`, path:"", url:backgroundShot.image, screenRatio, prompt:"", provider:"storyboard", createdAt:0 }
+    : generatedCover;
   const headline = coverHeadline.trim() || defaultHeadline.trim() || "Watch this story";
   const titleWidthPercent = coverTitleWidth / 100;
   const titleInset = `${((1 - titleWidthPercent) / 2 * 100).toFixed(1)}%`;
-  return <section className={`cover-studio ratio-${screenRatio.replace(":","-")}`}><div className="build-library-head"><div><span className="eyebrow">VIDEO COVER</span><h2>{currentCover ? "Place the cover title" : "Generate cover artwork"}</h2></div><span>{SCREEN_RATIOS[screenRatio as keyof typeof SCREEN_RATIOS]?.label || screenRatio} · {screenRatio}</span></div><div className="cover-studio-grid"><div className={`cover-preview ${currentCover ? `has-cover title-${coverTitlePosition}` : ""}`} style={{ aspectRatio:screenRatio.replace(":"," / ") }}>{currentCover ? <><img src={currentCover.url} alt={`Generated ${screenRatio} video cover`}/><div className="cover-preview-shade" style={{ background:`linear-gradient(180deg, transparent ${Math.max(0, coverTitleVertical - 35)}%, rgba(0,0,0,.18) ${Math.max(0, coverTitleVertical - 18)}%, rgba(0,0,0,.76) ${coverTitleVertical}%, rgba(0,0,0,.18) ${Math.min(100, coverTitleVertical + 18)}%, transparent)` }}/><div className="cover-preview-copy" style={{ left:titleInset, right:titleInset, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}><i/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})` }}>{headline}</strong></div></> : <div className="empty-visual"><span>✦</span><b>Generate the artwork first</b><small>Then place the title while seeing the real image.</small></div>}</div><div className="cover-controls"><p>{currentCover ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p><label className="field"><span>Artwork direction</span><textarea rows={currentCover ? 3 : 5} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)}/><small>The image model creates artwork without unreliable generated lettering.</small></label>{currentCover && <div className="cover-title-editor"><label className="field cover-headline-field"><span>Cover headline</span><input maxLength={90} value={coverHeadline} placeholder={defaultHeadline || "Add an attention-grabbing headline"} onChange={(event) => setCoverHeadline(event.target.value)}/><small>Keep it short and specific. The episode title is used when this field is empty.</small></label><fieldset className="cover-position-field"><legend>Title position</legend><div>{COVER_TITLE_POSITIONS.map((option) => <button type="button" key={option.id} className={coverTitlePosition === option.id ? "chosen" : ""} title={option.label} aria-label={option.label} aria-pressed={coverTitlePosition === option.id} onClick={() => setCoverTitlePosition(option.id)}><i/></button>)}</div><small>Choose a clear area that does not cover the main subject.</small></fieldset><label className="field cover-title-scale-field"><span>Vertical position</span><div><input aria-label="Cover title vertical position" type="range" min="2" max="92" step="1" value={coverTitleVertical} onChange={(e) => setCoverTitleVertical(Number(e.target.value))}/><output>{coverTitleVertical}%</output></div><small>Fine-tune the title distance from the top.</small></label><label className="field cover-title-scale-field"><span>Title size</span><div><input aria-label="Cover title font size scale" type="range" min="50" max="200" step="5" value={coverTitleScale} onChange={(e) => setCoverTitleScale(Number(e.target.value))}/><output>{coverTitleScale}%</output></div><small>Adjust the title text size independent of position.</small></label><label className="field cover-title-width-field"><span>Text width</span><div><input aria-label="Cover title text width" type="range" min="50" max="95" step="1" value={coverTitleWidth} onChange={(e) => setCoverTitleWidth(Number(e.target.value))}/><output>{coverTitleWidth}%</output></div><small>Narrower text stays clear of the subject.</small></label></div>}<div className="cover-actions"><button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button><button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button>}</div></div></div>{covers.length > 0 && <div className="cover-history"><h3>Saved covers</h3><div>{covers.map((cover:CoverImage) => <article key={cover.id}><div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:cover.screenRatio.replace(":"," / ") }}><img src={cover.url} alt={`${cover.screenRatio} cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`}/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})`, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}>{headline}</strong></div><span><b>{cover.screenRatio}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span><button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button></article>)}</div></div>}</section>;
+  return <section className={`cover-studio ratio-${screenRatio.replace(":","-")}`}><div className="build-library-head"><div><span className="eyebrow">VIDEO COVER</span><h2>{currentCover ? "Place the cover title" : "Generate cover artwork"}</h2></div><span>{SCREEN_RATIOS[screenRatio as keyof typeof SCREEN_RATIOS]?.label || screenRatio} · {screenRatio}</span></div><div className="cover-studio-grid"><div className={`cover-preview ${currentCover ? `has-cover title-${coverTitlePosition}` : ""}`} style={{ aspectRatio:screenRatio.replace(":"," / ") }}>{currentCover ? <><img src={currentCover.url} alt={`Generated ${screenRatio} video cover`}/><div className="cover-preview-shade" style={{ background:`linear-gradient(180deg, transparent ${Math.max(0, coverTitleVertical - 35)}%, rgba(0,0,0,.18) ${Math.max(0, coverTitleVertical - 18)}%, rgba(0,0,0,.76) ${coverTitleVertical}%, rgba(0,0,0,.18) ${Math.min(100, coverTitleVertical + 18)}%, transparent)` }}/><div className="cover-preview-copy" style={{ left:titleInset, right:titleInset, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}><i/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})` }}>{headline}</strong></div></> : <div className="empty-visual"><span>✦</span><b>Generate the artwork first</b><small>{shotBackgrounds.length ? "Or pick a storyboard frame below as the background." : "Then place the title while seeing the real image."}</small></div>}</div><div className="cover-controls"><p>{currentCover ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p><label className="field"><span>Artwork direction</span><textarea rows={currentCover ? 3 : 5} value={coverPrompt} placeholder={suggestedCoverPrompt} onChange={(event) => setCoverPrompt(event.target.value)}/><small>The image model creates artwork without unreliable generated lettering.</small></label>{currentCover && <div className="cover-title-editor"><label className="field cover-headline-field"><span>Cover headline</span><input maxLength={90} value={coverHeadline} placeholder={defaultHeadline || "Add an attention-grabbing headline"} onChange={(event) => setCoverHeadline(event.target.value)}/><small>Keep it short and specific. The episode title is used when this field is empty.</small></label><fieldset className="cover-position-field"><legend>Title position</legend><div>{COVER_TITLE_POSITIONS.map((option) => <button type="button" key={option.id} className={coverTitlePosition === option.id ? "chosen" : ""} title={option.label} aria-label={option.label} aria-pressed={coverTitlePosition === option.id} onClick={() => setCoverTitlePosition(option.id)}><i/></button>)}</div><small>Choose a clear area that does not cover the main subject.</small></fieldset><label className="field cover-title-scale-field"><span>Vertical position</span><div><input aria-label="Cover title vertical position" type="range" min="2" max="92" step="1" value={coverTitleVertical} onChange={(e) => setCoverTitleVertical(Number(e.target.value))}/><output>{coverTitleVertical}%</output></div><small>Fine-tune the title distance from the top.</small></label><label className="field cover-title-scale-field"><span>Title size</span><div><input aria-label="Cover title font size scale" type="range" min="50" max="200" step="5" value={coverTitleScale} onChange={(e) => setCoverTitleScale(Number(e.target.value))}/><output>{coverTitleScale}%</output></div><small>Adjust the title text size independent of position.</small></label><label className="field cover-title-width-field"><span>Text width</span><div><input aria-label="Cover title text width" type="range" min="50" max="95" step="1" value={coverTitleWidth} onChange={(e) => setCoverTitleWidth(Number(e.target.value))}/><output>{coverTitleWidth}%</output></div><small>Narrower text stays clear of the subject.</small></label></div>}<div className="cover-actions"><button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button><button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button>}</div></div></div>{shotBackgrounds.length > 0 && <div className="cover-shots"><h3>Storyboard frames</h3><p>Use a generated storyboard frame as the cover background{generatedCover ? " instead of the generated artwork" : ""}. Click the selected frame again to switch back.</p><div>{shotBackgrounds.map((shot:Shot, index:number) => <button type="button" key={shot.id} className={coverShotId === shot.id ? "chosen" : ""} style={{ aspectRatio:screenRatio.replace(":"," / ") }} title={`Shot ${index + 1}`} aria-pressed={coverShotId === shot.id} onClick={() => setCoverShotId(coverShotId === shot.id ? "" : shot.id)}><img src={shot.image} alt={`Storyboard shot ${index + 1}`}/></button>)}</div></div>}{covers.length > 0 && <div className="cover-history"><h3>Saved covers</h3><div>{covers.map((cover:CoverImage) => <article key={cover.id}><div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:cover.screenRatio.replace(":"," / ") }}><img src={cover.url} alt={`${cover.screenRatio} cover generated ${cover.createdAt ? new Date(cover.createdAt).toLocaleString() : ""}`}/><strong style={{ fontSize:`calc(8.5cqw * ${coverTitleScale / 100})`, top:`${coverTitleVertical}%`, bottom:"auto", transform:"translateY(-50%)" }}>{headline}</strong></div><span><b>{cover.screenRatio}</b><time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time></span><button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button></article>)}</div></div>}</section>;
 }
 
 const INTRO_SECONDS = 10;

@@ -338,6 +338,22 @@ test("Volcengine video adapter creates and polls an image-to-video task", async 
   assert.equal(result.videoUrl, "https://example.test/generated.mp4"); assert.equal(result.taskId, "cgt-test-123");
 });
 
+test("Volcengine video adapter retries with a lower resolution when the model rejects it", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") {
+      const payload = JSON.parse(options.body);
+      if (payload.resolution === "1080p") return new Response(JSON.stringify({ error:{ message:"the parameter resolution specified in the request is not valid for model doubao-seedance-2-0-fast in i2v" } }), { status:400, headers:{ "Content-Type":"application/json" } });
+      return new Response(JSON.stringify({ id:"fast-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    }
+    return new Response(JSON.stringify({ id:"fast-task", status:"succeeded", content:{ video_url:"https://example.test/fast.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"volcengine", endpoint:"https://ark.example.test", model:"doubao-seedance-2-0-fast", apiKey:"key", image:png, duration:3 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.deepEqual(requests.filter((request) => request.options.method === "POST").map((request) => JSON.parse(request.options.body).resolution), ["1080p", "720p"]);
+  assert.equal(result.videoUrl, "https://example.test/fast.mp4");
+});
+
 test("Volcengine video adapter creates a direct text-to-video long scene without an image", async () => {
   const requests = [];
   const fetchImpl = async (url, options = {}) => {
