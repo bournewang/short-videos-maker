@@ -113,7 +113,7 @@ export function normalizeSubtitleStyle(value = {}) {
     chineseColor:normalizeColor(source.chineseColor, DEFAULT_SUBTITLE_STYLE.chineseColor),
     backgroundColor:normalizeColor(source.backgroundColor, DEFAULT_SUBTITLE_STYLE.backgroundColor),
     backgroundOpacity:Math.round(clamp(source.backgroundOpacity, 0, 100, DEFAULT_SUBTITLE_STYLE.backgroundOpacity)),
-    position:Math.round(clamp(source.position, 3, 60, DEFAULT_SUBTITLE_STYLE.position)),
+    position:Math.round(clamp(source.position, 5, 95, DEFAULT_SUBTITLE_STYLE.position)),
     alignment:["left","center","right"].includes(source.alignment) ? source.alignment : DEFAULT_SUBTITLE_STYLE.alignment,
     bold:typeof source.bold === "boolean" ? source.bold : DEFAULT_SUBTITLE_STYLE.bold,
     outline:Math.round(clamp(source.outline, 0, 5, DEFAULT_SUBTITLE_STYLE.outline) * 10) / 10,
@@ -140,6 +140,13 @@ export function subtitleAssOverrideColor(value) {
 export function applyPreset(presetId) {
   const preset = SUBTITLE_PRESETS.find((p) => p.id === presetId);
   return preset ? normalizeSubtitleStyle(preset.style) : null;
+}
+
+export function hexOpacityCss(hex, opacity) {
+  const r = Number.parseInt(hex.slice(1, 3), 16);
+  const g = Number.parseInt(hex.slice(3, 5), 16);
+  const b = Number.parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r}, ${g}, ${b}, ${clamp(opacity, 0, 100, 65) / 100})`;
 }
 
 export function normalizeBroadcastHeadline(value = {}) {

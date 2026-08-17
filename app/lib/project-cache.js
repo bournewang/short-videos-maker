@@ -79,6 +79,7 @@ export function normalizeCachedProject(value) {
     coverHeadline:String(value.coverHeadline || ""),
     coverTitlePosition:["top-left","top-center","top-right","middle-left","middle-center","middle-right","bottom-left","bottom-center","bottom-right"].includes(value.coverTitlePosition) ? value.coverTitlePosition : "bottom-left",
     coverPrompt:String(value.coverPrompt || ""),
+    chosenCoverUrl:String(value.chosenCoverUrl || ""),
     covers,
     videoBuilds,
     shots,

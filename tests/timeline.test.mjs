@@ -58,7 +58,7 @@ test("mixed mode recommends only about one video for every four shots", () => {
     videoRecommended:[1, 5, 9].includes(index),
   })), 25, { productionMode:"mixed" });
   assert.equal(shots.filter((shot) => shot.videoRecommended).length, 3);
-  assert.deepEqual(shots.map((shot, index) => shot.videoRecommended ? index : -1).filter((index) => index >= 0), [1, 5, 9]);
+  assert.deepEqual(shots.map((shot, index) => shot.videoRecommended ? index : -1).filter((index) => index >= 0), [0, 1, 9]);
 });
 
 test("mixed mode fills missing video recommendations across the episode", () => {
@@ -91,13 +91,28 @@ test("word timestamps place shot changes inside real pauses", () => {
   const shots = normalizePlannedShots([
     { narration:"one two", duration:2 },
     { narration:"three four", duration:2 },
-  ], 8, { transcription:{ duration:8, segments:[{ start:.4, end:7, text:"one two three four", words:[
+    { narration:"five six", duration:2 },
+  ], 14, { transcription:{ duration:14, segments:[{ start:.4, end:12, text:"one two three four five six", words:[
     { start:.4, end:1, word:"one" }, { start:1, end:2, word:"two" },
     { start:5, end:6, word:"three" }, { start:6, end:7, word:"four" },
+    { start:10, end:11, word:"five" }, { start:11, end:12, word:"six" },
   ] }] } });
-  assert.equal(shots[0].end, 3.5);
-  assert.equal(shots[1].start, 3.5);
-  assert.equal(shots[1].end, 8);
+  assert.equal(shots[0].end, 5);
+  assert.equal(shots[1].start, 5);
+  assert.equal(shots[1].end, 8.5);
+  assert.equal(shots[2].start, 8.5);
+  assert.equal(shots[2].end, 14);
+});
+
+test("the opening shot is pinned to about five seconds while the rest share the remaining time", () => {
+  const shots = normalizePlannedShots(Array.from({ length:6 }, (_, index) => ({
+    narration:`Narration section ${index + 1}.`, type:index === 0 ? "Opening" : "Narrative", duration:2.5,
+  })), 50);
+  assert.equal(shots[0].start, 0);
+  assert.equal(shots[0].duration, 5);
+  assert.equal(shots.at(-1).end, 50);
+  assert.equal(shots.reduce((sum, shot) => sum + shot.duration, 0), 50);
+  assert.ok(shots.slice(1).every((shot) => shot.duration >= 5));
 });
 
 test("the storyboard script section follows the selected shot time range", () => {

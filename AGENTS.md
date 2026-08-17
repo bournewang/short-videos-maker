@@ -79,7 +79,7 @@ State is persisted through `app/lib/project-cache.js` using browser IndexedDB. T
 These modules run in both the browser and the local Node bridge (the bridge imports `../app/lib/*.js` from `scripts/render-service.mjs`). Keep them free of browser-only or Node-only APIs unless guarded.
 
 - `concurrency.js` — bounded parallel worker pool (`mapWithConcurrency`) and slot check (`canStartConcurrentJob`).
-- `timeline.js` — `normalizePlannedShots()` stretches AI-planned shots across narration duration, derives word-timestamp boundaries from transcription data, and fills fallback image/video prompts from episode-level creative direction.
+- `timeline.js` — `normalizePlannedShots()` stretches AI-planned shots across narration duration, derives word-timestamp boundaries from transcription data, and fills fallback image/video prompts from episode-level creative direction. The opening shot is pinned to about `OPENING_HOOK_DURATION` (5s) so the hook stays short and cheap to animate; the remaining shots share the rest of the narration with the existing proportional/word-timestamp logic. In `mixed` mode the opening shot is always selected for video generation.
 - `audio.js` — voice presets (`original`, `denoise`) and FFmpeg cleanup filter chains.
 - `video.js` — vertical resolution presets (`480p`, `720p`, `1080p`).
 - `cover.js` — shared cover-art helpers (title positions, prompt suggestion, canvas download with baked-in headline) used by both `StudioApp.tsx` and `app/digital-human/DigitalHumanApp.tsx`. Browser-only (uses canvas/DOM).

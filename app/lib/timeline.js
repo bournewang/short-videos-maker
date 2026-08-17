@@ -12,6 +12,9 @@ const allowedTypes = new Set(["Opening", "Narrative", "Climax", "Map", "Timeline
 const historicalFormat = /\b(?:history|historical)\b/i;
 const historicalAccuracy = "Match the exact historical era in the narration: use a period-accurate background, architecture, clothing, objects, and technology; no anachronisms or mixed eras.";
 
+// The opening hook is pinned to about five seconds: long enough to land, short enough to keep animation cheap.
+export const OPENING_HOOK_DURATION = 5;
+
 export const SHOT_MOTIONS = ["Slow push-in", "Slow pull-out", "Slow drift", "Slow rise", "Slow sink", "Diagonal drift", "Push to subject", "Static"];
 const motionRotation = ["Slow push-in", "Slow drift", "Slow pull-out", "Slow rise", "Slow sink", "Diagonal drift"];
 
@@ -79,7 +82,8 @@ function timestampBoundaries(shots, transcription, target, options = {}) {
   for (let index = 1; index < shots.length; index += 1) {
     consumed += counts[index - 1];
     const wordIndex = Math.max(1, Math.min(words.length - 1, Math.round(words.length * consumed / total)));
-    const candidate = (words[wordIndex - 1].end + words[wordIndex].start) / 2;
+    const pinnedOpening = index === 1 ? Number(options.firstShotDuration) || 0 : 0;
+    const candidate = pinnedOpening > 0 ? pinnedOpening : (words[wordIndex - 1].end + words[wordIndex].start) / 2;
     const remainingShots = shots.length - index;
     const minimumDuration = Math.max(.6, Number(options.minimumDuration) || .6);
     const maximumDuration = Math.max(minimumDuration, Number(options.maximumDuration) || target);
@@ -94,12 +98,14 @@ function timestampBoundaries(shots, transcription, target, options = {}) {
 function mixedVideoIndexes(shots) {
   const limit = Math.min(shots.length, Math.max(1, Math.ceil(shots.length / 4)));
   const requested = shots.map((shot, index) => shot.videoRecommended ? index : -1).filter((index) => index >= 0);
+  if (!requested.includes(0)) requested.unshift(0);
   const evenlySample = (values, count) => count === 1
     ? [values[Math.floor(values.length / 2)]]
     : Array.from({ length:count }, (_, index) => values[Math.round(index * (values.length - 1) / (count - 1))]);
-  if (requested.length >= limit) return new Set(evenlySample(requested, limit));
+  if (requested.length >= limit) return new Set([0, ...evenlySample(requested.filter((index) => index !== 0), limit - 1)]);
   const selected = new Set(requested);
-  const anchors = limit === 1 ? [0] : Array.from({ length:limit }, (_, index) => Math.round(index * (shots.length - 1) / (limit - 1)));
+  const slots = limit - selected.size;
+  const anchors = slots <= 1 ? [shots.length - 1] : Array.from({ length:slots }, (_, index) => 1 + Math.round(index * (shots.length - 2) / (slots - 1)));
   for (const anchor of anchors) {
     if (selected.size >= limit) break;
     const candidate = shots.map((shot, index) => ({
@@ -151,7 +157,9 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   const target = Math.max(Number(audioDuration) || transcriptionDuration || rawTotal, source.length * .6);
   if (longScenes && target > source.length * 12 + .01) throw new Error("The planning provider returned too few long scenes to stay within the 12-second video limit");
   const longMinimumDuration = longScenes && target >= source.length * 6 ? 6 : .6;
-  const boundaries = timestampBoundaries(source, options.transcription, target, longScenes ? { minimumDuration:longMinimumDuration, maximumDuration:12 } : {});
+  const openingDuration = !longScenes && source.length > 1 ? Math.min(OPENING_HOOK_DURATION, target - (source.length - 1) * .6) : 0;
+  const pinnedOpening = openingDuration >= 3 ? Number(openingDuration.toFixed(2)) : 0;
+  const boundaries = timestampBoundaries(source, options.transcription, target, longScenes ? { minimumDuration:longMinimumDuration, maximumDuration:12 } : { firstShotDuration:pinnedOpening });
   if (boundaries) return source.map((shot, index) => {
     const start = Number(boundaries[index].toFixed(2));
     const end = Number(boundaries[index + 1].toFixed(2));
@@ -159,6 +167,11 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   });
   const remaining = target - source.length * .6;
   let allocated = source.map((shot) => .6 + remaining * (shot.duration / rawTotal));
+  if (pinnedOpening) {
+    const restRaw = rawTotal - source[0].duration;
+    const restRemaining = target - pinnedOpening - (source.length - 1) * .6;
+    allocated = [pinnedOpening, ...source.slice(1).map((shot) => .6 + restRemaining * (shot.duration / restRaw))];
+  }
   if (longScenes && allocated.some((duration) => duration < longMinimumDuration || duration > 12)) allocated = source.map(() => target / source.length);
   let cursor = 0;
   return source.map((shot, index) => {

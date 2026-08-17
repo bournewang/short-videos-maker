@@ -1,8 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
 import { alignBilingualChunks } from "../lib/subtitles";
 import { listProjectCaches, readProjectCache } from "../lib/project-cache";
+import { hexOpacityCss, normalizeHeadlineStyle, normalizeSubtitleStyle } from "../lib/subtitle-style";
+import { HeadlineEditor } from "../components/HeadlineEditor";
+import type { HeadlineStyle } from "../components/HeadlineEditor";
+import { SubtitleStyleEditor } from "../components/SubtitleStyleEditor";
+import type { SubtitleStyle } from "../components/SubtitleStyleEditor";
+import { readStyleCache, writeStyleCache } from "../lib/style-cache";
 
 type TimedChunk = {
   english: string;
@@ -19,10 +26,16 @@ type EpisodeSummary = {
   duration: number;
 };
 
+type CachedCover = {
+  url?: string;
+  screenRatio?: string;
+};
+
 export default function PrompterPage() {
   const [episodeId, setEpisodeId] = useState("");
   const [title, setTitle] = useState("");
   const [audioSrc, setAudioSrc] = useState("");
+  const [bgImage, setBgImage] = useState("");
   const [chunks, setChunks] = useState<TimedChunk[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -38,23 +51,66 @@ export default function PrompterPage() {
   const [duration, setDuration] = useState(0);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [muted, setMuted] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+
+  /* subtitle style */
+  const [subtitleStyle, setSubtitleStyleRaw] = useState<SubtitleStyle>(() => normalizeSubtitleStyle({}));
+  const [broadcastMode, setBroadcastMode] = useState(false);
+  const [preBroadcastStyle, setPreBroadcastStyle] = useState<SubtitleStyle | null>(null);
+  function changeSubtitleStyle(patch: Partial<SubtitleStyle>) {
+    setSubtitleStyleRaw((prev) => {
+      const next = normalizeSubtitleStyle({ ...prev, ...patch });
+      writeStyleCache(episodeId, { subtitleStyle: next, headlineStyle, headlinePosition, broadcastMode });
+      return next;
+    });
+  }
 
   /* headline */
   const [headlineText, setHeadlineText] = useState("");
-  const [headlineFontScale, setHeadlineFontScale] = useState(100);
-  const [headlineTextColor, setHeadlineTextColor] = useState("#ffffff");
-  const [headlineBgColor, setHeadlineBgColor] = useState("#000000");
-  const [headlineBgOpacity, setHeadlineBgOpacity] = useState(65);
+  const [headlineStyle, setHeadlineStyleRaw] = useState<HeadlineStyle>(() => normalizeHeadlineStyle({ bgOpacity: 65 }));
   const [headlinePosition, setHeadlinePosition] = useState(8);
+  function changeHeadlinePosition(value: number) {
+    setHeadlinePosition(value);
+    writeStyleCache(episodeId, { subtitleStyle, headlineStyle, headlinePosition: value, broadcastMode });
+  }
+  function changeHeadlineStyle(patch: Partial<HeadlineStyle>) {
+    setHeadlineStyleRaw((prev) => {
+      const next = normalizeHeadlineStyle({ ...prev, ...patch });
+      writeStyleCache(episodeId, { subtitleStyle, headlineStyle: next, headlinePosition, broadcastMode });
+      return next;
+    });
+  }
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const scrollTrackRef = useRef<HTMLDivElement | null>(null);
+  const [optionsHydrated, setOptionsHydrated] = useState(false);
+
+  useEffect(() => {
+    if (!episodeId) return;
+    const cached = readStyleCache(episodeId);
+    queueMicrotask(() => {
+      if (cached?.subtitleStyle) setSubtitleStyleRaw(normalizeSubtitleStyle(cached.subtitleStyle));
+      if (cached?.headlineStyle) setHeadlineStyleRaw(normalizeHeadlineStyle(cached.headlineStyle));
+      if (Number.isFinite(Number(cached?.headlinePosition))) setHeadlinePosition(Number(cached.headlinePosition));
+      if (Number.isFinite(Number(cached?.visibleCount))) setVisibleCount(Math.max(1, Math.min(12, Number(cached.visibleCount))));
+      if (Number.isFinite(Number(cached?.fontScale))) setFontScale(Math.max(60, Math.min(300, Number(cached.fontScale))));
+      if (Number.isFinite(Number(cached?.playbackRate))) setPlaybackRate(Number(cached.playbackRate));
+      if (typeof cached?.muted === "boolean") setMuted(cached.muted);
+      if (typeof cached?.broadcastMode === "boolean") setBroadcastMode(cached.broadcastMode);
+      if (typeof cached?.headlineText === "string") setHeadlineText(cached.headlineText);
+      setOptionsHydrated(true);
+    });
+  }, [episodeId]);
+
+  useEffect(() => {
+    if (!optionsHydrated || !episodeId) return;
+    writeStyleCache(episodeId, { subtitleStyle, headlineStyle, headlinePosition, visibleCount, fontScale, playbackRate, muted, broadcastMode, headlineText });
+  }, [optionsHydrated, episodeId, subtitleStyle, headlineStyle, headlinePosition, visibleCount, fontScale, playbackRate, muted, broadcastMode, headlineText]);
 
   /* ---- load episode list on mount ---- */
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const idFromUrl = params.get("episode") || "";
-    listProjectCaches().then((list) => {
+    listProjectCaches().then((list: EpisodeSummary[]) => {
       setEpisodes(list);
       setEpisodesLoaded(true);
       if (idFromUrl && list.some((e) => e.id === idFromUrl)) {
@@ -70,6 +126,7 @@ export default function PrompterPage() {
     if (!episodeId) {
       setChunks([]);
       setAudioSrc("");
+      setBgImage("");
       setTitle("");
       setCurrentChunkIndex(-1);
       setScrollOffset(0);
@@ -83,7 +140,19 @@ export default function PrompterPage() {
     readProjectCache(episodeId)
       .then((data) => {
         if (!data) { setError("Episode not found."); setLoading(false); return; }
+        const cachedStyles = readStyleCache(episodeId);
+        if (cachedStyles?.subtitleStyle) setSubtitleStyleRaw(normalizeSubtitleStyle(cachedStyles.subtitleStyle));
+        else if (data.subtitleStyle) setSubtitleStyleRaw(normalizeSubtitleStyle(data.subtitleStyle));
+        if (cachedStyles?.headlineStyle) setHeadlineStyleRaw(normalizeHeadlineStyle(cachedStyles.headlineStyle));
+        else if (data.headlineStyle) setHeadlineStyleRaw(normalizeHeadlineStyle(data.headlineStyle));
+        if (Number.isFinite(Number(cachedStyles?.headlinePosition))) setHeadlinePosition(Number(cachedStyles.headlinePosition));
+        else if (Number.isFinite(Number(data.headlinePosition))) setHeadlinePosition(Number(data.headlinePosition));
         const shots = Array.isArray(data.shots) ? data.shots : [];
+        const covers: CachedCover[] = Array.isArray(data.covers) ? data.covers : [];
+        const coverUrl = covers.find((c) => c?.screenRatio === "9:16" && c?.url)?.url
+          || covers.find((c) => c?.url)?.url
+          || "";
+        setBgImage(String(data.chosenCoverUrl || coverUrl || shots[0]?.image || ""));
         setTitle(String(data.title || "Untitled"));
         setAudioSrc(String(data.audioData || ""));
 
@@ -161,13 +230,14 @@ export default function PrompterPage() {
     setCurrentChunkIndex(idx >= 0 ? idx : currentTime >= (chunks[chunks.length - 1]?.endTime || 0) ? chunks.length - 1 : 0);
   }, [currentTime, chunks]);
 
-  /* ---- auto-scroll: keep current chunk near middle of window ---- */
+  /* ---- auto-scroll: keep current chunk near middle of window (only while playing,
+     so manual scrollbar / wheel navigation is not overridden when paused) ---- */
   useEffect(() => {
-    if (currentChunkIndex < 0) return;
+    if (!isPlaying || currentChunkIndex < 0) return;
     const targetOffset = Math.max(0, currentChunkIndex - Math.floor(visibleCount / 2));
     const maxOffset = Math.max(0, chunks.length - visibleCount);
     setScrollOffset(Math.min(targetOffset, maxOffset));
-  }, [currentChunkIndex, visibleCount, chunks.length]);
+  }, [isPlaying, currentChunkIndex, visibleCount, chunks.length]);
 
   /* ---- keyboard shortcuts ---- */
   const togglePlayRef = useRef(togglePlay);
@@ -208,15 +278,50 @@ export default function PrompterPage() {
     window.history.replaceState({}, "", url.toString());
   }
 
+  /* ---- manual scrolling (scrollbar + mouse wheel) ---- */
+  function scrollWindowTo(clientY: number) {
+    const track = scrollTrackRef.current;
+    if (!track || chunks.length <= visibleCount) return;
+    const rect = track.getBoundingClientRect();
+    const thumbRatio = visibleCount / chunks.length;
+    const usable = rect.height * (1 - thumbRatio);
+    if (usable <= 0) return;
+    const y = Math.min(Math.max(clientY - rect.top - (rect.height * thumbRatio) / 2, 0), usable);
+    const maxOffset = chunks.length - visibleCount;
+    setScrollOffset(Math.round((y / usable) * maxOffset));
+  }
+
+  function onScrollbarPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    scrollWindowTo(e.clientY);
+  }
+
+  function onScrollbarPointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) scrollWindowTo(e.clientY);
+  }
+
+  function onChunksWheel(e: ReactWheelEvent<HTMLDivElement>) {
+    if (chunks.length <= visibleCount) return;
+    const maxOffset = chunks.length - visibleCount;
+    const delta = e.deltaY > 0 ? 1 : -1;
+    setScrollOffset((prev) => Math.min(Math.max(prev + delta, 0), maxOffset));
+  }
+
   function formatTime(seconds: number) {
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
   }
 
-  const visibleChunks = chunks.slice(scrollOffset, scrollOffset + visibleCount);
+  const maxScrollOffset = Math.max(0, chunks.length - visibleCount);
+  const clampedScrollOffset = Math.min(Math.max(scrollOffset, 0), maxScrollOffset);
+  const visibleChunks = chunks.slice(clampedScrollOffset, clampedScrollOffset + visibleCount);
   const hasAudio = Boolean(audioSrc);
   const totalDuration = chunks.length > 0 ? chunks[chunks.length - 1].endTime : 0;
+  const thumbHeightPct = chunks.length > 0 ? Math.min(100, (visibleCount / chunks.length) * 100) : 100;
+  const thumbTopPct = maxScrollOffset > 0
+    ? (clampedScrollOffset / maxScrollOffset) * (100 - thumbHeightPct)
+    : 0;
 
   return (
     <div className="prompter-shell">
@@ -241,90 +346,14 @@ export default function PrompterPage() {
               ))}
             </select>
           )}
-          <button
-            className="prompter-settings-btn"
-            onClick={() => setShowSettings(!showSettings)}
-            title="Settings"
-          >
-            ⚙
-          </button>
         </div>
       </div>
 
-      {/* settings panel */}
-      {showSettings && (
-        <div className="prompter-settings">
-          <label className="prompter-setting">
-            <span>Visible lines</span>
-            <div className="prompter-stepper">
-              <button onClick={() => setVisibleCount(Math.max(1, visibleCount - 1))}>−</button>
-              <output>{visibleCount}</output>
-              <button onClick={() => setVisibleCount(Math.min(8, visibleCount + 1))}>+</button>
-            </div>
-          </label>
-          <label className="prompter-setting">
-            <span>Text size</span>
-            <div className="prompter-stepper">
-              <button onClick={() => setFontScale(Math.max(60, fontScale - 10))}>−</button>
-              <output>{fontScale}%</output>
-              <button onClick={() => setFontScale(Math.min(300, fontScale + 10))}>+</button>
-            </div>
-          </label>
-          <label className="prompter-setting">
-            <span>Speed</span>
-            <select value={playbackRate} onChange={(e) => setPlaybackRate(Number(e.target.value))}>
-              <option value={0.5}>0.5x</option>
-              <option value={0.75}>0.75x</option>
-              <option value={0.8}>0.8x</option>
-              <option value={0.85}>0.85x</option>
-              <option value={0.9}>0.9x</option>
-              <option value={1}>1x</option>
-              <option value={1.25}>1.25x</option>
-              <option value={1.5}>1.5x</option>
-              <option value={2}>2x</option>
-            </select>
-          </label>
-          <div className="prompter-settings-divider" />
-          <label className="prompter-setting prompter-headline-text">
-            <span>Headline</span>
-            <input type="text" value={headlineText} onChange={(e) => setHeadlineText(e.target.value)} placeholder="Broadcast headline…" />
-          </label>
-          <label className="prompter-setting">
-            <span>HL size</span>
-            <div className="prompter-stepper">
-              <button onClick={() => setHeadlineFontScale(Math.max(60, headlineFontScale - 10))}>−</button>
-              <output>{headlineFontScale}%</output>
-              <button onClick={() => setHeadlineFontScale(Math.min(300, headlineFontScale + 10))}>+</button>
-            </div>
-          </label>
-          <label className="prompter-setting">
-            <span>HL position</span>
-            <div className="prompter-stepper">
-              <button onClick={() => setHeadlinePosition(Math.max(0, headlinePosition - 2))}>−</button>
-              <output>{headlinePosition}%</output>
-              <button onClick={() => setHeadlinePosition(Math.min(40, headlinePosition + 2))}>+</button>
-            </div>
-          </label>
-          <label className="prompter-setting">
-            <span>HL text</span>
-            <input type="color" value={headlineTextColor} onChange={(e) => setHeadlineTextColor(e.target.value)} />
-          </label>
-          <label className="prompter-setting">
-            <span>HL bg</span>
-            <input type="color" value={headlineBgColor} onChange={(e) => setHeadlineBgColor(e.target.value)} />
-          </label>
-          <label className="prompter-setting">
-            <span>HL bg α</span>
-            <div className="prompter-stepper">
-              <button onClick={() => setHeadlineBgOpacity(Math.max(0, headlineBgOpacity - 10))}>−</button>
-              <output>{headlineBgOpacity}%</output>
-              <button onClick={() => setHeadlineBgOpacity(Math.min(100, headlineBgOpacity + 10))}>+</button>
-            </div>
-          </label>
-        </div>
-      )}
+      {/* two-column workspace */}
+      <div className="prompter-workspace">
 
       {/* main area */}
+      <div className="prompter-main">
       <div className="prompter-body">
         {loading && (
           <div className="prompter-message">
@@ -361,28 +390,29 @@ export default function PrompterPage() {
         {!loading && !error && chunks.length > 0 && (
           <div className="prompter-phone-frame">
             <div className="prompter-phone-canvas">
+              {bgImage && <img className="prompter-bg" src={bgImage} alt="" />}
               {headlineText.trim() && (
                 <div className="prompter-headline" style={{
                   top: `${headlinePosition}%`,
-                  background: `rgba(${Number.parseInt(headlineBgColor.slice(1, 3), 16)}, ${Number.parseInt(headlineBgColor.slice(3, 5), 16)}, ${Number.parseInt(headlineBgColor.slice(5, 7), 16)}, ${headlineBgOpacity / 100})`,
+                  background: hexOpacityCss(headlineStyle.bgColor, headlineStyle.bgOpacity),
                 }}>
                   <span style={{
-                    color: headlineTextColor,
-                    fontSize: `${headlineFontScale * 0.032}cqh`,
+                    color: headlineStyle.textColor,
+                    fontSize: `${headlineStyle.fontScale * 0.032}cqh`,
                     fontWeight: 700,
                     textShadow: "0 2px 0 #000, 0 -2px 0 #000, 2px 0 0 #000, -2px 0 0 #000",
                   }}>{headlineText}</span>
                 </div>
               )}
-              <div className="prompter-chunk-list">
+              <div className="prompter-scroll" onWheel={onChunksWheel}>
+                <div className="prompter-chunk-list">
                 {visibleChunks.map((chunk, i) => {
-                  const globalIndex = scrollOffset + i;
+                  const globalIndex = clampedScrollOffset + i;
                   const isActive = globalIndex === currentChunkIndex;
-                  const isPast = globalIndex < currentChunkIndex;
                   return (
                     <div
                       key={globalIndex}
-                      className={`prompter-chunk${isActive ? " active" : ""}${isPast ? " past" : ""}`}
+                      className={`prompter-chunk${isActive ? " active" : ""}`}
                       onClick={() => seekToChunk(globalIndex)}
                       role="button"
                       tabIndex={0}
@@ -410,10 +440,29 @@ export default function PrompterPage() {
                     </div>
                   );
                 })}
-                {scrollOffset + visibleCount >= chunks.length && (
+                {clampedScrollOffset + visibleCount >= chunks.length && (
                   <div className="prompter-end">— End of script —</div>
                 )}
+                </div>
               </div>
+              {chunks.length > visibleCount && (
+                <div
+                  ref={scrollTrackRef}
+                  className="prompter-scrollbar"
+                  onPointerDown={onScrollbarPointerDown}
+                  onPointerMove={onScrollbarPointerMove}
+                  role="scrollbar"
+                  aria-orientation="vertical"
+                  aria-valuenow={clampedScrollOffset + 1}
+                  aria-valuemin={1}
+                  aria-valuemax={maxScrollOffset + 1}
+                >
+                  <div
+                    className="prompter-scrollbar-thumb"
+                    style={{ top: `${thumbTopPct}%`, height: `${thumbHeightPct}%` }}
+                  />
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -450,6 +499,70 @@ export default function PrompterPage() {
           <span className="prompter-hint">Space to play/pause · Click a line to jump</span>
         </div>
       )}
+      </div>{/* end prompter-main */}
+
+      {/* right sidebar */}
+      <aside className="prompter-sidebar">
+        <div className="prompter-settings">
+          <label className="prompter-setting">
+            <span>Sentences at a time</span>
+            <div className="prompter-stepper">
+              <button onClick={() => setVisibleCount(Math.max(1, visibleCount - 1))}>−</button>
+              <output>{visibleCount}</output>
+              <button onClick={() => setVisibleCount(Math.min(12, visibleCount + 1))}>+</button>
+            </div>
+          </label>
+          <label className="prompter-setting">
+            <span>Text size</span>
+            <div className="prompter-stepper">
+              <button onClick={() => setFontScale(Math.max(60, fontScale - 10))}>−</button>
+              <output>{fontScale}%</output>
+              <button onClick={() => setFontScale(Math.min(300, fontScale + 10))}>+</button>
+            </div>
+          </label>
+          <label className="prompter-setting">
+            <span>Speed</span>
+            <select value={playbackRate} onChange={(e) => setPlaybackRate(Number(e.target.value))}>
+              <option value={0.5}>0.5x</option>
+              <option value={0.75}>0.75x</option>
+              <option value={0.8}>0.8x</option>
+              <option value={0.85}>0.85x</option>
+              <option value={0.9}>0.9x</option>
+              <option value={1}>1x</option>
+              <option value={1.25}>1.25x</option>
+              <option value={1.5}>1.5x</option>
+              <option value={2}>2x</option>
+            </select>
+          </label>
+        </div>
+        <div className="prompter-settings-divider" />
+        <HeadlineEditor
+          variant="prompter"
+          headlineText={headlineText}
+          setHeadlineText={setHeadlineText}
+          headlinePosition={headlinePosition}
+          setHeadlinePosition={changeHeadlinePosition}
+          headlineStyle={headlineStyle}
+          setHeadlineStyle={changeHeadlineStyle}
+        />
+        <div className="prompter-settings-divider" />
+        <SubtitleStyleEditor
+          subtitleStyle={subtitleStyle}
+          setSubtitleStyle={changeSubtitleStyle}
+          broadcastMode={broadcastMode}
+          setBroadcastMode={setBroadcastMode}
+          headlineText={headlineText}
+          setHeadlineText={setHeadlineText}
+          headlinePosition={headlinePosition}
+          setHeadlinePosition={setHeadlinePosition}
+          preBroadcastStyle={preBroadcastStyle}
+          setPreBroadcastStyle={setPreBroadcastStyle}
+          hideBroadcastToggle
+          hideHeadlineRow
+        />
+      </aside>
+
+      </div>{/* end prompter-workspace */}
 
       {audioSrc && (
         <audio
