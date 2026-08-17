@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { buildSubtitleAss, completeText, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -77,6 +77,20 @@ test("subtitle ASS uses the editable episode style", () => {
   assert.match(ass, /Dialogue: 0,0:00:00\.00,0:00:01\.25,Box,,0,0,0,,\{\\an7\\pos\(70,1185\)\\p1\}m 0 0 l 940 0 l 940 300 l 0 300\{\\p0\}/);
   assert.match(ass, /English （line）\\N\{\\c&HEFCDAB&\}中文/);
   assert.doesNotMatch(buildSubtitleAss([{ start:0, end:1, narration:"No box" }], 1080, 1920, { backgroundOpacity:0 }), /,Box,,/);
+});
+
+test("documentary script generation asks for a climax-first video hook", async () => {
+  let request;
+  const fetchImpl = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ title:"The Fall of a City", script:"The gates break at dawn. What happened next changed the kingdom." }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateDocumentaryScript({ endpoint:"https://openai.example.test/chat/completions", model:"test-model", apiKey:"test-key", topic:"The fall of Constantinople", duration:3 }, { fetchImpl });
+  const system = request.messages[0].content;
+  assert.match(system, /first two spoken sentences as a cold open for a video hook/);
+  assert.match(system, /Sentence 1 must begin inside the story's most vivid, verified climax/);
+  assert.match(system, /one arresting 5-second opening video clip/);
+  assert.deepEqual(result, { title:"The Fall of a City", script:"The gates break at dawn. What happened next changed the kingdom." });
 });
 
 test("local renderer produces a playable vertical MP4", { timeout: 120000 }, async () => {
