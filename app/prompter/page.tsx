@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, WheelEvent as ReactWheelEvent } from "react";
-import { alignBilingualChunks } from "../lib/subtitles";
+import { buildTimedChunks, activeTimedChunkIndex } from "../lib/timing";
 import { listProjectCaches, readProjectCache } from "../lib/project-cache";
 import { hexOpacityCss, normalizeHeadlineStyle, normalizeSubtitleStyle } from "../lib/subtitle-style";
 import { HeadlineEditor } from "../components/HeadlineEditor";
@@ -156,39 +156,7 @@ export default function PrompterPage() {
         setTitle(String(data.title || "Untitled"));
         setAudioSrc(String(data.audioData || ""));
 
-        const timed: TimedChunk[] = [];
-        for (const shot of shots) {
-          const start = Math.max(0, Number(shot.start) || 0);
-          const shotDuration = Math.max(0.6, Number(shot.duration) || 2);
-          const end = Number.isFinite(Number(shot.end)) && Number(shot.end) > start
-            ? Number(shot.end) : start + shotDuration;
-          const realDuration = end - start;
-
-          const aligned = alignBilingualChunks(
-            String(shot.narration || ""),
-            String(shot.chinese || "")
-          );
-          if (aligned.length === 0) continue;
-
-          const weights = aligned.map((c) =>
-            Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length)
-          );
-          const totalWeight = weights.reduce((s, w) => s + w, 0);
-
-          let cueStart = start;
-          for (let i = 0; i < aligned.length; i++) {
-            const cueDuration = Math.max(0.5, realDuration * weights[i] / totalWeight);
-            const cueEnd = i === aligned.length - 1 ? end : Math.min(end, cueStart + cueDuration);
-            timed.push({
-              english: aligned[i].english,
-              chinese: aligned[i].chinese,
-              startTime: cueStart,
-              endTime: cueEnd,
-            });
-            cueStart = cueEnd;
-          }
-        }
-        setChunks(timed);
+        setChunks(buildTimedChunks(shots, data.transcription ?? null));
         setCurrentChunkIndex(-1);
         setScrollOffset(0);
         setCurrentTime(0);
@@ -223,11 +191,7 @@ export default function PrompterPage() {
 
   /* ---- find current chunk from audio time ---- */
   useEffect(() => {
-    if (chunks.length === 0) { setCurrentChunkIndex(-1); return; }
-    const idx = chunks.findIndex(
-      (c) => currentTime >= c.startTime && currentTime < c.endTime
-    );
-    setCurrentChunkIndex(idx >= 0 ? idx : currentTime >= (chunks[chunks.length - 1]?.endTime || 0) ? chunks.length - 1 : 0);
+    setCurrentChunkIndex(activeTimedChunkIndex(chunks, currentTime));
   }, [currentTime, chunks]);
 
   /* ---- auto-scroll: keep current chunk near middle of window (only while playing,

@@ -79,6 +79,28 @@ test("subtitle ASS uses the editable episode style", () => {
   assert.doesNotMatch(buildSubtitleAss([{ start:0, end:1, narration:"No box" }], 1080, 1920, { backgroundOpacity:0 }), /,Box,,/);
 });
 
+test("subtitle ASS cues follow transcription word timestamps, not planned shot times", () => {
+  // Planned shot times diverge from the speech: the opening is pinned to 5s on
+  // the timeline, but its narration actually runs 0–16s in the recording.
+  const shots = [
+    { index:0, start:0, end:5, duration:5, narration:"Welcome back to history.", chinese:"欢迎回到历史。" },
+    { index:1, start:5, end:10, duration:5, narration:"Today we explore Rome.", chinese:"今天我们探索罗马。" },
+  ];
+  const transcription = { duration:32, segments:[{ start:0, end:32, words:[
+    { start:0, end:4, word:"Welcome" }, { start:4, end:8, word:"back" },
+    { start:8, end:12, word:"to" }, { start:12, end:16, word:"history." },
+    { start:16, end:20, word:"Today" }, { start:20, end:24, word:"we" },
+    { start:24, end:28, word:"explore" }, { start:28, end:32, word:"Rome." },
+  ] }] };
+  const ass = buildSubtitleAss(shots, 1080, 1920, {}, false, "", 4, transcription);
+  assert.match(ass, /Dialogue: 1,0:00:00\.00,0:00:16\.00,Main,,0,0,0,,Welcome back to history\./);
+  assert.match(ass, /Dialogue: 1,0:00:16\.00,0:00:32\.00,Main,,0,0,0,,Today we explore Rome\./);
+  // Without a transcription, cues fall back to the planned shot timing.
+  const planned = buildSubtitleAss(shots, 1080, 1920, {}, false, "", 4);
+  assert.match(planned, /Dialogue: 1,0:00:00\.00,0:00:05\.00,Main,,0,0,0,,Welcome back to history\./);
+  assert.match(planned, /Dialogue: 1,0:00:05\.00,0:00:10\.00,Main,,0,0,0,,Today we explore Rome\./);
+});
+
 test("documentary script generation asks for a climax-first video hook", async () => {
   let request;
   const fetchImpl = async (_url, options) => {

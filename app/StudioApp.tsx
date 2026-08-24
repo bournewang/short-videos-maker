@@ -9,7 +9,8 @@ import { canStartConcurrentJob, mapWithConcurrency } from "./lib/concurrency";
 import { activateProjectCache, createEpisodeId, deleteProjectCache, listProjectCaches, normalizeCachedProject, readActiveProjectId, readAllProjectCaches, readProjectCache, writeProjectCache } from "./lib/project-cache";
 import { activateServerProject, deleteServerProject, importServerProjects, listServerProjects, readServerProject, writeServerProject } from "./lib/server-projects";
 import { BROADCAST_MODE_STYLE, DEFAULT_HEADLINE_STYLE, DEFAULT_SUBTITLE_STYLE, HEADLINE_PRESETS, SUBTITLE_FONTS, SUBTITLE_PRESETS, normalizeHeadlineStyle, normalizeSubtitleStyle, subtitleCssBackground } from "./lib/subtitle-style";
-import { alignBilingualChunks, buildSrt, subtitleFileName } from "./lib/subtitles";
+import { buildSrt as buildSrtFile, subtitleFileName, transcriptionForShots } from "./lib/subtitles";
+import { buildTimedChunks, activeTimedChunkIndex } from "./lib/timing";
 import { SHOT_MOTIONS, formatTime, scriptSectionForDuration } from "./lib/timeline";
 import { SCREEN_RATIOS, VIDEO_RESOLUTIONS, normalizeScreenRatio, promptForScreenRatio, videoResolution, visualCoverage } from "./lib/video";
 import { COVER_TITLE_POSITIONS, coverPromptSuggestion, downloadCoverFile, normalizeCoverTitlePosition } from "./lib/cover";
@@ -86,8 +87,10 @@ function readAudioDuration(file: File): Promise<number> {
   });
 }
 
-function downloadSubtitleFile(title:string, shots:Shot[], language:string) {
-  const content = buildSrt(shots, language);
+const buildSrt = buildSrtFile as (shots:Shot[], language?:string, transcription?:Transcription | null) => string;
+
+function downloadSubtitleFile(title:string, shots:Shot[], language:string, transcription:Transcription | null = null) {
+  const content = buildSrt(shots, language, transcription);
   if (!content) return;
   const url = URL.createObjectURL(new Blob(["\uFEFF", content], { type:"application/x-subrip;charset=utf-8" }));
   const link = document.createElement("a");
@@ -414,8 +417,15 @@ export default function StudioApp() {
         chosenCoverUrl: String(parsed.chosenCoverUrl || parsed.shots?.find((shot:Shot) => shot.id === parsed.coverShotId)?.image || ""),
         title: parsed.title || "",
         screenRatio: parsed.screenRatio || "9:16",
+        transcription: parsed.transcription || null,
       };
     } catch { return null; }
+  }
+
+  function textProviderPayload() {
+    return provider.textApiKey.trim()
+      ? { textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey }
+      : {};
   }
 
   async function analyze() {
@@ -425,7 +435,7 @@ export default function StudioApp() {
     if (!provider.textApiKey && !providerStatus.text.configured) { setMessage("Configure a text AI provider before analyzing the script."); setSettingsOpen(true); return; }
     setBusy("AI is planning the episode");
     try {
-      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, screenRatio, audioDuration, transcription }) });
+      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...textProviderPayload(), script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, screenRatio, audioDuration, transcription }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Planning failed");
       const planned:Shot[] = data.shots.map((shot:Partial<Shot>, index:number) => ({ ...shot, id:`shot-${Date.now()}-${index}`, index, status:"planned", locked:false, image:"", variants:[], imageStatus:"idle", imageError:"", provider:"", seed:"", video:"", videoStatus:"idle", videoError:"", videoProvider:"" })) as Shot[];
       persistProject(projectSnapshot({ shots:planned, selectedId:planned[0]?.id || "", stage:"storyboard", previewUrl:"", downloadUrl:"" }));
@@ -457,7 +467,7 @@ export default function StudioApp() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          textKind: provider.textKind, endpoint: provider.textEndpoint, model: provider.textModel, apiKey: provider.textApiKey,
+          ...textProviderPayload(),
           topic, duration: scriptDuration,
           creativeDirection: creativeDirection || undefined,
         }),
@@ -478,7 +488,7 @@ export default function StudioApp() {
     if (!provider.textApiKey && !providerStatus.text.configured) { setMessage("Configure a text AI provider first."); setSettingsOpen(true); return; }
     setBusy("Regenerating opening visual hook");
     try {
-      const response = await fetch(`${SERVICE}/text/opening-hook`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ textKind:provider.textKind, endpoint:provider.textEndpoint, model:provider.textModel, apiKey:provider.textApiKey, narration:opening.narration, contentFormat, visualStyle, creativeDirection, screenRatio, currentPrompt:opening.prompt }) });
+      const response = await fetch(`${SERVICE}/text/opening-hook`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...textProviderPayload(), narration:opening.narration, contentFormat, visualStyle, creativeDirection, screenRatio, currentPrompt:opening.prompt }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Opening hook generation failed");
       updateShot(opening.id, { prompt:data.prompt, status:"planned", video:"", videoStatus:"idle", videoError:"", videoProvider:"" });
       setMessage("Opening visual hook regenerated. Generate the image to see the new visual.");
@@ -750,7 +760,7 @@ export default function StudioApp() {
       if (!provider.textApiKey && !providerStatus.text.configured) {
         setMessage("Configure a text AI provider before translating subtitles."); setSettingsOpen(true); return;
       }
-      const response = await fetch(`${SERVICE}/text/translate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ textKind:provider.textKind, endpoint: provider.textEndpoint, model: provider.textModel, apiKey: provider.textApiKey, lines: shots.map((shot) => shot.narration) }) });
+      const response = await fetch(`${SERVICE}/text/translate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...textProviderPayload(), lines: shots.map((shot) => shot.narration) }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Translation failed");
       setPreviewUrl(""); setDownloadUrl("");
       setShots((current) => current.map((shot, index) => ({ ...shot, chinese: data.lines[index] || shot.chinese })));
@@ -777,7 +787,7 @@ export default function StudioApp() {
       } catch { /* the bridge may be busy; keep polling */ }
     }, 800);
     try {
-      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ episodeId, title, renderJobId, shots, narrationData:audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, broadcastMode, headlineText, headlinePosition, width:preset.width, height:preset.height }) });
+      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ episodeId, title, renderJobId, shots, narrationData:audioData, transcription, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, broadcastMode, headlineText, headlinePosition, width:preset.width, height:preset.height }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Render failed");
       const requestedStyle = normalizeSubtitleStyle(subtitleStyle); const renderedStyle = data.subtitleStyle ? normalizeSubtitleStyle(data.subtitleStyle) : null;
       if (!renderedStyle || JSON.stringify(renderedStyle) !== JSON.stringify(requestedStyle)) throw new Error("The render service is outdated and did not apply the current subtitle style. Restart npm run dev, then rebuild the video");
@@ -809,7 +819,7 @@ export default function StudioApp() {
       } catch { /* the bridge may be busy; keep polling */ }
     }, 800);
     try {
-      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ episodeId, title, renderJobId, shots:sampleShots, narrationData:audioData, voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, broadcastMode, headlineText, headlinePosition, width:preset.width, height:preset.height }) });
+      const response = await fetch(`${SERVICE}/render`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ episodeId, title, renderJobId, shots:sampleShots, narrationData:audioData, transcription:transcriptionForShots(transcription, sampleShots), voicePreset:denoiseNarration ? "denoise" : "original", bgmPath:bgm, bgmVolume:bgmVolume / 100, subtitleStyle, broadcastMode, headlineText, headlinePosition, width:preset.width, height:preset.height }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Render failed");
       const sampleDuration = sampleShots.reduce((sum, shot) => sum + shot.duration, 0);
       const url = `${SERVICE}${data.url}`;
@@ -900,9 +910,9 @@ export default function StudioApp() {
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} shortClipDuration={shortClipDuration} setShortClipDuration={setShortClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} provider={provider} setProvider={setProvider} speechStatus={providerStatus.speech} analyze={analyze} generateDocumentaryScript={generateDocumentaryScript} scriptDuration={scriptDuration} setScriptDuration={setScriptDuration} busy={busy} />}
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} handleShotImageUpload={handleShotImageUpload} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} previewActive={previewActive} setPreviewActive={setPreviewActive} regenerateOpeningVisual={regenerateOpeningVisual} audioElapsed={audioElapsed} translateAll={translateAll} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} />}
-          {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} />}
+          {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} transcription={transcription} />}
           {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { touchProject(); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { touchProject(); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { touchProject(); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={(value:string) => { touchProject(); setCoverShotId(value); setChosenCoverUrl(value ? (shots.find((s:Shot) => s.id === value)?.image || "") : ""); }} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={(url:string) => { touchProject(); setChosenCoverUrl(url); }} generateCover={generateCover} downloadCover={downloadCover} screenRatio={screenRatio} busy={busy} />}
-{stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} chosenCoverUrl={chosenCoverUrl} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
+{stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} chosenCoverUrl={chosenCoverUrl} transcription={transcription} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
 {stage === "prompter" && <PrompterPanel currentEpisodeId={episodeId} />}
         </>}
       </section>
@@ -1003,7 +1013,7 @@ function RatioSelect({ screenRatio, setScreenRatio }:any) {
   return <label className="ratio-select"><span>Screen ratio</span><select value={screenRatio} onChange={(event)=>setScreenRatio(event.target.value)}>{Object.entries(SCREEN_RATIOS).map(([value, option]) => <option key={value} value={value}>{value} · {option.label}</option>)}</select></label>;
 }
 
-function SubtitleOverlay({ shot, subtitleStyle, audioElapsed }:any) {
+function SubtitleOverlay({ shot, shots, subtitleStyle, audioElapsed, transcription, activeChunk }:any) {
   const style = normalizeSubtitleStyle(subtitleStyle);
   const outlinePx = style.outline || 0;
   const outlineColor = style.backgroundColor;
@@ -1012,46 +1022,43 @@ function SubtitleOverlay({ shot, subtitleStyle, audioElapsed }:any) {
     : "none";
   const fontSizeCqh = 0.028 * style.fontScale;
 
-  const chunks = useMemo(() => {
-    return alignBilingualChunks(shot?.narration || "", shot?.chinese || "");
-  }, [shot?.id, shot?.narration, shot?.chinese]);
+  // When activeChunk is supplied (livestream subtitle mode) skip chunk building.
+  // Otherwise build cues from the FULL shot list: the word-position mapping in
+  // subtitleCues only lines up with the real narration timestamps when it sees
+  // every shot, so a single-shot slice lands on the wrong transcription window.
+  const timedChunks = useMemo(
+    () => activeChunk !== undefined ? [] : buildTimedChunks(Array.isArray(shots) && shots.length ? shots : (shot ? [shot] : []), transcription),
+    [activeChunk, shots, shot, transcription]
+  );
 
-  const [chunkIndex, setChunkIndex] = useState(0);
+  // Chunks belonging to the previewed shot, used when no audio clock drives the overlay
+  const shotChunks = useMemo(() => {
+    if (!shot || shot.index === undefined || !timedChunks.length) return timedChunks;
+    const own = timedChunks.filter((chunk:any) => chunk.shotIndex === shot.index);
+    return own.length ? own : timedChunks;
+  }, [timedChunks, shot]);
+
+  // Timer-based auto-cycle used when no audio is playing (storyboard preview)
+  const [timerIndex, setTimerIndex] = useState(0);
   useEffect(() => {
-    setChunkIndex(0);
-    if (chunks.length <= 1) return;
-    if (audioElapsed != null) return;
-    const duration = Math.max(0.6, Number(shot?.duration) || 2);
-    const totalWeight = chunks.reduce((sum, c) => sum + Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length), 0);
-    let elapsed = 0;
+    setTimerIndex(0);
+    if (shotChunks.length <= 1 || audioElapsed != null) return;
+    const shotStart = shotChunks[0]?.startTime || 0;
     const timers: ReturnType<typeof setTimeout>[] = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const weight = Math.max(1, chunks[i].english.split(/\s+/).filter(Boolean).length || chunks[i].chinese.length);
-      const delay = (duration * weight) / totalWeight * 1000;
-      timers.push(setTimeout(() => setChunkIndex(i), elapsed));
-      elapsed += delay;
+    for (let i = 0; i < shotChunks.length; i++) {
+      timers.push(setTimeout(() => setTimerIndex(i), Math.max(0, (shotChunks[i].startTime - shotStart) * 1000)));
     }
     return () => timers.forEach(clearTimeout);
-  }, [chunks, shot?.duration, audioElapsed]);
+  }, [shotChunks, audioElapsed]);
 
-  useEffect(() => {
-    if (audioElapsed == null || chunks.length <= 1) return;
-    const shotStart = Number(shot?.start) || 0;
-    const shotDuration = Math.max(0.6, Number(shot?.duration) || 2);
-    const relativeTime = audioElapsed - shotStart;
-    if (relativeTime < 0 || relativeTime > shotDuration) { setChunkIndex(0); return; }
-    const totalWeight = chunks.reduce((sum, c) => sum + Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length), 0);
-    let acc = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      const weight = Math.max(1, chunks[i].english.split(/\s+/).filter(Boolean).length || chunks[i].chinese.length);
-      acc += shotDuration * weight / totalWeight;
-      if (relativeTime < acc) { setChunkIndex(i); return; }
-    }
-    setChunkIndex(chunks.length - 1);
-  }, [audioElapsed, chunks, shot?.start, shot?.duration]);
+  const activeIndex = audioElapsed != null ? activeTimedChunkIndex(timedChunks, audioElapsed) : -1;
+  const current = activeChunk !== undefined
+    ? (activeChunk || { english: "", chinese: "" })
+    : (audioElapsed != null
+      ? (timedChunks[activeIndex] || shotChunks[0] || timedChunks[0] || { english: "", chinese: "" })
+      : (shotChunks[timerIndex] || shotChunks[0] || { english: "", chinese: "" }));
 
-  const current = chunks[chunkIndex] || chunks[0] || { english: "", chinese: "" };
-  return <div className="preview-captions" style={{ bottom:`${style.position}%`, left:"6.5%", right:"6.5%", backgroundColor:subtitleCssBackground(style), fontFamily:style.fontFamily, fontWeight:style.bold ? 700 : 400, textAlign:style.alignment, textShadow:shadow }}><b style={{ color:style.englishColor, fontSize:`${fontSizeCqh}cqh`, fontWeight:"inherit" }}>{current.english || "Your English subtitle appears here"}</b>{(current.chinese || !shot) && <span style={{ color:style.chineseColor, fontSize:`${fontSizeCqh}cqh` }}>{current.chinese || "中文字幕显示在这里"}</span>}</div>;
+  return <div className="preview-captions" style={{ bottom:`${style.position}%`, left:"6.5%", right:"6.5%", backgroundColor:subtitleCssBackground(style), fontFamily:style.fontFamily, fontWeight:style.bold ? 700 : 400, textAlign:style.alignment, textShadow:shadow }}><b style={{ color:style.englishColor, fontSize:`${fontSizeCqh}cqh`, fontWeight:"inherit" }}>{current.english || "Your English subtitle appears here"}</b>{(current.chinese || (!shot && activeChunk === undefined)) && <span style={{ color:style.chineseColor, fontSize:`${fontSizeCqh}cqh` }}>{current.chinese || "中文字幕显示在这里"}</span>}</div>;
 }
 
 function BroadcastHeadlineOverlay({ headlineText, headlinePosition, subtitleStyle, headlineStyle, subHeadlineText, subHeadlineStyle }:any) {
@@ -1160,7 +1167,7 @@ function Storyboard({ productionMode, script, transcription, shots, selected, se
   return <div className="panel storyboard-panel"><div className="section-head compact storyboard-head"><div><span className="eyebrow">VISUAL PLAN</span><h1>{longScenes ? "Long scenes" : mixedMode ? "Mixed storyboard" : "Storyboard"}</h1><p>{shots.length} {longScenes ? "scenes" : "shots"} aligned across {formatTime(totalDuration)} · {shots.filter((shot:Shot)=>shot.video).length} clips ready{mixedMode ? ` · ${recommendedVideos} recommended` : ""} <span className="hotkey-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span></p></div><div className="story-actions"><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/>{previewActive ? <button className="ghost preview-stop" onClick={() => setPreviewActive(false)}>Stop preview</button> : <button className="primary preview-play" onClick={startPreview} disabled={batchActionsBusy}>Preview</button>}{!longScenes && <button className="ghost" onClick={generateAll} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : "Generate images"}</button>}{!longScenes && <button className="ghost" onClick={regenerateOpeningVisual} disabled={batchActionsBusy || !shots[0]}>Regenerate hook</button>}<button className="ghost" onClick={async () => { setTranslating(true); try { await translateAll(); } finally { setTranslating(false); } }} disabled={batchActionsBusy || translating || !shots.length}>{translating ? "Translating…" : "Translate subtitles"}</button><button className="primary" onClick={() => generateAllVideos()} disabled={batchActionsBusy}>{batchActionsBusy ? "Working…" : longScenes ? "Generate all long clips" : mixedMode ? `Animate recommended (${recommendedVideos})` : "Animate all shots"}</button></div></div>
     <div className={`story-grid ratio-${screenRatio.replace(':','-')}`}><div className="shot-list" ref={shotListRef} aria-keyshortcuts="ArrowUp ArrowDown">{shots.map((shot: Shot) => <button key={shot.id} data-shot-id={shot.id} className={`shot-row ${selected?.id === shot.id ? "selected" : ""}`} onClick={() => handleShotClick(shot.id)}>
       <div className="thumb">{shot.video ? <video src={shot.video} muted playsInline aria-label="Generated scene clip"/> : shot.image ? <img src={shot.image} alt="Generated shot"/> : null}<i className="shot-index-badge" aria-label={`Shot ${shot.index + 1}`}>{String(shot.index + 1).padStart(2,'0')}</i>{shot.video ? <i className="clip-badge">CLIP</i> : mixedMode && shot.videoRecommended ? <i className="video-pick-badge">VIDEO PICK</i> : null}</div><div className="shot-summary"><div><span className={`tag type-${shot.type.toLowerCase()}`}>{shot.type}</span><span className="time">{formatTime(shot.start)}—{formatTime(shot.end)}</span></div><p>{shot.narration}</p><small>{shot.duration.toFixed(1)}s · {shot.motion}</small></div><span className={`state state-${shot.videoStatus === "generating" ? "generating" : shot.status}`}>{shot.locked ? "Locked" : shot.videoStatus === "generating" ? longScenes ? "generating" : "animating" : shot.video ? "clip ready" : mixedMode && shot.videoRecommended ? "video selected" : longScenes ? "planned" : shot.status}</span></button>)}</div>
-      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video key={selected.id} src={selected.video} autoPlay loop={!previewActive} muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} subtitleStyle={subtitleStyle} audioElapsed={audioElapsed}/>{broadcastMode && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div>
+      {selected && <div className={`inspector ${screenRatio === "16:9" ? "layout-landscape" : ""}`}><div className="shot-preview-column"><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{selected.video ? <video key={selected.id} src={selected.video} autoPlay loop={!previewActive} muted playsInline aria-label="Generated shot video preview"/> : selected.image ? <img src={selected.image} alt="Selected shot preview" className={motionPreviewClass(selected.motion, selected.index)} style={{ animationDuration:`${Math.max(.6, Number(selected.duration) || 2)}s` }}/> : <div className="empty-visual"><span>{String(selected.index + 1).padStart(2,'0')}</span><b>{longScenes ? "Awaiting video" : "Awaiting image"}</b></div>}<SubtitleOverlay shot={selected} shots={shots} subtitleStyle={subtitleStyle} audioElapsed={previewActive ? audioElapsed : null} transcription={transcription}/>{broadcastMode && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div>
         <div className="inspector-form"><div className="inspector-title"><div><span className="eyebrow">{longScenes ? "SCENE" : "SHOT"} {String(selected.index + 1).padStart(2,'0')}</span><h2>{selected.type} visual</h2></div><button className={`lock ${selected.locked ? "locked" : ""}`} onClick={() => updateShot(selected.id,{locked:!selected.locked})}>{selected.locked ? "Locked" : "Lock"}</button></div>
           <div className="current-script" aria-live="polite"><div><span>Script in this {longScenes ? "scene" : "shot"}</span><time>{formatTime(selected.start)}—{formatTime(selected.end)}</time></div><p>{currentScript || "No spoken script in this time range."}</p></div>
           {!longScenes && <label className="field"><span>Image prompt</span><textarea rows={7} value={selected.prompt} onChange={(e) => updateShot(selected.id,{prompt:e.target.value,status:'planned',video:'',videoStatus:'idle',videoError:'',videoProvider:''})}/></label>}
@@ -1203,7 +1210,7 @@ function Captions({ script, shots, updateShot, translateAll, audioName, audioDat
       <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} aria-label={`English caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/><textarea className="chinese" value={shot.chinese} aria-label={`Chinese caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/></div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>No captions yet</h2><p>AI-generated bilingual lines appear after script analysis.</p></div>}</div></div></div>;
 }
 
-function ExportPanel({ title, productionMode, shots, approved, duration, audioName, bgm, build, buildSample, subtitleStyle, broadcastMode, headlineText, headlinePosition, previewUrl, downloadUrl, videoBuilds, deleteBuild, downloadResolution, setDownloadResolution, screenRatio, busy, buildProgress }: any) {
+function ExportPanel({ title, productionMode, shots, approved, duration, audioName, bgm, build, buildSample, subtitleStyle, broadcastMode, headlineText, headlinePosition, previewUrl, downloadUrl, videoBuilds, deleteBuild, downloadResolution, setDownloadResolution, screenRatio, busy, buildProgress, transcription }: any) {
   const longScenes = productionMode === "long-scenes";
   const coverage = visualCoverage(shots);
   const sampleCoverage = visualCoverage(shots.slice(0, 2));
@@ -1226,8 +1233,8 @@ function ExportPanel({ title, productionMode, shots, approved, duration, audioNa
   }, [videoUrl]);
   const firstShot = shots[0];
   return <div className="panel export-panel"><div className="section-head export-head"><div><span className="eyebrow">FINAL ASSEMBLY</span><h1>Build &amp; Preview</h1><p>Build each screen ratio you need. Every finished video is saved below with its render path, preview, and download.</p></div><label className="output-select"><span>Resolution</span><select value={downloadResolution} onChange={(event)=>setDownloadResolution(event.target.value)}>{Object.entries(VIDEO_RESOLUTIONS).map(([value, preset]) => { const dimensions = videoResolution(value, screenRatio); return <option key={value} value={value}>{preset.label} · {dimensions.width} × {dimensions.height}</option>; })}</select></label></div><div className="export-grid">
-    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">CURRENT VIDEO</span><h2>Review the final cut</h2></div><span>{selected.width} × {selected.height} · {screenRatio}</span></div><div className="build-video-stage"><div className="build-compare"><div className="build-compare-col"><span className="eyebrow">Shot preview</span><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{firstShot ? (firstShot.video ? <video src={firstShot.video} muted playsInline loop/> : firstShot.image ? <img src={firstShot.image} alt=""/> : <div className="empty-visual"><span>01</span><b>No visual</b></div>) : <div className="empty-visual"><span>01</span><b>No shot</b></div>}{firstShot && <SubtitleOverlay shot={firstShot} subtitleStyle={subtitleStyle}/>}{broadcastMode && headlineText.trim() && firstShot && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div><div className="build-compare-col"><span className="eyebrow">Built video</span><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{videoUrl ? <video key={videoUrl} ref={previewRef} controls autoPlay playsInline src={videoUrl} aria-label={`${selected.label} video preview`}/> : <div className="empty-visual"><span>▶</span><b>Video not built</b></div>}</div></div></div></div></div><div className="build-actions"><button className="primary large" onClick={build} disabled={!!busy || !ready}>{busy || "Build"}</button><button className="ghost large" onClick={buildSample} disabled={!!busy || !sampleReady} title={!sampleReady ? "The first 2 shots need images or video clips, and narration audio is required" : undefined}>Build Sample</button>{videoUrl ? <a className="ghost large" href={videoUrl} download>Download</a> : <button className="ghost large" disabled>Download</button>}</div>{buildProgress && <div className="build-progress" role="status"><div className="build-progress-track"><div className="build-progress-fill" style={{ width:`${Math.min(100, Math.max(0, buildProgress.percent))}%` }}/></div><div className="build-progress-meta"><span>{buildProgress.stage}</span><b>{Math.round(buildProgress.percent)}%</b></div></div>}</div>
-    <div className="export-side"><div className="export-card subtitle-export-card"><span className="eyebrow">YOUTUBE</span><h2>Add subtitles</h2><p>Reach a broader audience by adding subtitle files to your video. These SRT tracks use the timing from your reviewed captions.</p><div className="subtitle-downloads"><button className="ghost" type="button" disabled={!hasEnglish} onClick={() => downloadSubtitleFile(title, shots, "english")}><b>English</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasChinese} onClick={() => downloadSubtitleFile(title, shots, "chinese")}><b>简体中文</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasEnglish && !hasChinese} onClick={() => downloadSubtitleFile(title, shots, "bilingual")}><b>Bilingual</b><span>Download .srt</span></button></div><small>For selectable YouTube captions, upload English and Chinese as separate language tracks. Use Bilingual to show both together.</small></div><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>{longScenes ? "Scene plan" : "Storyboard"} <b>{shots.length} {longScenes ? "scenes" : "shots"}</b></div><div className={coverage.complete?'ok':'warn'}>Visual coverage <b>{coverage.ready}/{coverage.total} ready</b></div><div className={sampleCoverage.complete?'ok':'warn'}>Sample coverage (first 2) <b>{sampleCoverage.ready}/{sampleCoverage.total} ready</b></div><div className="optional">Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length}</b></div><div className="optional">{productionMode === "mixed" ? "Selected videos" : longScenes ? "Long clips" : "Animated clips"} <b>{productionMode === "mixed" ? `${shots.filter((s:Shot)=>s.video).length}/${shots.filter((s:Shot)=>s.videoRecommended).length} recommended` : `${shots.filter((s:Shot)=>s.video).length}/${shots.length}`}</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Each segment needs either an image or a video. When both exist, the generated video is used.</small></div></div>
+    <div className="preview-card"><div className="preview-card-head"><div><span className="eyebrow">CURRENT VIDEO</span><h2>Review the final cut</h2></div><span>{selected.width} × {selected.height} · {screenRatio}</span></div><div className="build-video-stage"><div className="build-compare"><div className="build-compare-col"><span className="eyebrow">Shot preview</span><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{firstShot ? (firstShot.video ? <video src={firstShot.video} muted playsInline loop/> : firstShot.image ? <img src={firstShot.image} alt=""/> : <div className="empty-visual"><span>01</span><b>No visual</b></div>) : <div className="empty-visual"><span>01</span><b>No shot</b></div>}{firstShot && <SubtitleOverlay shot={firstShot} shots={shots} subtitleStyle={subtitleStyle} transcription={transcription}/>}{broadcastMode && headlineText.trim() && firstShot && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle}/>}</div></div></div><div className="build-compare-col"><span className="eyebrow">Built video</span><div className={`phone-frame ratio-${screenRatio.replace(':','-')}`}><div className="phone-canvas" style={{ aspectRatio:screenRatio.replace(':',' / ') }}>{videoUrl ? <video key={videoUrl} ref={previewRef} controls autoPlay playsInline src={videoUrl} aria-label={`${selected.label} video preview`}/> : <div className="empty-visual"><span>▶</span><b>Video not built</b></div>}</div></div></div></div></div><div className="build-actions"><button className="primary large" onClick={build} disabled={!!busy || !ready}>{busy || "Build"}</button><button className="ghost large" onClick={buildSample} disabled={!!busy || !sampleReady} title={!sampleReady ? "The first 2 shots need images or video clips, and narration audio is required" : undefined}>Build Sample</button>{videoUrl ? <a className="ghost large" href={videoUrl} download>Download</a> : <button className="ghost large" disabled>Download</button>}</div>{buildProgress && <div className="build-progress" role="status"><div className="build-progress-track"><div className="build-progress-fill" style={{ width:`${Math.min(100, Math.max(0, buildProgress.percent))}%` }}/></div><div className="build-progress-meta"><span>{buildProgress.stage}</span><b>{Math.round(buildProgress.percent)}%</b></div></div>}</div>
+    <div className="export-side"><div className="export-card subtitle-export-card"><span className="eyebrow">YOUTUBE</span><h2>Add subtitles</h2><p>Reach a broader audience by adding subtitle files to your video. These SRT tracks use the timing from your reviewed captions.</p><div className="subtitle-downloads"><button className="ghost" type="button" disabled={!hasEnglish} onClick={() => downloadSubtitleFile(title, shots, "english", transcription)}><b>English</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasChinese} onClick={() => downloadSubtitleFile(title, shots, "chinese", transcription)}><b>简体中文</b><span>Download .srt</span></button><button className="ghost" type="button" disabled={!hasEnglish && !hasChinese} onClick={() => downloadSubtitleFile(title, shots, "bilingual", transcription)}><b>Bilingual</b><span>Download .srt</span></button></div><small>For selectable YouTube captions, upload English and Chinese as separate language tracks. Use Bilingual to show both together.</small></div><div className="export-card feature"><span className="eyebrow">OUTPUT</span><h2>Current build settings</h2><div className="specs"><span><b>{selected.width} × {selected.height}</b>Resolution</span><span><b>{screenRatio}</b>Storyboard ratio</span><span><b>{formatTime(duration)}</b>Duration</span><span><b>H.264</b>MP4 · 30 fps</span></div><p className="output-note">Change the screen ratio in Storyboard. Changing the resolution here clears the current build so preview and download stay in sync.</p></div><div className="checklist"><h3>Preflight</h3><div className={shots.length?'ok':'warn'}>{longScenes ? "Scene plan" : "Storyboard"} <b>{shots.length} {longScenes ? "scenes" : "shots"}</b></div><div className={coverage.complete?'ok':'warn'}>Visual coverage <b>{coverage.ready}/{coverage.total} ready</b></div><div className={sampleCoverage.complete?'ok':'warn'}>Sample coverage (first 2) <b>{sampleCoverage.ready}/{sampleCoverage.total} ready</b></div><div className="optional">Images <b>{shots.filter((s:Shot)=>s.image).length}/{shots.length}</b></div><div className="optional">{productionMode === "mixed" ? "Selected videos" : longScenes ? "Long clips" : "Animated clips"} <b>{productionMode === "mixed" ? `${shots.filter((s:Shot)=>s.video).length}/${shots.filter((s:Shot)=>s.videoRecommended).length} recommended` : `${shots.filter((s:Shot)=>s.video).length}/${shots.length}`}</b></div><div className={audioName?'ok':'warn'}>Narration <b>{audioName || 'Required'}</b></div><div className={shots.length && shots.every((s:Shot)=>s.chinese)?'ok':'warn'}>Bilingual captions <b>{approved}/{shots.length} reviewed</b></div><div className="ok">Background music <b>{bgm}</b></div><small>Each segment needs either an image or a video. When both exist, the generated video is used.</small></div></div>
   </div>{videoBuilds.length > 0 && <section className="build-library"><div className="build-library-head"><div><span className="eyebrow">CREATED VIDEOS</span><h2>All builds</h2></div><span>{videoBuilds.length} saved {videoBuilds.length === 1 ? "video" : "videos"}</span></div><div className="build-library-grid">{videoBuilds.map((item:VideoBuild) => <article className="saved-build" key={item.id}><div className={`saved-build-preview ratio-${item.screenRatio.replace(':','-')}`}><video controls preload="metadata" src={item.url} aria-label={`${item.screenRatio} video built ${item.createdAt ? new Date(item.createdAt).toLocaleString() : ""}`}/></div><div className="saved-build-body"><div className="saved-build-title"><div><span>{item.screenRatio}</span><b>{item.width} × {item.height}</b></div><time>{item.createdAt ? new Date(item.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier build"}</time></div><code title={item.path || item.url}>{item.path || item.url}</code><a className="ghost" href={item.url} download>Download video</a><button className="ghost build-delete" onClick={() => deleteBuild(item.id)} title="Delete this build">Delete</button></div></article>)}</div></section>}</div>;
 }
 
@@ -1250,7 +1257,7 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 
 const INTRO_SECONDS = 10;
 
-function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChosenCoverUrl, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, headlineStyle, setHeadlineStyle, preBroadcastStyle, setPreBroadcastStyle, episodeHistory, loadEpisodeData, currentEpisodeId }: any) {
+function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChosenCoverUrl, transcription: initialTranscription, subtitleStyle, setSubtitleStyle, broadcastMode, setBroadcastMode, headlineText, setHeadlineText, headlinePosition, setHeadlinePosition, headlineStyle, setHeadlineStyle, preBroadcastStyle, setPreBroadcastStyle, episodeHistory, loadEpisodeData, currentEpisodeId }: any) {
   const [livestreamRatio, setLivestreamRatio] = useState("9:16");
   const [customBackground, setCustomBackground] = useState<string | null>(null);
   const [bgMode, setBgMode] = useState<"cover" | "shots">("cover");
@@ -1266,6 +1273,7 @@ function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChose
   const [livestreamShots, setLivestreamShots] = useState(shots);
   const [livestreamAudio, setLivestreamAudio] = useState(audioData);
   const [livestreamCovers, setLivestreamCovers] = useState(covers);
+  const [livestreamTranscription, setLivestreamTranscription] = useState(initialTranscription ?? null);
   const [lsChosenCoverUrl, setLsChosenCoverUrl] = useState<string>(initialChosenCoverUrl || "");
   const [repeatCount, setRepeatCount] = useState(1);
   const [playCount, setPlayCount] = useState(0);
@@ -1331,34 +1339,13 @@ function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChose
   }, []);
 
   useEffect(() => {
-    const chunks: Array<{ english: string; chinese: string; startTime: number; endTime: number }> = [];
-    for (const shot of livestreamShots) {
-      const start = Math.max(0, Number(shot.start) || 0);
-      const shotDuration = Math.max(0.6, Number(shot.duration) || 2);
-      const end = Number.isFinite(Number(shot.end)) && Number(shot.end) > start
-        ? Number(shot.end) : start + shotDuration;
-      const realDuration = end - start;
-      const aligned = alignBilingualChunks(String(shot.narration || ""), String(shot.chinese || ""));
-      if (aligned.length === 0) continue;
-      const weights = aligned.map((c) => Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length));
-      const totalWeight = weights.reduce((s, w) => s + w, 0);
-      let cueStart = start;
-      for (let i = 0; i < aligned.length; i++) {
-        const cueDuration = Math.max(0.5, realDuration * weights[i] / totalWeight);
-        const cueEnd = i === aligned.length - 1 ? end : Math.min(end, cueStart + cueDuration);
-        chunks.push({ english: aligned[i].english, chinese: aligned[i].chinese, startTime: cueStart, endTime: cueEnd });
-        cueStart = cueEnd;
-      }
-    }
-    setPrompterChunks(chunks);
+    setPrompterChunks(buildTimedChunks(livestreamShots, livestreamTranscription));
     setCurrentChunkIndex(-1);
     setScrollOffset(0);
-  }, [livestreamShots]);
+  }, [livestreamShots, livestreamTranscription]);
 
   useEffect(() => {
-    if (prompterChunks.length === 0) { setCurrentChunkIndex(-1); return; }
-    const idx = prompterChunks.findIndex((c) => currentTime >= c.startTime && currentTime < c.endTime);
-    setCurrentChunkIndex(idx >= 0 ? idx : currentTime >= (prompterChunks[prompterChunks.length - 1]?.endTime || 0) ? prompterChunks.length - 1 : 0);
+    setCurrentChunkIndex(activeTimedChunkIndex(prompterChunks, currentTime));
   }, [currentTime, prompterChunks]);
 
   useEffect(() => {
@@ -1489,6 +1476,7 @@ function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChose
       setLivestreamShots(data.shots || []);
       setLivestreamAudio(data.audioData || null);
       setLivestreamCovers(data.covers || []);
+      setLivestreamTranscription(data.transcription || null);
       setLsChosenCoverUrl(String(data.chosenCoverUrl || ""));
       setCustomBackground(null);
       const savedRatio = data.screenRatio || "9:16";
@@ -1541,7 +1529,7 @@ function LivestreamPage({ shots, audioData, covers, chosenCoverUrl: initialChose
         <div className={phoneFrameClass}>
           <div className={phoneCanvasClass} style={{ aspectRatio: phoneCanvasRatio }}>
             {isCenteredLayout ? <div className="video-middle" style={{ top: `${videoPosition}%` }}>{visualContent}</div> : visualContent}
-            {hasVisual && previewShot && !prompterVisible && <SubtitleOverlay shot={previewShot} subtitleStyle={subtitleStyle} audioElapsed={currentTime} />}
+            {hasVisual && !prompterVisible && <SubtitleOverlay activeChunk={currentChunkIndex >= 0 ? prompterChunks[currentChunkIndex] : null} subtitleStyle={subtitleStyle} />}
 {hasVisual && headlineText.trim() && <BroadcastHeadlineOverlay headlineText={headlineText} headlinePosition={headlinePosition} subtitleStyle={subtitleStyle} headlineStyle={headlineStyle} subHeadlineText={subHeadlineText} subHeadlineStyle={subHeadlineStyle} />}
 {prompterVisible && prompterChunks.length > 0 && (
   <div className="livestream-prompter-overlay">

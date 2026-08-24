@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import https from "node:https";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -10,7 +10,7 @@ import { normalizePlannedShots } from "../app/lib/timeline.js";
 import { normalizeScreenRatio, promptForScreenRatio } from "../app/lib/video.js";
 import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
 import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } from "../app/lib/subtitle-style.js";
-import { alignBilingualChunks } from "../app/lib/subtitles.js";
+import { subtitleCues } from "../app/lib/subtitles.js";
 import { EpisodeStore } from "./episode-store.mjs";
 import { DigitalHumanStore } from "./digital-human-store.mjs";
 import { DigitalHumanProjectStore } from "./digital-human-project-store.mjs";
@@ -43,10 +43,40 @@ const workRoot = path.resolve(process.env.SHORTFORM_STORAGE_DIR || path.join(roo
 const exportRoot = path.join(workRoot, "exports");
 const assetRoot = path.join(workRoot, "assets");
 const audioPreviewRoot = path.join(workRoot, "audio-previews");
+const logRoot = path.join(workRoot, "logs");
+const renderLogFile = path.join(logRoot, "render-service.log");
 const bgmRoot = path.join(root, "public", "bgm");
 const episodeStore = new EpisodeStore({ storageRoot:workRoot, assetRoot, exportRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
 const digitalHumanStore = new DigitalHumanStore({ storageRoot:workRoot });
 const dhProjectStore = new DigitalHumanProjectStore({ storageRoot:workRoot, publicBaseUrl:`http://127.0.0.1:${port}` });
+
+function serializeError(error) {
+  if (!(error instanceof Error)) return { message:String(error || "Unexpected error") };
+  const cause = error.cause && typeof error.cause === "object" ? error.cause : null;
+  return {
+    name:error.name,
+    message:error.message,
+    stack:error.stack,
+    cause:cause ? {
+      name:cause.name,
+      message:cause.message,
+      code:cause.code,
+      errno:cause.errno,
+      syscall:cause.syscall,
+      hostname:cause.hostname,
+    } : undefined,
+  };
+}
+
+async function logRenderError(event, error, details = {}) {
+  const entry = { time:new Date().toISOString(), event, ...details, error:serializeError(error) };
+  try {
+    await mkdir(logRoot, { recursive:true });
+    await appendFile(renderLogFile, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (logError) {
+    console.error("[render-service] failed to write log:", logError instanceof Error ? logError.message : logError);
+  }
+}
 
 /* Re-check a non-terminal HeyGen video record against the API and persist the result. */
 async function syncHeyGenVideoRecord(video) {
@@ -532,7 +562,7 @@ function assTime(value) {
 
 function assText(value) { return String(value || "").replace(/\\/g, "\\\\").replace(/[\r\n]+/g, " ").replace(/\{/g, "（").replace(/\}/g, "）"); }
 
-export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode = false, headlineText = "", headlinePosition = 4) {
+export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode = false, headlineText = "", headlinePosition = 4, transcription = null) {
   const style = normalizeSubtitleStyle(value);
   const fontSize = Math.max(10, Math.round(height * .028 * style.fontScale / 100));
   const marginV = Math.round(height * style.position / 100); const marginH = Math.round(width * .065);
@@ -551,41 +581,35 @@ export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode
     header += `\nStyle: Headline,${style.fontFamily},${headlineFontSize},${headlineColor},&H000000FF,&H00000000,&HEE000000,1,0,0,0,100,100,0,0,1,2.5,0,8,${marginH},${marginH},${headlineMarginV},1`;
   }
   header += `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
-  const events = shots.flatMap((shot) => {
+  // Cue timing comes from subtitleCues — the same word-timestamp sync used by the
+  // live preview and SRT export. With a transcription, cue times follow the actual
+  // speech even when planned shot times diverge (e.g. the pinned 5s opening hook);
+  // without one it falls back to proportional timing within each shot.
+  const cues = subtitleCues(shots, transcription);
+  const headlineEvents = hasHeadline ? shots.flatMap((shot) => {
     const shotStart = Number(shot.start) || 0;
     const shotEnd = Number(shot.end) || (shotStart + (Number(shot.duration) || 1));
-    const shotDuration = shotEnd - shotStart;
-
-    const chunks = alignBilingualChunks(shot.narration, shot.chinese);
-    const weights = chunks.map((c) => Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length));
-    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
-
-    const headlineEvents = hasHeadline ? [
+    return [
       `Dialogue: 0,${assTime(shotStart)},${assTime(shotEnd)},Box,,0,0,0,,{\\an7\\pos(0,0)\\p1}m 0 0 l ${width} 0 l ${width} ${headlineBarHeight} l 0 ${headlineBarHeight}{\\p0}`,
       `Dialogue: 1,${assTime(shotStart)},${assTime(shotEnd)},Headline,,0,0,0,,${assText(headlineText)}`,
-    ] : [];
-
-    let cueStart = shotStart;
-    return chunks.map((chunk, i) => {
-      const cueDuration = Math.max(.5, shotDuration * weights[i] / totalWeight);
-      const cueEnd = i === chunks.length - 1 ? shotEnd : Math.min(shotEnd, cueStart + cueDuration);
-      const englishText = assText(chunk.english);
-      const chineseText = assText(chunk.chinese);
-      const text = [englishText, chineseText ? `{\\c${chinese}}${chineseText}` : ""].filter(Boolean).join("\\N");
-      const lines = Math.max(1, Number(Boolean(englishText)) + Number(Boolean(chineseText)));
-      const paddingY = Math.max(4, Math.round(fontSize * .35)); const lineHeight = Math.round(fontSize * 1.3);
-      const boxHeight = lines * lineHeight + paddingY * 2; const boxWidth = width - marginH * 2;
-      const boxBottom = Math.min(height, height - marginV + paddingY); const boxTop = Math.max(0, boxBottom - boxHeight);
-      const box = `{\\an7\\pos(${marginH},${boxTop})\\p1}m 0 0 l ${boxWidth} 0 l ${boxWidth} ${boxHeight} l 0 ${boxHeight}{\\p0}`;
-      const events = [
-        ...(i === 0 ? headlineEvents : []),
-        ...(style.backgroundOpacity > 0 ? [`Dialogue: 0,${assTime(cueStart)},${assTime(cueEnd)},Box,,0,0,0,,${box}`] : []),
-        `Dialogue: 1,${assTime(cueStart)},${assTime(cueEnd)},Main,,0,0,0,,${text}`,
-      ];
-      cueStart = cueEnd;
-      return events;
-    }).flat();
+    ];
+  }) : [];
+  const cueEvents = cues.flatMap((cue) => {
+    const englishText = assText(cue.chunk.english);
+    const chineseText = assText(cue.chunk.chinese);
+    const text = [englishText, chineseText ? `{\\c${chinese}}${chineseText}` : ""].filter(Boolean).join("\\N");
+    if (!text) return [];
+    const lines = Math.max(1, Number(Boolean(englishText)) + Number(Boolean(chineseText)));
+    const paddingY = Math.max(4, Math.round(fontSize * .35)); const lineHeight = Math.round(fontSize * 1.3);
+    const boxHeight = lines * lineHeight + paddingY * 2; const boxWidth = width - marginH * 2;
+    const boxBottom = Math.min(height, height - marginV + paddingY); const boxTop = Math.max(0, boxBottom - boxHeight);
+    const box = `{\\an7\\pos(${marginH},${boxTop})\\p1}m 0 0 l ${boxWidth} 0 l ${boxWidth} ${boxHeight} l 0 ${boxHeight}{\\p0}`;
+    return [
+      ...(style.backgroundOpacity > 0 ? [`Dialogue: 0,${assTime(cue.start)},${assTime(cue.end)},Box,,0,0,0,,${box}`] : []),
+      `Dialogue: 1,${assTime(cue.start)},${assTime(cue.end)},Main,,0,0,0,,${text}`,
+    ];
   });
+  const events = [...headlineEvents, ...cueEvents];
   const ass = header + events.join("\n");
   if (hasHeadline) console.log(`[buildSubtitleAss] Generated ASS with headline, first 600 chars: ${ass.substring(0, 600)}`);
   return ass;
@@ -676,7 +700,7 @@ export async function renderEpisode(payload, options = {}) {
     await readFile(customBgm);
   }
   report("Writing subtitles", 78, totalShots);
-  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle, payload.broadcastMode, payload.headlineText, payload.headlinePosition));
+  const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle, payload.broadcastMode, payload.headlineText, payload.headlinePosition, payload.transcription));
   const concatFile = path.join(jobDir, "segments.txt");
   const quoteConcat = (value) => value.replace(/'/g, "'\\''");
   await writeFile(concatFile, shots.map((shot) => `file '${quoteConcat(shot.segment)}'`).join("\n"));
@@ -843,6 +867,7 @@ export async function completeText(data, messages, options = {}) {
     try { response = await callProvider(); }
     catch (retryError) {
       if (retryError?.name === "TimeoutError" || retryError?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      await logRenderError("text-provider-fetch-failed", retryError, { kind:data.kind, endpoint, model:data.model });
       throw retryError;
     }
   }
@@ -1039,9 +1064,12 @@ export async function testProviderConnection(data, options = {}) {
 
 export function createRenderServer() {
   return createServer(async (req, res) => {
+    const startedAt = Date.now();
+    let requestLabel = `${req.method || "GET"} ${req.url || "/"}`;
     try {
       if (req.method === "OPTIONS") { res.writeHead(204, cors()); res.end(); return; }
       const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      requestLabel = `${req.method || "GET"} ${url.pathname}`;
       await episodeStore.initialize();
       if (req.method === "GET" && url.pathname === "/health") { json(res, 200, { ok:true, ffmpeg:"available", storage:{ kind:"sqlite+files", root:workRoot } }); return; }
       if (req.method === "GET" && url.pathname === "/audio/presets") { json(res, 200, { presets:voicePresetSummaries(), processing:"local" }); return; }
@@ -1533,7 +1561,10 @@ export function createRenderServer() {
       }
 
       json(res, 404, { error:"Not found" });
-    } catch (error) { json(res, 500, { error:error instanceof Error ? error.message : "Unexpected error" }); }
+    } catch (error) {
+      await logRenderError("request-failed", error, { request:requestLabel, durationMs:Date.now() - startedAt });
+      json(res, 500, { error:error instanceof Error ? error.message : "Unexpected error", log:renderLogFile });
+    }
   });
 }
 
