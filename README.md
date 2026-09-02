@@ -64,7 +64,7 @@ Add a provider key to `.env.local`, then restart `npm run dev`:
 OPENAI_API_KEY=your_key_here
 ```
 
-Each provider has one shared API key and a separate endpoint for every supported modality. Select the active provider and model with `TEXT_PROVIDER` and `TEXT_MODEL`, `IMAGE_PROVIDER` and `IMAGE_MODEL`, or `VIDEO_PROVIDER` and `VIDEO_MODEL`. Copy the complete structure from `.env.example`.
+Each provider has one shared API key, a separate endpoint for every supported modality, and a model name scoped to the provider: `DASHSCOPE_VIDEO_MODEL`, `VOLCENGINE_IMAGE_MODEL`, and so on. Select the active provider per modality with `TEXT_PROVIDER`, `IMAGE_PROVIDER`, or `VIDEO_PROVIDER` — switching a provider never leaks another provider's model name into its requests. (The legacy un-prefixed `TEXT_MODEL` / `IMAGE_MODEL` / `VIDEO_MODEL` still work but only apply to the currently selected provider.) Copy the complete structure from `.env.example`.
 
 Open **Provider settings** in the editor to see whether environment keys were loaded and test each connection. You can also enter a session-only override there. The editor never returns environment keys to the browser, and `.env.local` is ignored by Git.
 

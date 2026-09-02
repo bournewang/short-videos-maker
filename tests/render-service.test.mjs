@@ -52,6 +52,28 @@ async function generatedJpegDataUrl(dir, name = "still", color = "0xc06020") {
   return `data:image/jpeg;base64,${(await readFile(output)).toString("base64")}`;
 }
 
+async function generatedClipWithToneDataUrl(dir, name = "toned", color = "0x38566b") {
+  const output = path.join(dir, `${name}.mp4`);
+  await new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", ["-y", "-f", "lavfi", "-i", `color=c=${color}:s=180x320:r=30`, "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=44100", "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", output]);
+    let stderr = ""; child.stderr.on("data", (data) => stderr += data);
+    child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr)));
+  });
+  return `data:video/mp4;base64,${(await readFile(output)).toString("base64")}`;
+}
+
+function probeMaxVolume(file) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", ["-v", "info", "-i", file, "-af", "volumedetect", "-f", "null", "-"]);
+    let stderr = ""; child.stderr.on("data", (data) => stderr += data);
+    child.on("close", (code) => {
+      if (code !== 0) { reject(new Error(stderr)); return; }
+      const match = /max_volume:\s*(-?[\d.]+) dB/.exec(stderr);
+      resolve(match ? Number(match[1]) : -Infinity);
+    });
+  });
+}
+
 function samplePixel(file, at) {
   return new Promise((resolve, reject) => {
     const child = spawn("ffmpeg", ["-v", "error", "-i", file, "-ss", String(at), "-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]);
@@ -153,6 +175,26 @@ test("local renderer normalizes and concatenates generated video clips", { timeo
   assert.ok(info.size > 5000); assert.ok(duration >= 1 && duration <= 1.3); assert.equal(result.clipsUsed, 1);
 });
 
+test("local renderer keeps generated clip audio in the final export", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-clip-audio-test-")); const output = path.join(dir, "episode.mp4");
+  const video = await generatedClipWithToneDataUrl(dir);
+  await renderEpisode({ width:360, height:640, shots:[
+    { duration:1.1, video, image:png, narration:"Clip audio should survive.", chinese:"片段音频应保留。" },
+  ] }, { id:`clip-audio-test-${Date.now()}`, output });
+  const maxVolume = await probeMaxVolume(output);
+  assert.ok(maxVolume > -30, `Expected the export to keep the clip's audio track, max_volume=${maxVolume} dB`);
+});
+
+test("local renderer mixes generated clip audio with narration", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-clip-mix-test-")); const output = path.join(dir, "episode.mp4");
+  const video = await generatedClipWithToneDataUrl(dir);
+  await renderEpisode({ width:360, height:640, narrationData:narrationWav(1.2), voicePreset:"original", shots:[
+    { duration:1.1, video, image:png, narration:"Clip audio mixes under narration.", chinese:"片段音频与旁白混合。" },
+  ] }, { id:`clip-mix-test-${Date.now()}`, output });
+  const maxVolume = await probeMaxVolume(output);
+  assert.ok(maxVolume > -30, `Expected audible audio in the mixed export, max_volume=${maxVolume} dB`);
+});
+
 test("local renderer keeps image shots visible after generated clips", { timeout:120000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "shortform-mixed-test-")); const output = path.join(dir, "episode.mp4");
   const blueClip = await generatedClipDataUrl(dir, "blue", "0x204060");
@@ -223,9 +265,9 @@ test("render dimensions preserve landscape, square, and portrait export ratios",
 
 test("provider status reports configuration without exposing secrets", () => {
   const environment = {
-    IMAGE_PROVIDER:"volcengine", IMAGE_MODEL:"seedream-test",
-    TEXT_PROVIDER:"openai", TEXT_MODEL:"openai-text-test",
-    VIDEO_PROVIDER:"volcengine", VIDEO_MODEL:"seedance-test",
+    IMAGE_PROVIDER:"volcengine", IMAGE_MODEL:"seedream-test", VOLCENGINE_IMAGE_MODEL:"seedream-test",
+    TEXT_PROVIDER:"openai", TEXT_MODEL:"openai-text-test", OPENAI_TEXT_MODEL:"openai-text-test",
+    VIDEO_PROVIDER:"volcengine", VIDEO_MODEL:"seedance-test", VOLCENGINE_VIDEO_MODEL:"seedance-test",
     VOLCENGINE_API_KEY:"volcengine-test-secret", OPENAI_API_KEY:"openai-test-secret",
     VOLCENGINE_IMAGE_ENDPOINT:"https://volcengine.test/images",
     VOLCENGINE_VIDEO_ENDPOINT:"https://volcengine.test/videos",
@@ -436,6 +478,275 @@ test("Volcengine video adapter uses the selected screen ratio", async () => {
   assert.match(payload.content[0].text, /Square 1:1 screen ratio/);
 });
 
+test("DashScope video adapter creates and polls a Wan image-to-video task", async () => {
+  const requests = []; let poll = 0;
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ output:{ task_id:"ds-task-123", task_status:"PENDING" }, request_id:"req-1" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    poll += 1;
+    return new Response(JSON.stringify(poll === 1 ? { output:{ task_id:"ds-task-123", task_status:"RUNNING" } } : { output:{ task_id:"ds-task-123", task_status:"SUCCEEDED", video_url:"https://example.test/wan.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"dashscope", endpoint:"https://llm-workspace.cn-beijing.maas.aliyuncs.com", model:"wan3.0-video", apiKey:"sk-dashscope-test", videoPrompt:"Rain streams diagonally across the window while the subject breathes naturally", image:png, motion:"Slow push-in", duration:2.4, resolution:"1080p" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.equal(requests[0].url, "https://llm-workspace.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer sk-dashscope-test");
+  assert.equal(requests[0].options.headers["X-DashScope-Async"], "enable");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.model, "wan3.0-video");
+  assert.match(payload.input.prompt, /Rain streams diagonally/);
+  assert.equal(payload.input.media[0].type, "first_frame");
+  assert.deepEqual(pngDimensions(payload.input.media[0].url), { width:1080, height:1920 });
+  assert.equal(payload.parameters.ratio, "9:16"); assert.equal(payload.parameters.duration, 5); assert.equal(payload.parameters.resolution, "1080P");
+  assert.equal(payload.parameters.prompt_extend, false); assert.equal(payload.parameters.watermark, false);
+  assert.equal(requests[1].url, "https://llm-workspace.cn-beijing.maas.aliyuncs.com/api/v1/tasks/ds-task-123");
+  assert.equal(result.videoUrl, "https://example.test/wan.mp4"); assert.equal(result.taskId, "ds-task-123"); assert.equal(result.status, "succeeded");
+});
+
+test("DashScope video adapter creates a long-scene text-to-video task with a 10-second clip", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ output:{ task_id:"ds-long-task", task_status:"PENDING" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ output:{ task_id:"ds-long-task", task_status:"SUCCEEDED", video_url:"https://example.test/wan-long.mp4", duration:10 } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"dashscope", endpoint:"https://dashscope.aliyuncs.com/api/v1", model:"wan3.0-video", apiKey:"key", generationMode:"long-scenes", videoPrompt:"An engineer enters the laboratory and activates its blue control lights", motion:"Slow drift", duration:10 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(requests[0].url, "https://dashscope.aliyuncs.com/api/v1/services/aigc/video-generation/video-synthesis");
+  assert.equal(payload.input.media, undefined);
+  assert.match(payload.input.prompt, /Generate the full scene directly/i);
+  assert.equal(payload.parameters.duration, 10);
+  assert.equal(result.videoUrl, "https://example.test/wan-long.mp4");
+  assert.equal(result.duration, 10);
+});
+
+test("DashScope video adapter retries with a lower resolution when the model rejects it", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") {
+      const payload = JSON.parse(options.body);
+      if (payload.parameters.resolution === "1080P") return new Response(JSON.stringify({ code:"InvalidParameter", message:"resolution is not valid for this model" }), { status:400, headers:{ "Content-Type":"application/json" } });
+      return new Response(JSON.stringify({ output:{ task_id:"ds-fallback", task_status:"PENDING" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+    }
+    return new Response(JSON.stringify({ output:{ task_id:"ds-fallback", task_status:"SUCCEEDED", video_url:"https://example.test/wan-fallback.mp4" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"dashscope", endpoint:"https://dashscope.aliyuncs.com", model:"wan3.0-video", apiKey:"key", image:png, resolution:"1080p" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.deepEqual(requests.filter((request) => request.options.method === "POST").map((request) => JSON.parse(request.options.body).parameters.resolution), ["1080P", "720P"]);
+  assert.equal(result.videoUrl, "https://example.test/wan-fallback.mp4");
+});
+
+test("DashScope image adapter calls the Qwen-Image multimodal generation API", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    return new Response(JSON.stringify({ output:{ choices:[{ finish_reason:"stop", message:{ role:"assistant", content:[{ image:"https://dashscope-result.test/output.png" }] } }] }, usage:{ image_count:1 } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateImage({ kind:"dashscope", endpoint:"https://llm-workspace.cn-beijing.maas.aliyuncs.com", model:"qwen-image-3.0-pro", apiKey:"sk-dashscope-test", prompt:"A vertical cinematic scene", screenRatio:"9:16" }, { fetchImpl });
+  assert.equal(requests[0].url, "https://llm-workspace.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.model, "qwen-image-3.0-pro");
+  assert.equal(payload.input.messages[0].role, "user");
+  assert.match(payload.input.messages[0].content[0].text, /A vertical cinematic scene/);
+  assert.equal(payload.parameters.size, "1152*2048"); assert.equal(payload.parameters.n, 1); assert.equal(payload.parameters.watermark, false);
+  assert.equal(result, "https://dashscope-result.test/output.png");
+});
+
+test("DashScope connection probe treats an invalid API key as failure", async () => {
+  const invalidKeyFetch = async () => new Response(JSON.stringify({ code:"InvalidApiKey", message:"Invalid API-key provided." }), { status:401, headers:{ "Content-Type":"application/json" } });
+  await assert.rejects(testProviderConnection({ target:"video", videoKind:"dashscope", endpoint:"https://dashscope.aliyuncs.com", model:"wan3.0-video", apiKey:"sk-bad" }, { fetchImpl:invalidKeyFetch }), /Invalid API-key/);
+  const notFoundFetch = async (url) => {
+    assert.equal(url, "https://dashscope.aliyuncs.com/api/v1/tasks/connection-probe");
+    return new Response(JSON.stringify({ code:"TaskNotFound", message:"task not found" }), { status:404, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await testProviderConnection({ target:"image", kind:"dashscope", endpoint:"https://dashscope.aliyuncs.com", model:"qwen-image-3.0-pro", apiKey:"sk-good" }, { fetchImpl:notFoundFetch });
+  assert.equal(result.ok, true);
+});
+
+test("DashScope provider reads DASHSCOPE_HOST and shared DASHSCOPE_API_KEY from the environment", async () => {
+  const environment = {
+    VIDEO_PROVIDER:"dashscope",
+    VIDEO_MODEL:"wan3.0-video",
+    DASHSCOPE_API_KEY:"environment-dashscope-key",
+    DASHSCOPE_HOST:"https://env-workspace.cn-beijing.maas.aliyuncs.com",
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    const status = getProviderStatus();
+    assert.equal(status.video.kind, "dashscope");
+    assert.equal(status.video.model, "wan3.0-video");
+    assert.equal(status.video.endpoint, "https://env-workspace.cn-beijing.maas.aliyuncs.com");
+    assert.equal(status.video.configured, true);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+test("per-provider model env beats the legacy global model name", async () => {
+  const environment = {
+    VIDEO_PROVIDER:"dashscope",
+    VIDEO_MODEL:"legacy-global-model",
+    DASHSCOPE_VIDEO_MODEL:"wan3.0-video",
+    DASHSCOPE_API_KEY:"environment-dashscope-key",
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    const status = getProviderStatus();
+    assert.equal(status.video.kind, "dashscope");
+    assert.equal(status.video.model, "wan3.0-video");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+test("legacy global model name does not leak into a session-selected provider", async () => {
+  const environment = {
+    VIDEO_PROVIDER:"dashscope",
+    VIDEO_MODEL:"legacy-global-model",
+    PIXSTAG_VIDEO_MODEL:"MiniMax-H3",
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, environment);
+  try {
+    const requests = [];
+    const fetchImpl = async (url, options = {}) => {
+      requests.push({ url, options });
+      if (options.method === "POST") return new Response(JSON.stringify({ task_id:"px-isolation-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+      return new Response(JSON.stringify({ task:{ id:"px-isolation-task", status:"succeeded", content:{ url:"https://example.test/pixstag-isolation.mp4" } } }), { status:200, headers:{ "Content-Type":"application/json" } });
+    };
+    const result = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", apiKey:"sk-pixstag-test", generationMode:"long-scenes", videoPrompt:"A lantern parade moves through the old city gates at dusk", motion:"Slow drift", duration:5 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+    const payload = JSON.parse(requests[0].options.body);
+    assert.equal(payload.model, "MiniMax-H3");
+    assert.equal(result.videoUrl, "https://example.test/pixstag-isolation.mp4");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+test("PixStag video adapter creates and polls a MiniMax-H3 image-to-video task", async () => {
+  const requests = []; let poll = 0;
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ task_id:"px-task-42" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    poll += 1;
+    return new Response(JSON.stringify(poll === 1 ? { task:{ id:"px-task-42", status:"queued" } } : { task:{ id:"px-task-42", status:"succeeded", content:{ url:"https://example.test/pixstag.mp4" }, duration:5, ratio:"9:16" } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const publicFrame = "https://cdn.example.test/frames/storyboard-042.png";
+  const result = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"sk-pixstag-test", videoPrompt:"Candlelight flickers across the manuscript while ink dries", image:publicFrame, motion:"Slow push-in", duration:5, screenRatio:"9:16" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.equal(requests[0].url, "https://pixstag.com/api/v2/video_generation");
+  assert.equal(requests[0].options.headers.Authorization, "Bearer sk-pixstag-test");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.model, "MiniMax-H3");
+  assert.match(payload.content[0].text, /Candlelight flickers/);
+  assert.equal(payload.content[1].type, "image_url");
+  assert.equal(payload.content[1].role, "first_frame");
+  assert.equal(payload.content[1].image_url.url, publicFrame);
+  assert.equal(payload.ratio, "9:16"); assert.equal(payload.duration, 5); assert.equal(payload.resolution, "1080P");
+  assert.equal(requests[1].url, "https://pixstag.com/api/v2/query/video_generation/px-task-42");
+  assert.equal(result.videoUrl, "https://example.test/pixstag.mp4"); assert.equal(result.taskId, "px-task-42"); assert.equal(result.status, "succeeded"); assert.equal(result.duration, 5);
+});
+
+test("PixStag image-to-video uploads local frames to OSS and passes the presigned URL", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ task_id:"px-oss-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ task:{ id:"px-oss-task", status:"succeeded", content:{ url:"https://example.test/pixstag-oss.mp4" } } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  let uploaded = null;
+  const result = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"sk-pixstag-test", videoPrompt:"Candlelight flickers", image:png, motion:"Slow push-in", duration:5, screenRatio:"9:16" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000, ossUpload:async (dataUrl) => { uploaded = dataUrl; return "https://oss.example.test/shortform/frame.png?sign=abc123"; } });
+  assert.ok(String(uploaded || "").startsWith("data:image/"), "the local frame should be handed to the OSS uploader as a data URL");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.content[1].type, "image_url");
+  assert.equal(payload.content[1].role, "first_frame");
+  assert.equal(payload.content[1].image_url.url, "https://oss.example.test/shortform/frame.png?sign=abc123");
+  assert.equal(result.videoUrl, "https://example.test/pixstag-oss.mp4");
+});
+
+test("PixStag image-to-video fails with an actionable message when OSS is unconfigured", async () => {
+  const keys = ["OSS_REGION", "OSS_BUCKET", "OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  try {
+    await assert.rejects(
+      generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"sk-pixstag-test", videoPrompt:"Candlelight flickers", image:png, motion:"Slow push-in", duration:5, screenRatio:"9:16" }, { fetchImpl:async () => { throw new Error("should not call the provider"); }, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 }),
+      /OSS is not configured/
+    );
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
+
+test("PixStag plain-text provider errors surface the real message", async () => {
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === "POST") return new Response("invalid params, Key: 'ReferenceAllDTO.Content[1].ImageUrl.Url' Error:Field validation for 'Url' failed on the 'max' tag", { status:400, headers:{ "Content-Type":"text/plain" } });
+    return new Response("internal error: record not found", { status:404, headers:{ "Content-Type":"text/plain" } });
+  };
+  await assert.rejects(
+    generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"key", generationMode:"long-scenes", videoPrompt:"A lantern parade", motion:"Slow drift", duration:5 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 }),
+    /invalid params, Key: 'ReferenceAllDTO/
+  );
+});
+
+test("PixStag video adapter creates a text-to-video task and clamps duration to the 4-15 second range", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") return new Response(JSON.stringify({ task_id:"px-long-task" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ task:{ id:"px-long-task", status:"succeeded", content:{ url:"https://example.test/pixstag-long.mp4" }, duration:15 } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com/api/v2", model:"MiniMax-H3", apiKey:"key", generationMode:"long-scenes", videoPrompt:"A lantern parade moves through the old city gates at dusk", motion:"Slow drift", duration:2 }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.equal(requests[0].url, "https://pixstag.com/api/v2/video_generation");
+  const payload = JSON.parse(requests[0].options.body);
+  assert.equal(payload.content.length, 1);
+  assert.match(payload.content[0].text, /Generate the full scene directly/i);
+  assert.equal(payload.duration, 4);
+  assert.equal(payload.resolution, "1080P");
+  assert.equal(result.videoUrl, "https://example.test/pixstag-long.mp4");
+  assert.equal(result.duration, 15);
+});
+
+test("PixStag video adapter maps the 480p budget tier to 720P and retries with a lower resolution on rejection", async () => {
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (options.method === "POST") {
+      const payload = JSON.parse(options.body);
+      if (payload.resolution === "2K") return new Response(JSON.stringify({ error:{ code:"InvalidParameter", message:"resolution 2K is not available" } }), { status:400, headers:{ "Content-Type":"application/json" } });
+      return new Response(JSON.stringify({ task_id:"px-fallback" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    }
+    return new Response(JSON.stringify({ task:{ id:"px-fallback", status:"succeeded", content:{ url:"https://example.test/pixstag-fallback.mp4" } } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  const result = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"key", image:"https://cdn.example.test/frames/shot-042.png", resolution:"2k" }, { fetchImpl, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.deepEqual(requests.filter((request) => request.options.method === "POST").map((request) => JSON.parse(request.options.body).resolution), ["2K", "720P"]);
+  assert.equal(result.videoUrl, "https://example.test/pixstag-fallback.mp4");
+  const budget = await generateVideo({ videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"key", generationMode:"long-scenes", resolution:"480p", videoPrompt:"Quiet harbour", motion:"Slow drift" }, { fetchImpl:async (url, options = {}) => {
+    if (options.method === "POST") return new Response(JSON.stringify({ task_id:"px-budget" }), { status:200, headers:{ "Content-Type":"application/json" } });
+    return new Response(JSON.stringify({ task:{ id:"px-budget", status:"succeeded", content:{ url:"https://example.test/pixstag-budget.mp4" } } }), { status:200, headers:{ "Content-Type":"application/json" } });
+  }, sleepImpl:async () => {}, pollIntervalMs:250, timeoutMs:5000 });
+  assert.equal(budget.videoUrl, "https://example.test/pixstag-budget.mp4");
+});
+
+test("PixStag connection probe rejects an invalid API key and accepts a valid one", async () => {
+  const invalidKeyFetch = async (url) => {
+    assert.equal(url, "https://pixstag.com/api/v2/query/video_generation/connection-probe");
+    return new Response(JSON.stringify({ code:"1004", message:"login fail: Please carry the API secret key in the 'Authorization' field of the request header (1004)" }), { status:401, headers:{ "Content-Type":"application/json" } });
+  };
+  await assert.rejects(testProviderConnection({ target:"video", videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"sk-bad" }, { fetchImpl:invalidKeyFetch }), /login fail/);
+  const recordNotFoundFetch = async () => new Response(JSON.stringify({ message:"internal error: record not found" }), { status:500, headers:{ "Content-Type":"application/json" } });
+  const result = await testProviderConnection({ target:"video", videoKind:"pixstag", endpoint:"https://pixstag.com", model:"MiniMax-H3", apiKey:"sk-good" }, { fetchImpl:recordNotFoundFetch });
+  assert.equal(result.ok, true);
+  assert.equal(result.model, "MiniMax-H3");
+});
+
 test("video provider connection test uses the task-list API for Agent Plan", async () => {
   let requestUrl = "";
   const fetchImpl = async (url) => {
@@ -607,6 +918,27 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   assert.match(shots[0].videoPrompt, /moves naturally/);
   assert.equal(shots.at(-1).end, 82);
   assert.equal(Number(shots.reduce((sum, shot) => sum + shot.duration, 0).toFixed(2)), 82);
+});
+
+test("short-shot planning forwards the selected target shot length to the model", async () => {
+  let providerPayload;
+  const providerShots = Array.from({ length:11 }, (_, index) => ({
+    narration:`Short narration ${index + 1}.`, chinese:`短旁白 ${index + 1}。`, type:index === 0 ? "Opening" : "Narrative", duration:7.45,
+    prompt:`Photorealistic short scene ${index + 1}, vertical 9:16, no text, no watermark`,
+    videoPrompt:`The subject in short scene ${index + 1} moves naturally while the camera drifts slowly`, motion:"Slow drift",
+  }));
+  const fetchImpl = async (_url, options) => {
+    providerPayload = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ shots:providerShots }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"A complete 82-second narration.", audioDuration:82, shortClipDuration:8 }, { fetchImpl });
+  const planningInput = JSON.parse(providerPayload.messages[1].content);
+  assert.equal(planningInput.targetShotDurationSeconds, 8);
+  assert.equal(planningInput.targetClipDurationSeconds, null);
+  assert.equal(planningInput.targetShotCount, 11);
+  assert.match(providerPayload.messages[0].content, /target shot length is 8 seconds/);
+  assert.match(providerPayload.messages[0].content, /never longer than 12 seconds/);
+  assert.doesNotMatch(providerPayload.messages[0].content, /each shot should be 10–20 seconds/);
 });
 
 test("long-scene planning uses the selected 6-12 second target and direct video prompts", async () => {

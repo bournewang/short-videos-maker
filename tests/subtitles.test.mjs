@@ -56,3 +56,23 @@ test("subtitle filenames are safe and identify the language track", () => {
   assert.equal(subtitleFileName("My Episode: 1453!", "english"), "my-episode-1453-en.srt");
   assert.equal(subtitleFileName("", "chinese"), "shortform-video-zh-cn.srt");
 });
+
+// The transcriber expanded the first shot's narration into more words than the
+// script ("Alpha bravo." -> six spoken words), so word-count proportion would
+// start the second shot's cue inside the first shot's speech (at 25s). Text
+// alignment keeps each cue on its own spoken words.
+const driftShots = [
+  { index:0, start:0, end:30, duration:30, narration:"Alpha bravo.", chinese:"阿尔法布拉沃。" },
+  { index:1, start:30, end:33, duration:3, narration:"Charlie.", chinese:"查理。" },
+];
+const driftTranscription = { duration:33, segments:[{ start:0, end:33, words:[
+  { start:0, end:5, word:"Alpha" }, { start:5, end:10, word:"one" },
+  { start:10, end:15, word:"two" }, { start:15, end:20, word:"three" },
+  { start:20, end:25, word:"four" }, { start:25, end:30, word:"bravo" },
+  { start:30, end:33, word:"Charlie" },
+] }] };
+
+test("subtitle timing aligns shots to transcription text, not word-count proportion", () => {
+  assert.equal(buildSrt(driftShots, "english", driftTranscription),
+    "1\n00:00:00,000 --> 00:00:30,000\nAlpha bravo.\n\n2\n00:00:30,000 --> 00:00:33,000\nCharlie.\n");
+});

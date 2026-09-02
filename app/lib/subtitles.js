@@ -17,35 +17,73 @@ function transcriptionWords(transcription) {
   }).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start);
 }
 
+function normalizeWord(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9']/g, "").replace(/'/g, "");
+}
+
+function narrationWordsWithShots(shots) {
+  const list = [];
+  (Array.isArray(shots) ? shots : []).forEach((shot, shotIdx) => {
+    String(shot?.narration || "").trim().split(/\s+/).filter(Boolean)
+      .forEach((word) => list.push({ norm: normalizeWord(word), shotIdx }));
+  });
+  return list;
+}
+
+// Greedy text alignment of the ordered narration words against the transcription
+// words. Returns a transcription index per narration word (-1 when the transcriber
+// dropped or merged the word). This replaces word-count proportion, which drifts
+// seconds out of sync whenever the transcriber expands or contracts the word count
+// (e.g. numbers read aloud, contractions, dropped filler).
+function alignNarrationToTranscription(narration, transNorms) {
+  const aligned = new Array(narration.length).fill(-1);
+  let t = 0;
+  for (let n = 0; n < narration.length; n++) {
+    let found = -1;
+    for (let k = t; k < Math.min(transNorms.length, t + 8); k++) {
+      if (transNorms[k] === narration[n].norm) { found = k; break; }
+    }
+    if (found >= 0) { aligned[n] = found; t = found + 1; }
+  }
+  return aligned;
+}
+
+// Per-shot transcription words, aligned to each shot's narration by text.
+function alignedShotWords(shots, words) {
+  const perShot = (Array.isArray(shots) ? shots : []).map(() => []);
+  const narration = narrationWordsWithShots(shots);
+  if (narration.length < 2 || words.length < 2) return perShot;
+  const aligned = alignNarrationToTranscription(narration, words.map((word) => normalizeWord(word.text)));
+  narration.forEach((item, index) => { if (aligned[index] >= 0) perShot[item.shotIdx].push(words[aligned[index]]); });
+  return perShot;
+}
+
 // Trims a transcription to the words covered by the given shots' narration, so
-// word-position timing for a subset of shots (e.g. a two-shot sample build) maps
-// onto the matching slice of the recording instead of the whole word list.
+// timing for a subset of shots (e.g. a two-shot sample build) maps onto the
+// matching slice of the recording instead of the whole word list.
 export function transcriptionForShots(transcription, shots) {
   const words = transcriptionWords(transcription);
   if (words.length < 2) return transcription;
-  const narrationWords = (Array.isArray(shots) ? shots : []).reduce((sum, shot) => sum + Math.max(1, String(shot?.narration || "").trim().split(/\s+/).filter(Boolean).length), 0);
-  if (!narrationWords || words.length <= narrationWords) return transcription;
-  const trimmed = words.slice(0, narrationWords);
-  return { ...transcription, duration: trimmed.at(-1).end, segments: [{ start: trimmed[0].start, end: trimmed.at(-1).end, words: trimmed.map((word) => ({ start: word.start, end: word.end, word: word.text })) }] };
+  const subset = alignedShotWords(shots, words).flat();
+  if (subset.length < 2) return transcription;
+  if (subset[0] === words[0] && subset.at(-1) === words.at(-1)) return transcription;
+  return { ...transcription, duration: subset.at(-1).end, segments: [{ start: subset[0].start, end: subset.at(-1).end, words: subset.map((word) => ({ start: word.start, end: word.end, word: word.text })) }] };
 }
 
 // Builds cue objects with absolute start/end times.
-// With transcription: for multiple shots, maps each shot's narration to its proportional slice of the
-// transcription word list by word count — this gives correct timestamps even when shot.end is wrong
-// (e.g. the opening hook is pinned to 5s but the speech takes 20s). For a single shot, falls back to
-// the time-range approach. Without transcription, uses proportional word-count timing within shot.end.
+// With transcription: for multiple shots, maps each shot's narration to the
+// transcription words by text alignment — this gives correct timestamps even when
+// shot.end is wrong (e.g. the opening hook is pinned to 5s but the speech takes
+// 20s) and stays in sync when the transcriber's word count differs from the script.
+// For a single shot, falls back to the time-range approach. Without transcription,
+// uses proportional word-count timing within shot.end.
 export function subtitleCues(shots, transcription = null) {
   const words = transcriptionWords(transcription);
   const shotsArr = Array.isArray(shots) ? shots : [];
 
   // Multi-shot word-position mapping: ignore planned shot.end, use actual transcription timestamps
   const useWordPosition = words.length >= 2 && shotsArr.length > 1;
-  const narrationWordCounts = useWordPosition
-    ? shotsArr.map((s) => Math.max(1, String(s.narration || "").trim().split(/\s+/).filter(Boolean).length))
-    : null;
-  const totalNarrationWords = narrationWordCounts ? narrationWordCounts.reduce((s, c) => s + c, 0) : 0;
-
-  let wordOffset = 0;
+  const perShotAligned = useWordPosition ? alignedShotWords(shotsArr, words) : null;
 
   return shotsArr.flatMap((shot, shotIdx) => {
     const start = Math.max(0, Number(shot.start) || 0);
@@ -54,24 +92,21 @@ export function subtitleCues(shots, transcription = null) {
     const realDuration = end - start;
 
     const aligned = alignBilingualChunks(String(shot.narration || ""), String(shot.chinese || ""));
-    const wordCount = narrationWordCounts ? narrationWordCounts[shotIdx] : 0;
 
-    if (!aligned.length) {
-      if (useWordPosition) wordOffset += wordCount;
-      return [];
-    }
+    if (!aligned.length) return [];
 
     const weights = aligned.map((c) => Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length));
     const totalWeight = weights.reduce((s, w) => s + w, 0);
 
     let shotWords;
     if (useWordPosition) {
-      // Map this shot's words to a proportional slice of the transcription by narration word count.
-      // This is accurate even when shot.end is much shorter than the actual speech duration.
-      const wStart = Math.round(words.length * wordOffset / totalNarrationWords);
-      const wEnd = Math.min(words.length, Math.round(words.length * (wordOffset + wordCount) / totalNarrationWords));
-      shotWords = words.slice(wStart, wEnd);
-      wordOffset += wordCount;
+      shotWords = perShotAligned[shotIdx];
+      if (!shotWords.length && words.length >= 2) {
+        // Fallback when none of this shot's narration words matched the transcriber.
+        const narrationWordCount = Math.max(1, String(shot.narration || "").trim().split(/\s+/).filter(Boolean).length);
+        const estimatedEnd = start + narrationWordCount * 0.6;
+        shotWords = words.filter((w) => w.start >= start - 0.1 && w.start < Math.max(end, estimatedEnd) + 1);
+      }
     } else if (words.length >= 2) {
       // Single shot: expand the search window beyond shot.end using a ~100 wpm duration estimate
       // so a short planned shot.end doesn't cut off the transcription words.

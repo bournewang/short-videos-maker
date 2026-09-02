@@ -165,10 +165,11 @@ Copy `.env.example` to `.env.local` and add real keys. `.env.local` is ignored b
 
 Key environment variables:
 
-- `OPENAI_API_KEY`, `VOLCENGINE_API_KEY` — provider API keys.
-- `TEXT_PROVIDER`, `TEXT_MODEL` — active chat/planning provider.
-- `IMAGE_PROVIDER`, `IMAGE_MODEL` — active image generation provider.
-- `VIDEO_PROVIDER`, `VIDEO_MODEL` — active video generation provider (currently Volcengine only).
+- `OPENAI_API_KEY`, `VOLCENGINE_API_KEY`, `DASHSCOPE_API_KEY`, `PIXSTAG_API_KEY` — provider API keys.
+- `TEXT_PROVIDER`, `IMAGE_PROVIDER`, `VIDEO_PROVIDER` — active provider per modality (openai / volcengine / dashscope / pixstag / sdwebui, depending on modality).
+- `{PROVIDER}_{MODALITY}_MODEL` (e.g. `DASHSCOPE_VIDEO_MODEL=wan3.0-video`, `PIXSTAG_VIDEO_MODEL=MiniMax-H3`, `VOLCENGINE_IMAGE_MODEL=...`) — model name per provider and modality. Preferred naming: models are scoped to their provider, so switching `VIDEO_PROVIDER` never leaks a model name into another provider's requests.
+- `{PROVIDER}_{MODALITY}_ENDPOINT` — optional endpoint override per modality (`DASHSCOPE_HOST` is also accepted for the shared DashScope host).
+- Legacy `TEXT_MODEL` / `IMAGE_MODEL` / `VIDEO_MODEL` still work, but only apply to the currently selected provider.
 - `TRANSCRIPTION_ENDPOINT`, `TRANSCRIPTION_LANGUAGE` — local STT endpoint.
 - `TEXT_REQUEST_TIMEOUT_MS`, `VIDEO_REQUEST_TIMEOUT_MS`, `VIDEO_POLL_INTERVAL_MS` — bridge timeouts.
 - `SHORTFORM_PORT` — render bridge port (default `4317`).

@@ -78,6 +78,17 @@ async function logRenderError(event, error, details = {}) {
   }
 }
 
+/* General-purpose debug log line (success paths and intermediate steps). */
+async function logRenderEvent(event, details = {}) {
+  const entry = { time:new Date().toISOString(), event, ...details };
+  try {
+    await mkdir(logRoot, { recursive:true });
+    await appendFile(renderLogFile, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (logError) {
+    console.error("[render-service] failed to write log:", logError instanceof Error ? logError.message : logError);
+  }
+}
+
 /* Re-check a non-terminal HeyGen video record against the API and persist the result. */
 async function syncHeyGenVideoRecord(video) {
   if (!video || !video.heygenTaskId) return video;
@@ -108,10 +119,13 @@ const providerDefaults = {
   image: {
     openai: { endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1" },
     volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128" },
+    dashscope: { endpoint:"https://dashscope.aliyuncs.com", model:"qwen-image-3.0-pro" },
     sdwebui: { endpoint:"http://127.0.0.1:7860", model:"Local checkpoint" },
   },
   video: {
     volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", model:"doubao-seedance-2-0-260128" },
+    dashscope: { endpoint:"https://dashscope.aliyuncs.com", model:"wan3.0-video" },
+    pixstag: { endpoint:"https://pixstag.com", model:"MiniMax-H3" },
   },
   text: {
     openai: { endpoint:"https://api.openai.com/v1/chat/completions", model:"gpt-4.1-mini" },
@@ -137,10 +151,17 @@ function configuredProvider(modality, kind, fallbackKind) {
   const providerName = normalizedKind.replace(/[^a-z0-9]+/g, "_").toUpperCase();
   const defaults = providerDefaults[modality]?.[normalizedKind] || {};
   const selected = selectedProvider(modality, fallbackKind);
+  // DashScope (Aliyun Bailian) keys share one host: DASHSCOPE_HOST is accepted
+  // alongside the per-modality DASHSCOPE_<MODALITY>_ENDPOINT override.
+  const dashscopeHost = normalizedKind === "dashscope" ? String(process.env.DASHSCOPE_HOST || "").trim() : "";
   return {
     kind: normalizedKind,
-    endpoint: process.env[`${providerName}_${modalityName}_ENDPOINT`] || defaults.endpoint || "",
-    model: (normalizedKind === selected ? process.env[`${modalityName}_MODEL`] : "") || defaults.model || "",
+    endpoint: process.env[`${providerName}_${modalityName}_ENDPOINT`] || dashscopeHost || defaults.endpoint || "",
+    // Per-provider model override ({PROVIDER}_{MODALITY}_MODEL) always wins, so
+    // VIDEO_PROVIDER can switch freely without model names leaking across
+    // providers. The legacy global {MODALITY}_MODEL still applies, but only
+    // to the currently selected provider (backward compatibility).
+    model: process.env[`${providerName}_${modalityName}_MODEL`] || (normalizedKind === selected ? process.env[`${modalityName}_MODEL`] : "") || defaults.model || "",
     apiKey: process.env[`${providerName}_API_KEY`] || "",
   };
 }
@@ -197,6 +218,7 @@ function resolveVideoProvider(data = {}) {
     motion:data.motion,
     duration:data.duration,
     screenRatio:data.screenRatio,
+    resolution:data.resolution,
   };
 }
 
@@ -229,6 +251,7 @@ function resolveTextProvider(data = {}) {
     creativeDirection: data.creativeDirection,
     productionMode: data.productionMode,
     longClipDuration: data.longClipDuration,
+    shortClipDuration: data.shortClipDuration,
     screenRatio: data.screenRatio,
     audioDuration: data.audioDuration,
     transcription: data.transcription,
@@ -500,6 +523,63 @@ async function providerImageUrl(value) {
   return value;
 }
 
+/* Aliyun OSS helpers. PixStag (MiniMax-H3) only accepts a publicly reachable
+   first-frame URL, so local storyboard frames are uploaded to a private OSS
+   bucket and replaced with a short-lived presigned GET URL. */
+function ossConfig() {
+  return {
+    region: String(process.env.OSS_REGION || "").trim(),
+    bucket: String(process.env.OSS_BUCKET || "").trim(),
+    accessKeyId: String(process.env.OSS_ACCESS_KEY_ID || "").trim(),
+    accessKeySecret: String(process.env.OSS_ACCESS_KEY_SECRET || "").trim(),
+  };
+}
+
+function ossRegionForSdk(region) {
+  const value = String(region || "").trim();
+  if (!value) return "";
+  if (value.startsWith("oss-") || value.includes("aliyuncs.com")) return value;
+  return `oss-${value}`;
+}
+
+function ossObjectKey(mime) {
+  const extension = (String(mime || "").split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "").slice(0, 8) || "bin";
+  return `shortform/pixstag-firstframe/${randomUUID()}.${extension}`;
+}
+
+async function ossClient(config) {
+  const OSS = (await import("ali-oss")).default;
+  return new OSS({
+    region: ossRegionForSdk(config.region),
+    accessKeyId: config.accessKeyId,
+    accessKeySecret: config.accessKeySecret,
+    bucket: config.bucket,
+    secure: true,
+    timeout: 120000,
+  });
+}
+
+async function uploadToOssAndSign(dataUrl) {
+  const config = ossConfig();
+  if (!config.region || !config.bucket || !config.accessKeyId || !config.accessKeySecret) {
+    throw new Error("OSS is not configured for PixStag first-frame upload. Set OSS_REGION, OSS_BUCKET, OSS_ACCESS_KEY_ID, and OSS_ACCESS_KEY_SECRET in .env.local, or switch to Aliyun Bailian (Wan) / Volcengine (Seedance) for image-to-video.");
+  }
+  const { mime, data } = fromDataUrl(dataUrl);
+  const client = await ossClient(config);
+  const key = ossObjectKey(mime);
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await client.put(key, data, { mime });
+      return client.signatureUrl(key, { expires: 900 });
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    }
+  }
+  throw lastError;
+}
+
 export async function prepareProviderImage(value, screenRatio, options = {}) {
   const ratio = normalizeScreenRatio(screenRatio);
   const dimensions = ratio === "16:9" ? { width:1920, height:1080 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
@@ -523,6 +603,14 @@ function run(command, args) {
     const child = spawn(command, args, { cwd: root, stdio: ["ignore", "ignore", "pipe"] }); let stderr = "";
     child.stderr.on("data", (chunk) => { stderr += chunk.toString(); if (stderr.length > 30000) stderr = stderr.slice(-30000); });
     child.on("error", reject); child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${command} exited with ${code}: ${stderr.slice(-2500)}`)));
+  });
+}
+
+function probeHasAudio(file) {
+  return new Promise((resolve) => {
+    const child = spawn("ffprobe", ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", file]);
+    let stdout = ""; child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", () => resolve(false)); child.on("close", () => resolve(stdout.trim().length > 0));
   });
 }
 
@@ -663,7 +751,7 @@ export async function renderEpisode(payload, options = {}) {
   const totalShots = payload.shots.length;
   const report = (stage, percent, completedShots = 0) => { if (typeof options.onProgress === "function") options.onProgress({ stage, percent, completedShots, totalShots }); };
   report("Preparing sources", 2);
-  let cursor = 0; const shots = [];
+  let cursor = 0; let hasClipAudio = false; const shots = [];
   for (let i = 0; i < payload.shots.length; i += 1) {
     if (!payload.shots[i].video && !payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image or video clip`);
     const duration = Math.max(.6, Number(payload.shots[i].duration) || 2);
@@ -676,6 +764,8 @@ export async function renderEpisode(payload, options = {}) {
     // Intermediate segments are encoded near-lossless so the single final
     // encode (which burns subtitles) is the only lossy step.
     const segmentEncoding = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"];
+    const clipAudioSource = payload.shots[i].video && await probeHasAudio(source) ? source : "";
+    if (clipAudioSource) hasClipAudio = true;
     if (payload.shots[i].video) {
       await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     } else if (frameLayout === "fit") {
@@ -686,7 +776,7 @@ export async function renderEpisode(payload, options = {}) {
       const stillMotion = stillMotionFilter(payload.shots[i].motion, width, height, duration, i);
       await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     }
-    shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment }); cursor += duration;
+    shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment, clipAudioSource }); cursor += duration;
     report(`Encoding shot ${i + 1}/${totalShots}`, 2 + Math.round(68 * (i + 1) / totalShots), i + 1);
   }
   report("Processing narration", 74, totalShots);
@@ -699,25 +789,51 @@ export async function renderEpisode(payload, options = {}) {
     customBgm = path.join(bgmRoot, filename);
     await readFile(customBgm);
   }
+  const quoteConcat = (value) => value.replace(/'/g, "'\\''");
+  let clipAudio = "";
+  if (hasClipAudio) {
+    report("Mixing clip audio", 76, totalShots);
+    const clipAudioFiles = [];
+    for (let i = 0; i < shots.length; i += 1) {
+      const clipAudioPart = path.join(jobDir, `clip-audio-${String(i).padStart(3,"0")}.wav`);
+      if (shots[i].clipAudioSource) {
+        await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", shots[i].clipAudioSource, "-t", String(shots[i].duration), "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", clipAudioPart]);
+      } else {
+        await run("ffmpeg", ["-y", "-f", "lavfi", "-t", String(shots[i].duration), "-i", "anullsrc=channel_layout=stereo:sample_rate=48000", "-c:a", "pcm_s16le", clipAudioPart]);
+      }
+      clipAudioFiles.push(clipAudioPart);
+    }
+    const clipAudioList = path.join(jobDir, "clip-audio-list.txt");
+    await writeFile(clipAudioList, clipAudioFiles.map((file) => `file '${quoteConcat(file)}'`).join("\n"));
+    clipAudio = path.join(jobDir, "clip-audio.wav");
+    await run("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", clipAudioList, "-c", "copy", clipAudio]);
+  }
   report("Writing subtitles", 78, totalShots);
   const ass = path.join(jobDir, "captions.ass"); await writeFile(ass, buildSubtitleAss(shots, width, height, subtitleStyle, payload.broadcastMode, payload.headlineText, payload.headlinePosition, payload.transcription));
   const concatFile = path.join(jobDir, "segments.txt");
-  const quoteConcat = (value) => value.replace(/'/g, "'\\''");
   await writeFile(concatFile, shots.map((shot) => `file '${quoteConcat(shot.segment)}'`).join("\n"));
   const output = options.output || path.join(exportRoot, `${id}.mp4`); const args = ["-y", "-f", "concat", "-safe", "0", "-i", concatFile];
-  const audioInputs = [];
-  if (narration) { audioInputs.push({ kind: "narration", index: 1 }); args.push("-i", narration); }
-  if (customBgm) { audioInputs.push({ kind: "bgm", index: 1 + audioInputs.length }); args.push("-stream_loop", "-1", "-i", customBgm); }
-  if (!audioInputs.length) { audioInputs.push({ kind:"silence", index:1 }); args.push("-f", "lavfi", "-t", String(total), "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"); }
+  if (narration) args.push("-i", narration);
+  if (customBgm) args.push("-stream_loop", "-1", "-i", customBgm);
+  if (clipAudio) args.push("-i", clipAudio);
+  let audioIndex = 1;
+  const narrationIndex = narration ? audioIndex++ : 0;
+  const bgmIndex = customBgm ? audioIndex++ : 0;
+  const clipIndex = clipAudio ? audioIndex++ : 0;
   const filters = [];
   const escapedAss = ass.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
   filters.push(`[0:v]setpts=PTS-STARTPTS,ass=filename='${escapedAss}'[vout]`);
-  const narrationInput = audioInputs.find((item) => item.kind === "narration"); const bgmInput = audioInputs.find((item) => item.kind === "bgm");
   const requestedBgmVolume = Number(payload.bgmVolume); const bgmVolume = Number.isFinite(requestedBgmVolume) ? Math.max(0, Math.min(.2, requestedBgmVolume)) : .08;
-  if (narrationInput && bgmInput) filters.push(`[${narrationInput.index}:a]volume=1[nar];[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[bg];[nar][bg]amix=inputs=2:duration=longest:dropout_transition=2,alimiter=limit=.8414:level=false[aout]`);
-  else if (narrationInput) filters.push(`[${narrationInput.index}:a]volume=1[aout]`);
-  else if (bgmInput) filters.push(`[${bgmInput.index}:a]atrim=0:${total},volume=${bgmVolume}[aout]`);
-  else filters.push(`[${audioInputs[0].index}:a]atrim=0:${total}[aout]`);
+  // Mix clip audio (real sound from video clips, silence for stills) with
+  // narration and BGM. normalize=0 keeps each source at its explicit volume
+  // instead of dividing by the number of inputs.
+  const mixLabels = [];
+  if (clipIndex) { filters.push(`[${clipIndex}:a]atrim=0:${total}[clip]`); mixLabels.push("[clip]"); }
+  if (narrationIndex) { filters.push(`[${narrationIndex}:a]volume=1[nar]`); mixLabels.push("[nar]"); }
+  if (bgmIndex) { filters.push(`[${bgmIndex}:a]atrim=0:${total},volume=${bgmVolume}[bg]`); mixLabels.push("[bg]"); }
+  if (mixLabels.length === 0) filters.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${total}[aout]`);
+  else if (mixLabels.length === 1) filters.push(`${mixLabels[0]}anull[aout]`);
+  else filters.push(`${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=longest:normalize=0:dropout_transition=2,alimiter=limit=.8414:level=false[aout]`);
   args.push("-filter_complex", filters.join(";"), "-map", "[vout]", "-map", "[aout]", "-t", String(total), "-r", "30", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output);
   report("Final assembly", 82, totalShots);
   const ffmpegCmd = `ffmpeg ${args.map((arg) => `'${arg.replace(/'/g, "'\\''")}'`).join(" ")}`;
@@ -755,6 +871,21 @@ export async function generateImage(data, options = {}) {
   }
   const volcengineSize = screenRatio === "16:9" ? "3840x2160" : screenRatio === "1:1" ? "4096x4096" : "2160x3840";
   const openaiSize = screenRatio === "16:9" ? "1536x1024" : screenRatio === "1:1" ? "1024x1024" : "1024x1536";
+  if (data.kind === "dashscope") {
+    // Qwen-Image 3.0 (sync multimodal-generation API); free pixel budget is
+    // 512*512 to 2048*2048, so 16:9 / 9:16 / 1:1 map to 2048-wide frames.
+    const dashscopeSize = screenRatio === "16:9" ? "2048*1152" : screenRatio === "1:1" ? "2048*2048" : "1152*2048";
+    const response = await fetchImpl(dashscopeImageGenerationEndpoint(data.endpoint), { method:"POST", headers:{"Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}`}, body:JSON.stringify({
+      model:data.model,
+      input:{ messages:[{ role:"user", content:[{ text:prompt }] }] },
+      parameters:{ size:dashscopeSize, n:1, prompt_extend:false, watermark:false, negative_prompt:"text, watermark, logo, low quality, distorted anatomy, duplicate subjects" },
+    }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.message || result.code || `Provider returned ${response.status}`);
+    const item = result.output?.choices?.[0]?.message?.content?.find((entry) => entry?.image);
+    if (!item?.image) throw new Error("Provider returned no image");
+    return item.image;
+  }
   const requestBody = data.kind === "volcengine"
     ? { model:data.model, prompt, size:volcengineSize, response_format:"url", watermark:false }
     : { model:data.model, prompt, size:openaiSize, n:1, response_format:"b64_json" };
@@ -774,6 +905,24 @@ function videoTasksEndpoint(endpoint) {
   return providerEndpoint(endpoint, "contents/generations/tasks");
 }
 
+/* DashScope native API helpers: the endpoint may be a bare host
+   (DASHSCOPE_HOST) or already carry an /api/v1/... path. */
+function dashscopeApiBase(endpoint) {
+  return String(endpoint || "").replace(/\/+$/, "").replace(/\/api\/v1.*$/, "");
+}
+
+function dashscopeVideoSynthesisEndpoint(endpoint) {
+  return `${dashscopeApiBase(endpoint)}/api/v1/services/aigc/video-generation/video-synthesis`;
+}
+
+function dashscopeTasksEndpoint(endpoint) {
+  return `${dashscopeApiBase(endpoint)}/api/v1/tasks`;
+}
+
+function dashscopeImageGenerationEndpoint(endpoint) {
+  return `${dashscopeApiBase(endpoint)}/api/v1/services/aigc/multimodal-generation/generation`;
+}
+
 function textCompletionsEndpoint(endpoint) {
   return providerEndpoint(endpoint, "chat/completions");
 }
@@ -786,24 +935,67 @@ function providerError(result, status) {
   return result?.error?.message || (typeof result?.error === "string" ? result.error : "") || result?.message || `Provider returned ${status}`;
 }
 
+/* Providers occasionally answer errors as plain text ("invalid parameter...").
+   Parse defensively so the real message surfaces instead of a SyntaxError. */
+async function readProviderBody(response) {
+  const text = await response.text();
+  try { return JSON.parse(text); }
+  catch { return text.trim() ? { error:text.trim() } : {}; }
+}
+
+/* Retry a fetch on transient network failures (connection reset, socket close,
+   DNS flaps). HTTP responses — even error statuses — are returned as-is so
+   callers can surface the provider's real message. */
+async function fetchWithRetry(fetchImpl, url, options = {}, { attempts = 3, baseDelayMs = 1000 } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try { return await fetchImpl(url, options); }
+    catch (error) {
+      lastError = error;
+      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, baseDelayMs * attempt));
+    }
+  }
+  throw lastError;
+}
+
 export async function generateVideo(data, options = {}) {
   data = resolveVideoProvider(data);
-  if (data.kind !== "volcengine") throw new Error("Volcengine Ark is the only configured video provider");
+  if (data.kind !== "volcengine" && data.kind !== "dashscope" && data.kind !== "pixstag") throw new Error("Volcengine Ark, Aliyun DashScope (Wan), and PixStag (MiniMax-H3) are the only configured video providers");
   if (!data.endpoint || !data.apiKey || !data.model) throw new Error("Video endpoint, API key, and model are required");
   const fetchImpl = options.fetchImpl || fetch;
   const sleepImpl = options.sleepImpl || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   const pollIntervalMs = Math.max(250, Number(options.pollIntervalMs) || Number(process.env.VIDEO_POLL_INTERVAL_MS) || 5000);
   const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.VIDEO_REQUEST_TIMEOUT_MS) || 15 * 60 * 1000);
-  const endpoint = videoTasksEndpoint(data.endpoint);
   const screenRatio = normalizeScreenRatio(data.screenRatio);
   const duration = Math.max(2, Math.min(12, Math.ceil(Number(data.duration) || 5)));
   const directTextToVideo = data.generationMode === "long-scenes" || !data.image;
-  const image = directTextToVideo ? "" : await prepareProviderImage(data.image, screenRatio, { fetchImpl:options.imageFetchImpl });
+  /* PixStag only accepts a publicly reachable first-frame URL (its url field
+     rejects data URLs with an over-length error). Public URLs pass through
+     as-is; local storyboard frames and data URLs are uploaded to Aliyun OSS
+     and replaced with a short-lived presigned URL. */
+  let image = "";
+  if (!directTextToVideo) {
+    if (data.kind === "pixstag") {
+      const resolved = await providerImageUrl(data.image);
+      const isPublicUrl = /^https?:\/\//i.test(resolved) && !/localhost|127\.0\.0\.1|0\.0\.0\.0|::1/i.test(resolved);
+      image = isPublicUrl ? resolved : await (options.ossUpload || uploadToOssAndSign)(resolved);
+      await logRenderEvent("video-frame-prepared", { kind:data.kind, viaOss:!isPublicUrl, framePrefix:String(image || "").slice(0, 80) });
+    } else {
+      image = await prepareProviderImage(data.image, screenRatio, { fetchImpl:options.imageFetchImpl });
+    }
+  }
   const direction = String(data.motion || "Slow push-in").trim();
   const motionPrompt = promptForScreenRatio(data.videoPrompt || data.prompt || (directTextToVideo ? "Create a coherent cinematic scene with natural subject and environmental motion" : "Animate this storyboard frame naturally with coherent subject and environmental motion"), screenRatio);
   const prompt = directTextToVideo
     ? `${motionPrompt}. Camera direction: ${direction}. Generate the full scene directly from this description as one continuous take with coherent visual beats, stable identity and anatomy, consistent setting, lighting, and style; avoid text, logos, cuts, flicker, warping, morphing, or unrelated subjects.`
     : `${motionPrompt}. Camera direction override: ${direction}. Treat the supplied image as the exact first frame. Preserve its subject identity, composition, lighting, and visual style throughout one continuous shot; avoid text, logos, cuts, flicker, warping, morphing, or new subjects.`;
+  if (data.kind === "dashscope") {
+    return generateDashscopeVideo({ ...data, prompt, image, screenRatio, duration, directTextToVideo }, { fetchImpl, sleepImpl, pollIntervalMs, timeoutMs });
+  }
+  if (data.kind === "pixstag") {
+    return generatePixstagVideo({ ...data, prompt, image, screenRatio, duration, directTextToVideo }, { fetchImpl, sleepImpl, pollIntervalMs, timeoutMs });
+  }
+  const endpoint = videoTasksEndpoint(data.endpoint);
   const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
   // Some Seedance variants (e.g. *-fast) reject higher resolutions, especially
   // for image-to-video. Start high and fall back when the provider complains.
@@ -823,7 +1015,7 @@ export async function generateVideo(data, options = {}) {
       generate_audio:false,
       watermark:false,
     }) });
-    created = await createdResponse.json();
+    created = await readProviderBody(createdResponse);
     if (createdResponse.ok) break;
     const message = providerError(created, createdResponse.status);
     const resolutionRejected = /resolution/i.test(message) && resolutionCandidates.indexOf(resolution) < resolutionCandidates.length - 1;
@@ -835,7 +1027,7 @@ export async function generateVideo(data, options = {}) {
   while (Date.now() < deadline) {
     await sleepImpl(pollIntervalMs);
     const response = await fetchImpl(`${endpoint}/${encodeURIComponent(created.id)}`, { headers });
-    const result = await response.json();
+    const result = await readProviderBody(response);
     if (!response.ok) throw new Error(providerError(result, response.status));
     if (result.status === "succeeded") {
       if (!result.content?.video_url) throw new Error("Video task succeeded without a download URL");
@@ -843,6 +1035,124 @@ export async function generateVideo(data, options = {}) {
     }
     if (result.status === "failed" || result.status === "cancelled") throw new Error(providerError(result, result.status));
     if (result.status !== "queued" && result.status !== "running") throw new Error(`Video provider returned unexpected task status: ${result.status || "unknown"}`);
+  }
+  throw new Error(`Video generation timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+}
+
+/* Aliyun Bailian (DashScope) Wan video generation. Creates an asynchronous
+   task via /api/v1/services/aigc/video-generation/video-synthesis (requires
+   the X-DashScope-Async header) and polls /api/v1/tasks/{task_id} until the
+   clip URL appears in output.video_url. */
+async function generateDashscopeVideo(data, options = {}) {
+  const { fetchImpl, sleepImpl, pollIntervalMs, timeoutMs } = options;
+  const endpoint = dashscopeVideoSynthesisEndpoint(data.endpoint);
+  const tasksEndpoint = dashscopeTasksEndpoint(data.endpoint);
+  const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}`, "X-DashScope-Async":"enable" };
+  const requestedResolution = /^(1080|720|480)p$/i.test(String(data.resolution || "")) ? `${String(data.resolution).replace(/p$/i, "").toUpperCase()}P` : "1080P";
+  const resolutionCandidates = [...new Set([requestedResolution, "720P", "480P"])];
+  // Wan clips support discrete lengths (5s / 10s); snap the requested duration.
+  const duration = Number(data.duration) >= 8 ? 10 : 5;
+  let created = null;
+  for (const resolution of resolutionCandidates) {
+    const createdResponse = await fetchImpl(endpoint, { method:"POST", headers, body:JSON.stringify({
+      model:data.model,
+      input: data.directTextToVideo
+        ? { prompt:data.prompt }
+        : { prompt:data.prompt, media:[{ type:"first_frame", url:data.image }] },
+      parameters:{ resolution, ratio:data.screenRatio, duration, prompt_extend:false, watermark:false },
+    }) });
+    created = await readProviderBody(createdResponse);
+    if (createdResponse.ok) break;
+    const message = providerError(created, createdResponse.status);
+    const resolutionRejected = /resolution/i.test(message) && resolutionCandidates.indexOf(resolution) < resolutionCandidates.length - 1;
+    if (!resolutionRejected) throw new Error(message);
+  }
+  const taskId = created?.output?.task_id;
+  if (!taskId) throw new Error(created?.message || created?.code || "Video provider returned no task ID");
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleepImpl(pollIntervalMs);
+    const response = await fetchImpl(`${tasksEndpoint}/${encodeURIComponent(taskId)}`, { headers:{ Authorization:`Bearer ${data.apiKey}` } });
+    const result = await readProviderBody(response);
+    if (!response.ok) throw new Error(providerError(result, response.status));
+    const status = String(result.output?.task_status || "").toUpperCase();
+    if (status === "SUCCEEDED") {
+      if (!result.output?.video_url) throw new Error("Video task succeeded without a download URL");
+      return { taskId, videoUrl:result.output.video_url, duration:Number(result.output?.duration) || duration, status:"succeeded" };
+    }
+    if (status === "FAILED" || status === "CANCELED" || status === "CANCELLED") throw new Error(result.output?.message || result.output?.code || `Video task failed (${status})`);
+    if (status !== "PENDING" && status !== "RUNNING" && status !== "QUEUED") throw new Error(`Video provider returned unexpected task status: ${status || "unknown"}`);
+  }
+  throw new Error(`Video generation timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+}
+
+/* PixStag endpoint helpers: the endpoint may be a bare host
+   (https://pixstag.com) or already carry an /api/v2/... path. */
+function pixstagApiBase(endpoint) {
+  return String(endpoint || "").replace(/\/+$/, "").replace(/\/api\/v2.*$/, "");
+}
+
+function pixstagVideoGenerationEndpoint(endpoint) {
+  return `${pixstagApiBase(endpoint)}/api/v2/video_generation`;
+}
+
+function pixstagQueryVideoEndpoint(endpoint, taskId) {
+  return `${pixstagApiBase(endpoint)}/api/v2/query/video_generation/${encodeURIComponent(taskId)}`;
+}
+
+/* PixStag (MiniMax-H3) video generation. Mirrors the MiniMax V2 protocol:
+   POST /api/v2/video_generation with a multimodal content[] array, then poll
+   GET /api/v2/query/video_generation/{task_id} until task.status succeeds and
+   the clip URL appears in task.content.url. */
+async function generatePixstagVideo(data, options = {}) {
+  const { fetchImpl, sleepImpl, pollIntervalMs, timeoutMs } = options;
+  const endpoint = pixstagVideoGenerationEndpoint(data.endpoint);
+  const headers = { "Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}` };
+  // PixStag supports 720P / 768P / 1080P / 2K. Map the app's 480p budget
+  // tier up to 720P (PixStag's cheapest) and fall back when rejected.
+  const normalizedResolution = String(data.resolution || "").toLowerCase();
+  const requestedResolution = normalizedResolution === "480p" || normalizedResolution === "720p" ? "720P" : normalizedResolution === "2k" ? "2K" : "1080P";
+  const resolutionCandidates = [...new Set([requestedResolution, "720P"])];
+  // MiniMax-H3 accepts integer durations from 4 to 15 seconds.
+  const duration = Math.max(4, Math.min(15, Math.ceil(Number(data.duration) || 5)));
+  let created = null;
+  for (const resolution of resolutionCandidates) {
+    const createdResponse = await fetchWithRetry(fetchImpl, endpoint, { method:"POST", headers, body:JSON.stringify({
+      model:data.model,
+      content: data.directTextToVideo
+        ? [{ type:"text", text:data.prompt }]
+        : [
+            { type:"text", text:data.prompt },
+            { type:"image_url", image_url:{ url:data.image }, role:"first_frame" },
+          ],
+      duration,
+      ratio:data.screenRatio,
+      resolution,
+    }) });
+    created = await readProviderBody(createdResponse);
+    if (createdResponse.ok) break;
+    const message = providerError(created, createdResponse.status);
+    const resolutionRejected = /resolution/i.test(message) && resolutionCandidates.indexOf(resolution) < resolutionCandidates.length - 1;
+    if (!resolutionRejected) throw new Error(message);
+  }
+  const taskId = created?.task_id;
+  if (!taskId) throw new Error(providerError(created, 0) || "Video provider returned no task ID");
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleepImpl(pollIntervalMs);
+    const response = await fetchWithRetry(fetchImpl, pixstagQueryVideoEndpoint(data.endpoint, taskId), { headers:{ Authorization:`Bearer ${data.apiKey}` } });
+    const result = await readProviderBody(response);
+    if (!response.ok) throw new Error(providerError(result, response.status));
+    const task = result.task || {};
+    const status = String(task.status || "").toLowerCase();
+    if (status === "succeeded") {
+      if (!task.content?.url) throw new Error("Video task succeeded without a download URL");
+      return { taskId, videoUrl:task.content.url, duration:Number(task.duration) || duration, status };
+    }
+    if (status === "failed" || status === "cancelled" || status === "expired") throw new Error(task.error?.message || task.error?.code || `Video task failed (${status})`);
+    if (status !== "queued" && status !== "running") throw new Error(`Video provider returned unexpected task status: ${status || "unknown"}`);
   }
   throw new Error(`Video generation timed out after ${Math.round(timeoutMs / 1000)} seconds`);
 }
@@ -992,7 +1302,7 @@ export async function planEpisode(data, options = {}) {
   const mixedMode = productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(config.longClipDuration) || 10)));
   const shortClipDuration = Math.max(5, Math.min(20, Math.round(Number(config.shortClipDuration) || 15)));
-  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: each shot should be 10–20 seconds and may contain multiple sentences; prefer natural topic shifts, scene changes, or turning points over arbitrary cuts. Group related sentences into one shot and split only when the subject, location, or action meaningfully changes. The opening hook must be about 5 seconds; ordinary narration 8–15; climaxes 6–12; maps and timelines 10–18; emotional turns 8–15. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const mixedSystem = `${shortSystem} This request uses mixed mode to control generation cost. Add videoRecommended (boolean) to every shot. When targetAnimatedShotCount is supplied, mark exactly that many shots true; otherwise mark roughly one in every four shots true. Mark all others false. Spread the selections across the full episode and prioritize the opening hook, climaxes, emotional turns, and shots where real subject or environmental motion adds clear value. A recommended video still begins from its generated storyboard image; write every videoPrompt so it also works as a strong image-to-video instruction. Do not recommend adjacent shots unless the narrative makes both essential.`;
   const longSystem = `You are a senior text-to-video scene planner for short-form social video. Divide the supplied English narration into meaningful consecutive scenes for direct text-to-video generation, without creating or relying on storyboard images. Preserve every spoken word in order across the narration fields and do not add unsupported facts. Prefer natural pauses, complete ideas, and real changes of setting or action over arbitrary cuts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each scene must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, videoPrompt (a detailed direct text-to-video prompt of at most 100 words), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static). The videoPrompt must faithfully visualize the complete narration excerpt as a coherent sequence of two or three timed visual beats within one continuous take. Describe subject identity and appearance, setting, actions in order, environmental motion, lighting, pace, camera path, and continuity. Do not refer to a supplied image or first frame. Exclude cuts, unrelated subjects, text, logos, flicker, unstable anatomy, warping, and morphing. The first scene (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening is weak. Its videoPrompt must create immediate visual impact: dramatic cinematic lighting, striking composition, and visual tension or mystery. Never open with a map, chart, diagram, split-screen comparison, or flat informational establishing shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion. The opening should feel like a movie teaser, not a textbook illustration. For historical subjects or whenever the narration contains a date or period cue, explicitly name the most accurate era or date and location supported by the script and require period-accurate architecture, landscape or interiors, clothing, materials, props, transport, weapons, and technology; never mix eras or include anachronisms. Target the requested clip length, keep every normal scene between 6 and 12 seconds, and rebalance neighboring scenes so the final scene is not needlessly short. A narration shorter than 6 seconds may remain one scene. When duration and scene-count guidance are supplied, return at least the minimum count and aim for the target count. Never return an empty object, empty narration, placeholder, or trailing item merely to reach a count. The sum of scene durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const system = longScenes ? longSystem : mixedMode ? mixedSystem : shortSystem;
@@ -1003,7 +1313,7 @@ export async function planEpisode(data, options = {}) {
   const maximumShotCount = narrationDuration && longScenes ? Math.max(targetShotCount, Math.floor(narrationDuration / 6)) : null;
   const targetAnimatedShotCount = mixedMode && targetShotCount ? Math.max(1, Math.ceil(targetShotCount / 4)) : null;
   const screenRatio = normalizeScreenRatio(config.screenRatio);
-  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
+  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetShotDurationSeconds:longScenes ? null : shortClipDuration, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
   const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a shots array");
   return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, productionMode, targetClipDuration, shortClipDuration, screenRatio, transcription:config.transcription });
 }
@@ -1047,6 +1357,26 @@ export async function testProviderConnection(data, options = {}) {
   if (target === "video" && !config.apiKey) throw new Error("No video API key is configured");
   if (target === "image" && config.kind !== "sdwebui" && !config.apiKey) throw new Error("No image API key is configured");
   const fetchImpl = options.fetchImpl || fetch;
+  if (target === "video" && config.kind === "pixstag") {
+    // PixStag mirrors the MiniMax V2 API: probing the task query endpoint
+    // with a dummy task ID returns 401 "login fail" for a rejected key and
+    // a not-found error for a valid one.
+    const probe = await fetchImpl(pixstagQueryVideoEndpoint(config.endpoint, "connection-probe"), { headers:{ Authorization:`Bearer ${config.apiKey}` } });
+    if (probe.status === 401 || probe.status === 403) {
+      const body = await probe.json().catch(() => ({}));
+      throw new Error(body?.message || "PixStag rejected the API key");
+    }
+    return { ok:true, target, model:config.model, endpoint:config.endpoint };
+  }
+  if ((target === "image" || target === "video") && config.kind === "dashscope") {
+    // DashScope's native API has no /models route. Probe the task query
+    // endpoint with a dummy task ID: a rejected key returns 401
+    // InvalidApiKey, while a valid key returns 404 "task not found".
+    const probe = await fetchImpl(`${dashscopeTasksEndpoint(config.endpoint)}/connection-probe`, { headers:{ Authorization:`Bearer ${config.apiKey}` } });
+    const body = await probe.json().catch(() => ({}));
+    if (probe.status === 401 || probe.status === 403 || body?.code === "InvalidApiKey") throw new Error(body?.message || "DashScope rejected the API key");
+    return { ok:true, target, model:config.model, endpoint:config.endpoint };
+  }
   const planText = target === "text" && config.kind === "volcengine" && isVolcenginePlanEndpoint(config.endpoint);
   const endpoint = target === "speech" ? `${speechApiBase(config.endpoint)}/v1/models` : planText ? textCompletionsEndpoint(config.endpoint) : target === "video" ? `${videoTasksEndpoint(config.endpoint)}?page_num=1&page_size=1` : modelsEndpoint(config.endpoint, config.kind);
   const response = await fetchImpl(endpoint, planText ? {
@@ -1172,10 +1502,13 @@ export function createRenderServer() {
       }
       if (req.method === "POST" && url.pathname === "/video/generate") {
         const payload = await body(req, 24*1024*1024);
+        await logRenderEvent("video-generate-start", { kind:payload.videoKind || payload.kind || null, generationMode:payload.generationMode || null, hasImage:Boolean(payload.image), imageKind:String(payload.image || "").slice(0, 40), episodeId:payload.episodeId || null, duration:payload.duration || null });
         const generated = await generateVideo(payload);
+        await logRenderEvent("video-generate-done", { taskId:generated.taskId || null, status:generated.status || null, videoUrlLen:String(generated.videoUrl || "").length, videoUrlPrefix:String(generated.videoUrl || "").slice(0, 80) });
         const cached = payload.episodeId
           ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, "videos", payload.assetName || randomUUID(), async (target) => await persistGeneratedVideo(generated.videoUrl, target))
           : await persistGeneratedVideo(generated.videoUrl);
+        await logRenderEvent("video-generate-persisted", { localUrl:cached?.url || null, localPath:cached?.path || null });
         json(res, 200, { video:cached.url, path:cached.path, taskId:generated.taskId, duration:generated.duration }); return;
       }
       if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
@@ -1334,6 +1667,7 @@ export function createRenderServer() {
               });
             });
             req.on("error", reject);
+            req.on("socket", (socket) => socket.on("error", reject));
             req.write(body);
             req.end();
           });
