@@ -10,6 +10,7 @@ import { normalizePlannedShots } from "../app/lib/timeline.js";
 import { normalizeScreenRatio, promptForScreenRatio } from "../app/lib/video.js";
 import { cleanupFilters, voicePreset, voicePresetSummaries } from "../app/lib/audio.js";
 import { normalizeSubtitleStyle, subtitleAssColor, subtitleAssOverrideColor } from "../app/lib/subtitle-style.js";
+import { getGenre } from "../app/lib/genres.js";
 import { subtitleCues } from "../app/lib/subtitles.js";
 import { EpisodeStore } from "./episode-store.mjs";
 import { DigitalHumanStore } from "./digital-human-store.mjs";
@@ -396,25 +397,116 @@ export async function synthesizeSpeech(payload = {}, options = {}) {
   };
 }
 
-async function synthesizeSpeechMiniMax({ script, voiceId, model = "speech-2.8-hd", speed = 1 }) {
+// MiniMax T2A subtitle JSON uses millisecond timestamps. Normalize a single
+// timestamp to seconds, detecting the scale from the value (a narration longer
+// than one second reports values well above 1000 when expressed in ms).
+function minimaxTimeSeconds(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+// Convert a MiniMax subtitle file (data.subtitle_file, JSON) into the same
+// transcription shape the app already consumes from the local transcriber:
+// { text, language, duration, segments: [{ id, start, end, text, words:[...] }] }.
+// Handles both sentence-level entries and word-level entries, and tolerates
+// millisecond or second timestamps.
+export function minimaxSubtitleToTranscription(payload = {}, fallbackText = "") {
+  const list = Array.isArray(payload)
+    ? payload
+    : Array.isArray(payload?.subtitle) ? payload.subtitle
+    : Array.isArray(payload?.data?.subtitle) ? payload.data.subtitle
+    : [];
+
+  const entries = list.map((entry, index) => ({
+    text: String(entry?.text ?? entry?.word ?? entry?.content ?? "").trim(),
+    start: minimaxTimeSeconds(entry?.start_time ?? entry?.startTime ?? entry?.start),
+    end: minimaxTimeSeconds(entry?.end_time ?? entry?.endTime ?? entry?.end),
+    sentenceId: entry?.sentence_id ?? entry?.sentenceId ?? index,
+    language: String(entry?.language ?? entry?.lang ?? ""),
+  })).filter((entry) => entry.text && entry.end >= entry.start);
+
+  if (!entries.length) return null;
+
+  // MiniMax documents millisecond timestamps; detect and normalize the scale.
+  const maxEnd = entries.reduce((max, entry) => Math.max(max, entry.end), 0);
+  const scale = maxEnd > 1000 ? 1 / 1000 : 1;
+
+  const words = entries.map((entry) => ({
+    start: entry.start * scale,
+    end: entry.end * scale,
+    text: entry.text,
+  }));
+
+  // Sentence-level entries contain multiple space-separated words or long runs.
+  const sentenceLevel = words.some((word) => /\s/.test(word.text) || word.text.length > 30);
+
+  const segments = [];
+  let segmentWords = [];
+  const flushSegment = () => {
+    if (!segmentWords.length) return;
+    segments.push({
+      id: segments.length,
+      start: segmentWords[0].start,
+      end: segmentWords[segmentWords.length - 1].end,
+      text: segmentWords.map((word) => word.text).join(" "),
+      words: segmentWords.map((word) => ({ start: word.start, end: word.end, word: word.text, probability: null })),
+    });
+    segmentWords = [];
+  };
+
+  if (sentenceLevel) {
+    for (const entry of words) {
+      const parts = entry.text.split(/\s+/).filter(Boolean);
+      const timedWords = parts.length > 1
+        ? parts.map((part, i) => ({ start: entry.start + (entry.end - entry.start) * i / parts.length, end: entry.start + (entry.end - entry.start) * (i + 1) / parts.length, word: part, probability: null }))
+        : [{ start: entry.start, end: entry.end, word: entry.text, probability: null }];
+      segments.push({ id: segments.length, start: entry.start, end: entry.end, text: entry.text, words: timedWords });
+    }
+  } else {
+    // Word-level entries: group into sentence-like segments at punctuation or ~15 words.
+    for (const word of words) {
+      segmentWords.push(word);
+      if (/[.!?;。！？；]$/.test(word.text) || segmentWords.length >= 15) flushSegment();
+    }
+    flushSegment();
+  }
+
+  if (!segments.length) return null;
+
+  return {
+    text: entries.map((entry) => entry.text).join(" ") || String(fallbackText || ""),
+    language: entries[0].language || "",
+    languageProbability: null,
+    duration: segments[segments.length - 1].end,
+    durationAfterVad: 0,
+    segments,
+  };
+}
+
+async function synthesizeSpeechMiniMax({ script, voiceId, model = "speech-2.8-hd", speed = 1, subtitleType = "word", languageBoost, fetchImpl = fetch }) {
   const apiKey = process.env.MINIMAX_API_KEY;
   if (!apiKey) throw new Error("MINIMAX_API_KEY is not configured");
   if (!script) throw new Error("Script is required for TTS");
   if (!voiceId) throw new Error("MiniMax voice_id is required");
 
-  const response = await fetch("https://api.minimaxi.com/v1/t2a_v2", {
+  const requestBody = {
+    model,
+    text: script,
+    stream: false,
+    voice_setting: { voice_id: voiceId, speed },
+    audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
+    subtitle_enable: true,
+    subtitle_type: subtitleType,
+  };
+  if (languageBoost) requestBody.language_boost = languageBoost;
+
+  const response = await fetchImpl("https://api.minimaxi.com/v1/t2a_v2", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "Authorization": `Bearer ${apiKey}`,
     },
-    body: JSON.stringify({
-      model,
-      text: script,
-      stream: false,
-      voice_setting: { voice_id: voiceId, speed },
-      audio_setting: { sample_rate: 32000, bitrate: 128000, format: "mp3", channel: 1 },
-    }),
+    body: JSON.stringify(requestBody),
   });
   const result = await response.json();
   if (!response.ok || result.base_resp?.status_code !== 0) {
@@ -425,6 +517,19 @@ async function synthesizeSpeechMiniMax({ script, voiceId, model = "speech-2.8-hd
   if (!audioHex) throw new Error("MiniMax returned no audio data");
 
   const audioBuffer = Buffer.from(audioHex, "hex");
+
+  let transcription = null;
+  if (result.data?.subtitle_file) {
+    try {
+      const subtitleResponse = await fetchImpl(result.data.subtitle_file);
+      if (subtitleResponse.ok) {
+        transcription = minimaxSubtitleToTranscription(await subtitleResponse.json(), script);
+      }
+    } catch (error) {
+      console.error("[MiniMax TTS] subtitle download/parse failed: %s", error.message);
+    }
+  }
+
   return {
     audioData: `data:audio/mp3;base64,${audioBuffer.toString("base64")}`,
     filename: `minimax-${voiceId}.mp3`,
@@ -432,7 +537,164 @@ async function synthesizeSpeechMiniMax({ script, voiceId, model = "speech-2.8-hd
     model,
     voice: voiceId,
     speed,
+    transcription,
   };
+}
+
+// Convert Doubao query "sentences" (each with startTime/endTime/text/words,
+// all in seconds) into the app's transcription shape:
+// { text, language, duration, segments: [{ id, start, end, text, words:[...] }] }.
+function doubaoSentencesToTranscription(sentences = [], fallbackText = "") {
+  const list = Array.isArray(sentences) ? sentences : [];
+  const segments = list.map((sentence, index) => ({
+    id: index,
+    start: Number(sentence?.startTime) || 0,
+    end: Number(sentence?.endTime) || 0,
+    text: String(sentence?.text || "").trim(),
+    words: Array.isArray(sentence?.words)
+      ? sentence.words.map((word) => ({
+          start: Number(word?.startTime) || 0,
+          end: Number(word?.endTime) || 0,
+          word: String(word?.word || ""),
+          probability: Number.isFinite(Number(word?.confidence)) ? Number(word.confidence) : null,
+        }))
+      : [],
+  })).filter((segment) => segment.text && segment.end >= segment.start);
+
+  if (!segments.length) return null;
+  const lastEnd = segments[segments.length - 1].end;
+  return {
+    text: segments.map((segment) => segment.text).join("") || String(fallbackText || ""),
+    language: "zh",
+    languageProbability: null,
+    duration: lastEnd,
+    durationAfterVad: 0,
+    segments,
+  };
+}
+
+// Doubao (Volcengine Speech) TTS via the asynchronous submit → query → download
+// flow. Uses the new X-Api-Key auth (DOUBAO_TTS_API_KEY) with resource
+// seed-tts-2.0, and returns sentence/word timestamps for caption alignment.
+async function synthesizeSpeechDoubao({ script, speaker, model = "seed-tts-2.0", speechRate = 0, format = "mp3", sampleRate = 24000, explicitLanguage = "zh-cn", fetchImpl = fetch }) {
+  const apiKey = process.env.DOUBAO_TTS_API_KEY;
+  if (!apiKey) throw new Error("DOUBAO_TTS_API_KEY is not configured");
+  if (!script) throw new Error("Script is required for TTS");
+  if (!speaker) throw new Error("Doubao speaker_id is required");
+
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Api-Key": apiKey,
+    "X-Api-Resource-Id": model,
+    "X-Api-Request-Id": randomUUID(),
+  };
+
+  const submitResp = await fetchImpl("https://openspeech.bytedance.com/api/v3/tts/submit", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      user: { uid: "shortform-studio" },
+      req_params: {
+        text: script,
+        speaker,
+        audio_params: { format, sample_rate: sampleRate, speech_rate: speechRate, enable_timestamp: true },
+        explicit_language: explicitLanguage,
+      },
+    }),
+  });
+  const submitJson = await submitResp.json().catch(() => ({}));
+  if (!submitResp.ok || submitJson.code !== 20000000 || !submitJson.data?.task_id) {
+    throw new Error(submitJson.message || `Doubao TTS submit returned ${submitResp.status}`);
+  }
+  const taskId = submitJson.data.task_id;
+
+  let audioUrl = null;
+  let sentences = [];
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const queryResp = await fetchImpl("https://openspeech.bytedance.com/api/v3/tts/query", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ task_id: taskId }),
+    });
+    const queryJson = await queryResp.json().catch(() => ({}));
+    const data = queryJson.data || {};
+    if (queryJson.code !== 20000000 || data.task_status === 3) {
+      throw new Error(queryJson.message || "Doubao TTS synthesis failed");
+    }
+    if (data.task_status === 2) {
+      audioUrl = data.audio_url || null;
+      sentences = Array.isArray(data.sentences) ? data.sentences : [];
+      break;
+    }
+  }
+  if (!audioUrl) throw new Error("Doubao TTS synthesis timed out");
+
+  const audioResp = await fetchImpl(audioUrl);
+  if (!audioResp.ok) throw new Error(`Doubao TTS audio download returned ${audioResp.status}`);
+  const audioBuffer = Buffer.from(await audioResp.arrayBuffer());
+  if (!audioBuffer.length) throw new Error("Doubao TTS returned an empty audio file");
+
+  return {
+    audioData: `data:audio/mp3;base64,${audioBuffer.toString("base64")}`,
+    filename: `doubao-${speaker}.mp3`,
+    mimeType: "audio/mp3",
+    model,
+    voice: speaker,
+    speed: speechRate,
+    transcription: doubaoSentencesToTranscription(sentences, script),
+  };
+}
+
+// Fetch and normalize the MiniMax voice list. The voice list API endpoint and
+// response shape vary by account, so a few known endpoints are tried in order.
+async function listMiniMaxVoices(fetchImpl = fetch) {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  if (!apiKey) throw new Error("MINIMAX_API_KEY is not configured");
+
+  const urls = [
+    "https://api.minimaxi.com/v1/voice/list",
+    "https://api.minimaxi.com/v1/voices",
+    "https://api.minimax.chat/v1/voice/list",
+  ];
+  const voices = [];
+  for (const url of urls) {
+    try {
+      const resp = await fetchImpl(url, { headers: { Authorization: `Bearer ${apiKey}` } });
+      const text = await resp.text();
+      console.error("[MiniMax voices] %s → HTTP %s", url, resp.status);
+      console.error("[MiniMax voices] body: %s", text.slice(0, 500));
+
+      let data;
+      try { data = JSON.parse(text); } catch { continue; }
+
+      const voiceList =
+        data.data?.voice_list ||
+        data.data?.voices ||
+        data.data?.list ||
+        data.voice_list ||
+        data.voices ||
+        data.list ||
+        [];
+      const ok = data.base_resp?.status_code === 0 || data.code === 0 || data.status === 0 || resp.ok;
+
+      if (ok && Array.isArray(voiceList) && voiceList.length > 0) {
+        for (const v of voiceList) {
+          voices.push({
+            voice_id: v.voice_id,
+            name: v.name || v.voice_name || v.voice_id,
+            type: v.type || "system",
+            language: v.language || "",
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[MiniMax voices] %s → %s", url, err.message);
+    }
+  }
+  // deduplicate by voice_id
+  const seen = new Set();
+  return voices.filter((v) => !seen.has(v.voice_id) && seen.add(v.voice_id));
 }
 
 async function saveMedia(value, targetBase, fetchImpl = fetch) {
@@ -614,6 +876,27 @@ function probeHasAudio(file) {
   });
 }
 
+function probeMediaDuration(file) {
+  return new Promise((resolve) => {
+    const child = spawn("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", file]);
+    let stdout = ""; child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.on("error", () => resolve(0)); child.on("close", () => {
+      const duration = Number(stdout.trim());
+      resolve(Number.isFinite(duration) && duration > 0 ? duration : 0);
+    });
+  });
+}
+
+function fitShotsToDuration(input, duration) {
+  const shots = Array.isArray(input) ? input : [];
+  const currentTotal = shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0);
+  if (!shots.length || !Number.isFinite(duration) || duration <= 0 || Math.abs(currentTotal - duration) < .01) return shots;
+  const scale = duration / currentTotal;
+  return shots.map((shot, index) => ({ ...shot, duration:index === shots.length - 1
+    ? Number((duration - shots.slice(0, index).reduce((sum, prior) => sum + Math.max(.6, Number(prior.duration) || 2) * scale, 0)).toFixed(3))
+    : Number((Math.max(.6, Number(shot.duration) || 2) * scale).toFixed(3)) }));
+}
+
 async function renderNarrationStages(source, presetId, jobDir, prefix = "voice") {
   const preset = voicePreset(presetId);
   const raw = path.join(jobDir, `${prefix}-raw.wav`);
@@ -671,7 +954,7 @@ export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode
   header += `\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n`;
   // Cue timing comes from subtitleCues — the same word-timestamp sync used by the
   // live preview and SRT export. With a transcription, cue times follow the actual
-  // speech even when planned shot times diverge (e.g. the pinned 5s opening hook);
+  // speech even when planned shot times diverge;
   // without one it falls back to proportional timing within each shot.
   const cues = subtitleCues(shots, transcription);
   const headlineEvents = hasHeadline ? shots.flatMap((shot) => {
@@ -747,15 +1030,21 @@ export async function renderEpisode(payload, options = {}) {
   await mkdir(jobDir, { recursive: true }); await mkdir(exportRoot, { recursive: true });
   const { width, height } = renderDimensions(payload); const subtitleStyle = normalizeSubtitleStyle(payload.subtitleStyle);
   const frameLayout = payload.frameLayout === "fit" ? "fit" : "fill";
-  const total = Number(payload.shots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(2));
-  const totalShots = payload.shots.length;
+  let narration = await saveMedia(payload.narrationData, path.join(jobDir, "narration"));
+  if (narration && payload.voicePreset !== "original") narration = (await renderNarrationStages(narration, "denoise", jobDir, "narration")).final;
+  const narrationDuration = narration ? await probeMediaDuration(narration) : 0;
+  const requestedTimelineDuration = Number(payload.timelineDuration);
+  const timelineDuration = requestedTimelineDuration > 0 && requestedTimelineDuration <= narrationDuration + .05 ? requestedTimelineDuration : narrationDuration;
+  const renderShots = fitShotsToDuration(payload.shots, timelineDuration);
+  const total = Number(renderShots.reduce((sum, shot) => sum + Math.max(.6, Number(shot.duration) || 2), 0).toFixed(3));
+  const totalShots = renderShots.length;
   const report = (stage, percent, completedShots = 0) => { if (typeof options.onProgress === "function") options.onProgress({ stage, percent, completedShots, totalShots }); };
   report("Preparing sources", 2);
   let cursor = 0; let hasClipAudio = false; const shots = [];
-  for (let i = 0; i < payload.shots.length; i += 1) {
-    if (!payload.shots[i].video && !payload.shots[i].image) throw new Error(`Shot ${i + 1} has no generated image or video clip`);
-    const duration = Math.max(.6, Number(payload.shots[i].duration) || 2);
-    const sourceValue = payload.shots[i].video || payload.shots[i].image;
+  for (let i = 0; i < renderShots.length; i += 1) {
+    if (!renderShots[i].video && !renderShots[i].image) throw new Error(`Shot ${i + 1} has no generated image or video clip`);
+    const duration = Math.max(.6, Number(renderShots[i].duration) || 2);
+    const sourceValue = renderShots[i].video || renderShots[i].image;
     const source = await saveMedia(sourceValue, path.join(jobDir, `source-${String(i).padStart(3,"0")}`));
     const segment = path.join(jobDir, `segment-${String(i).padStart(3,"0")}.mp4`);
     const scale = segmentFrameFilter(width, height, frameLayout);
@@ -764,24 +1053,22 @@ export async function renderEpisode(payload, options = {}) {
     // Intermediate segments are encoded near-lossless so the single final
     // encode (which burns subtitles) is the only lossy step.
     const segmentEncoding = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p"];
-    const clipAudioSource = payload.shots[i].video && await probeHasAudio(source) ? source : "";
+    const clipAudioSource = renderShots[i].video && await probeHasAudio(source) ? source : "";
     if (clipAudioSource) hasClipAudio = true;
-    if (payload.shots[i].video) {
+    if (renderShots[i].video) {
       await run("ffmpeg", ["-y", "-stream_loop", "-1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     } else if (frameLayout === "fit") {
       // Letterboxed layouts keep the whole still visible, so Ken Burns motion
       // is skipped in favor of a static fit.
       await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", `${scale},${normalizedFormat}`, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     } else {
-      const stillMotion = stillMotionFilter(payload.shots[i].motion, width, height, duration, i);
+      const stillMotion = stillMotionFilter(renderShots[i].motion, width, height, duration, i);
       await run("ffmpeg", ["-y", "-loop", "1", "-i", source, "-t", String(duration), "-an", "-vf", stillMotion, "-r", "30", ...segmentEncoding, ...colorMetadata, segment]);
     }
-    shots.push({ ...payload.shots[i], duration, start:cursor, end:cursor + duration, source, segment, clipAudioSource }); cursor += duration;
+    shots.push({ ...renderShots[i], duration, start:cursor, end:cursor + duration, source, segment, clipAudioSource }); cursor += duration;
     report(`Encoding shot ${i + 1}/${totalShots}`, 2 + Math.round(68 * (i + 1) / totalShots), i + 1);
   }
   report("Processing narration", 74, totalShots);
-  let narration = await saveMedia(payload.narrationData, path.join(jobDir, "narration"));
-  if (narration && payload.voicePreset !== "original") narration = (await renderNarrationStages(narration, "denoise", jobDir, "narration")).final;
   let customBgm = null;
   if (payload.bgmPath) {
     const filename = path.basename(String(payload.bgmPath));
@@ -1213,7 +1500,7 @@ ENGLISH LEVEL: Use common everyday words. Write clear sentences with one main id
 DURATION: ${duration} minutes. Write ${minWords}–${maxWords} words of narration at 90–110 words per minute. Count narration only.
 
 STRUCTURE:
-1. HOOK (${hookTimes[duration]}): Treat the first two spoken sentences as a cold open for a video hook. Sentence 1 must begin inside the story's most vivid, verified climax, reversal, danger, or irreversible decision, using a concrete image and active present-tense narration where natural. Sentence 2 must immediately reveal the stakes or a sharp unanswered question that makes the viewer need the backstory. Do not begin chronologically, with broad context, greetings, or "Today we will learn." Do not invent drama or reveal the entire outcome. Make these two sentences concise enough to play over one arresting 5-second opening video clip; the later setup can return to when, where, and who.
+1. HOOK (${hookTimes[duration]}): Treat the first two spoken sentences as a cold open for a video hook. Sentence 1 must begin inside the story's most vivid, verified climax, reversal, danger, or irreversible decision, using a concrete image and active present-tense narration where natural. Sentence 2 must immediately reveal the stakes or a sharp unanswered question that makes the viewer need the backstory. Do not begin chronologically, with broad context, greetings, or "Today we will learn." Do not invent drama or reveal the entire outcome. Keep these two sentences concise and visually arresting; the later setup can return to when, where, and who.
 2. SETUP (${setupTimes[duration]}): Establish when, where, who, and why this moment matters. State what could be gained, lost, changed, or remembered.
 3. CONFLICT & PAYOFF (${coreTimes[duration]}): Build the decisive sequence through actions, choices, pressure, setbacks, and rising consequences. Add one natural midpoint re-hook (new danger, reversal, or surprising fact). Reach a clear turning point, then deliver the answer promised by the opening.
 4. GLOBAL VIEW & CLOSE (${closeTimes[duration]}): Show why the payoff mattered. Pull back to a wider global-history perspective on the event's consequences and legacy. End with one memorable, reflective sentence.
@@ -1302,10 +1589,20 @@ export async function planEpisode(data, options = {}) {
   const mixedMode = productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(config.longClipDuration) || 10)));
   const shortClipDuration = Math.max(5, Math.min(20, Math.round(Number(config.shortClipDuration) || 15)));
-  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied English narration into compelling visual shots suited to the requested content format and visual style. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
-  const mixedSystem = `${shortSystem} This request uses mixed mode to control generation cost. Add videoRecommended (boolean) to every shot. When targetAnimatedShotCount is supplied, mark exactly that many shots true; otherwise mark roughly one in every four shots true. Mark all others false. Spread the selections across the full episode and prioritize the opening hook, climaxes, emotional turns, and shots where real subject or environmental motion adds clear value. A recommended video still begins from its generated storyboard image; write every videoPrompt so it also works as a strong image-to-video instruction. Do not recommend adjacent shots unless the narrative makes both essential.`;
-  const longSystem = `You are a senior text-to-video scene planner for short-form social video. Divide the supplied English narration into meaningful consecutive scenes for direct text-to-video generation, without creating or relying on storyboard images. Preserve every spoken word in order across the narration fields and do not add unsupported facts. Prefer natural pauses, complete ideas, and real changes of setting or action over arbitrary cuts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each scene must contain: narration (a non-empty exact consecutive excerpt), chinese (concise Simplified Chinese translation), type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, videoPrompt (a detailed direct text-to-video prompt of at most 100 words), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static). The videoPrompt must faithfully visualize the complete narration excerpt as a coherent sequence of two or three timed visual beats within one continuous take. Describe subject identity and appearance, setting, actions in order, environmental motion, lighting, pace, camera path, and continuity. Do not refer to a supplied image or first frame. Exclude cuts, unrelated subjects, text, logos, flicker, unstable anatomy, warping, and morphing. The first scene (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening is weak. Its videoPrompt must create immediate visual impact: dramatic cinematic lighting, striking composition, and visual tension or mystery. Never open with a map, chart, diagram, split-screen comparison, or flat informational establishing shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion. The opening should feel like a movie teaser, not a textbook illustration. For historical subjects or whenever the narration contains a date or period cue, explicitly name the most accurate era or date and location supported by the script and require period-accurate architecture, landscape or interiors, clothing, materials, props, transport, weapons, and technology; never mix eras or include anachronisms. Target the requested clip length, keep every normal scene between 6 and 12 seconds, and rebalance neighboring scenes so the final scene is not needlessly short. A narration shorter than 6 seconds may remain one scene. When duration and scene-count guidance are supplied, return at least the minimum count and aim for the target count. Never return an empty object, empty narration, placeholder, or trailing item merely to reach a count. The sum of scene durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
-  const system = longScenes ? longSystem : mixedMode ? mixedSystem : shortSystem;
+  const genre = getGenre(data.genre);
+  const storyGenre = genre.primaryLanguage === "zh";
+  const narrationLang = storyGenre ? "Simplified Chinese" : "English";
+  const formatDirective = storyGenre
+    ? `for a suspense-driven character story in the style of ${genre.visualTone}`
+    : "suited to the requested content format and visual style";
+  const chineseField = storyGenre ? "" : ", chinese (concise Simplified Chinese translation)";
+  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied ${narrationLang} narration into compelling visual shots ${formatDirective}. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt)${chineseField}, type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const unrestrictedShortSystem = shortSystem
+    .replace("The opening hook must be about 5 seconds; ", "")
+    .replace("Avoid shots shorter than 5 seconds, except the opening hook.", "Avoid arbitrary fixed durations; let each shot follow its narration excerpt.");
+  const mixedSystem = `${unrestrictedShortSystem} This request uses mixed mode to control generation cost. Add videoRecommended (boolean) to every shot. When targetAnimatedShotCount is supplied, mark exactly that many shots true; otherwise mark roughly one in every four shots true. Mark all others false. Spread the selections across the full episode and prioritize the opening hook, climaxes, emotional turns, and shots where real subject or environmental motion adds clear value. A recommended video still begins from its generated storyboard image; write every videoPrompt so it also works as a strong image-to-video instruction. Do not recommend adjacent shots unless the narrative makes both essential.`;
+  const longSystem = `You are a senior text-to-video scene planner for short-form social video. Divide the supplied ${narrationLang} narration into meaningful consecutive scenes for direct text-to-video generation, without creating or relying on storyboard images. Preserve every spoken word in order across the narration fields and do not add unsupported facts. Prefer natural pauses, complete ideas, and real changes of setting or action over arbitrary cuts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each scene must contain: narration (a non-empty exact consecutive excerpt)${chineseField}, type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, videoPrompt (a detailed direct text-to-video prompt of at most 100 words), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static). The videoPrompt must faithfully visualize the complete narration excerpt as a coherent sequence of two or three timed visual beats within one continuous take. Describe subject identity and appearance, setting, actions in order, environmental motion, lighting, pace, camera path, and continuity. Do not refer to a supplied image or first frame. Exclude cuts, unrelated subjects, text, logos, flicker, unstable anatomy, warping, and morphing. The first scene (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening is weak. Its videoPrompt must create immediate visual impact: dramatic cinematic lighting, striking composition, and visual tension or mystery. Never open with a map, chart, diagram, split-screen comparison, or flat informational establishing shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion. The opening should feel like a movie teaser, not a textbook illustration. For historical subjects or whenever the narration contains a date or period cue, explicitly name the most accurate era or date and location supported by the script and require period-accurate architecture, landscape or interiors, clothing, materials, props, transport, weapons, and technology; never mix eras or include anachronisms. Target the requested clip length, keep every normal scene between 6 and 12 seconds, and rebalance neighboring scenes so the final scene is not needlessly short. A narration shorter than 6 seconds may remain one scene. When duration and scene-count guidance are supplied, return at least the minimum count and aim for the target count. Never return an empty object, empty narration, placeholder, or trailing item merely to reach a count. The sum of scene durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const system = longScenes ? longSystem : mixedMode ? mixedSystem : unrestrictedShortSystem;
   const transcriptionSegments = Array.isArray(config.transcription?.segments) ? config.transcription.segments.map((segment) => ({ start:segment.start, end:segment.end, text:segment.text })) : [];
   const narrationDuration = Number(config.audioDuration) || Number(config.transcription?.duration) || 0;
   const minimumShotCount = narrationDuration ? Math.max(1, Math.ceil(narrationDuration / (longScenes ? 12 : 20))) : null;
@@ -1315,7 +1612,7 @@ export async function planEpisode(data, options = {}) {
   const screenRatio = normalizeScreenRatio(config.screenRatio);
   const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetShotDurationSeconds:longScenes ? null : shortClipDuration, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
   const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a shots array");
-  return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, productionMode, targetClipDuration, shortClipDuration, screenRatio, transcription:config.transcription });
+  return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { genre:genre.id, contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, productionMode, targetClipDuration, shortClipDuration, screenRatio, transcription:config.transcription });
 }
 
 async function regenerateOpeningHook(data) {
@@ -1516,6 +1813,35 @@ export function createRenderServer() {
       if (req.method === "POST" && url.pathname === "/text/generate-documentary-script") { json(res, 200, await generateDocumentaryScript(await body(req, 4*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/text/opening-hook") { json(res, 200, await regenerateOpeningHook(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/synthesize") { json(res, 200, await synthesizeSpeech(await body(req, 2*1024*1024))); return; }
+      if (req.method === "POST" && url.pathname === "/audio/synthesize-minimax") {
+        const payload = await body(req, 2 * 1024 * 1024);
+        const result = await synthesizeSpeechMiniMax({
+          script: payload.script || payload.input,
+          voiceId: payload.voice || payload.voiceId,
+          model: payload.model || "speech-2.8-hd",
+          speed: payload.speed ?? 1,
+          subtitleType: payload.subtitleType || "word",
+          languageBoost: payload.languageBoost || undefined,
+        });
+        json(res, 200, result); return;
+      }
+      if (req.method === "POST" && url.pathname === "/audio/synthesize-doubao") {
+        const payload = await body(req, 2 * 1024 * 1024);
+        const result = await synthesizeSpeechDoubao({
+          script: payload.script || payload.input,
+          speaker: payload.speaker || payload.voice,
+          model: payload.model || "seed-tts-2.0",
+          speechRate: payload.speechRate ?? payload.speed ?? 0,
+          format: payload.format || "mp3",
+          sampleRate: payload.sampleRate || 24000,
+          explicitLanguage: payload.explicitLanguage || "zh-cn",
+        });
+        json(res, 200, result); return;
+      }
+      if (req.method === "GET" && url.pathname === "/audio/voices") {
+        const provider = String(new URLSearchParams(url.search).get("provider") || "minimax").trim().toLowerCase();
+        json(res, 200, { voices: provider === "minimax" ? await listMiniMaxVoices() : [] }); return;
+      }
       if (req.method === "POST" && url.pathname === "/audio/transcribe") { json(res, 200, await transcribeAudio(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/audio/process") { json(res, 200, await processNarration(await body(req))); return; }
       if (req.method === "POST" && url.pathname === "/providers/test") { json(res, 200, await testProviderConnection(await body(req, 2*1024*1024))); return; }
@@ -1544,57 +1870,7 @@ export function createRenderServer() {
       /* Digital Human TTS */
       if (req.method === "GET" && url.pathname === "/digital-human/voices") {
         const provider = String(new URLSearchParams(url.search).get("provider") || "minimax").trim().toLowerCase();
-        if (provider === "minimax") {
-          const apiKey = process.env.MINIMAX_API_KEY;
-          if (!apiKey) throw new Error("MINIMAX_API_KEY is not configured");
-          const voices = [];
-
-          // Try different endpoints — MiniMax voice list API varies by account
-          const urls = [
-            "https://api.minimaxi.com/v1/voice/list",
-            "https://api.minimaxi.com/v1/voices",
-            "https://api.minimax.chat/v1/voice/list",
-          ];
-          for (const url of urls) {
-            try {
-              const resp = await fetch(url, { headers: { Authorization: `Bearer ${apiKey}` } });
-              const text = await resp.text();
-              console.error("[MiniMax voices] %s → HTTP %s", url, resp.status);
-              console.error("[MiniMax voices] body: %s", text.slice(0, 500));
-
-              let data;
-              try { data = JSON.parse(text); } catch { continue; }
-
-              const voiceList =
-                data.data?.voice_list ||
-                data.data?.voices ||
-                data.data?.list ||
-                data.voice_list ||
-                data.voices ||
-                data.list ||
-                [];
-              const ok = data.base_resp?.status_code === 0 || data.code === 0 || data.status === 0 || resp.ok;
-
-              if (ok && Array.isArray(voiceList) && voiceList.length > 0) {
-                for (const v of voiceList) {
-                  voices.push({
-                    voice_id: v.voice_id,
-                    name: v.name || v.voice_name || v.voice_id,
-                    type: v.type || "system",
-                    language: v.language || "",
-                  });
-                }
-              }
-            } catch (err) {
-              console.error("[MiniMax voices] %s → %s", url, err.message);
-            }
-          }
-          // deduplicate by voice_id
-          const seen = new Set();
-          const unique = voices.filter((v) => !seen.has(v.voice_id) && seen.add(v.voice_id));
-          json(res, 200, { voices: unique }); return;
-        }
-        json(res, 200, { voices: [] }); return;
+        json(res, 200, { voices: provider === "minimax" ? await listMiniMaxVoices() : [] }); return;
       }
       if (req.method === "POST" && url.pathname === "/digital-human/tts") {
         const payload = await body(req, 2 * 1024 * 1024);

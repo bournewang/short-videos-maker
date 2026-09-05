@@ -1,3 +1,5 @@
+import { getGenre } from "./genres.js";
+
 export function formatTime(seconds) {
   const value = Math.max(0, Number(seconds) || 0);
   const totalTenths = Math.round(value * 10);
@@ -11,9 +13,6 @@ const allowedTypes = new Set(["Opening", "Narrative", "Climax", "Map", "Timeline
 
 const historicalFormat = /\b(?:history|historical)\b/i;
 const historicalAccuracy = "Match the exact historical era in the narration: use a period-accurate background, architecture, clothing, objects, and technology; no anachronisms or mixed eras.";
-
-// The opening hook is pinned to about five seconds: long enough to land, short enough to keep animation cheap.
-export const OPENING_HOOK_DURATION = 5;
 
 export const SHOT_MOTIONS = ["Slow push-in", "Slow pull-out", "Slow drift", "Slow rise", "Slow sink", "Diagonal drift", "Push to subject", "Static"];
 const motionRotation = ["Slow push-in", "Slow drift", "Slow pull-out", "Slow rise", "Slow sink", "Diagonal drift"];
@@ -37,6 +36,10 @@ function defaultLongVideoPrompt(shot = {}, index = 0, options = {}) {
   return `${visualStyle} ${contentFormat} scene illustrating the complete narration: ${narration}. ${creativeDirection ? `Creative direction: ${creativeDirection}. ` : ""}Stage the action as a coherent sequence of visual beats in one continuous scene. ${motion} camera movement, natural subject and environmental motion, stable identity and anatomy, consistent setting and lighting; no cuts, text, logos, flicker, warping, morphing, or unrelated subjects.`;
 }
 
+// A transcript entry is only usable for boundary alignment when it actually
+// spans time. Some TTS subtitle payloads (notably MiniMax for Chinese) return
+// sentence/word timestamps as all zeros — those must be dropped, not treated as
+// a zero-length word, or timestampBoundaries collapses every shot to its minimum.
 function transcriptionWords(transcription) {
   if (!Array.isArray(transcription?.segments)) return [];
   return transcription.segments.flatMap((segment) => {
@@ -47,7 +50,7 @@ function transcriptionWords(transcription) {
     const start = Number(segment?.start); const end = Number(segment?.end);
     if (!parts.length || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return [];
     return parts.map((text, index) => ({ start:start + (end - start) * index / parts.length, end:start + (end - start) * (index + 1) / parts.length, text }));
-  }).filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end >= word.start);
+  }).filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end > word.start);
 }
 
 export function scriptSectionForDuration(script, transcription, start, end, totalDuration = 0) {
@@ -73,17 +76,29 @@ export function scriptSectionForDuration(script, transcription, start, end, tota
   return scriptWords.slice(scriptStart, scriptEnd).join(" ");
 }
 
+// Count the timing-relevant units in a narration line. Chinese text has no
+// whitespace between words, so a whitespace split would treat a whole sentence
+// as a single unit and misalign shot boundaries against the per-character word
+// timestamps that Doubao returns. CJK characters are counted individually;
+// latin text falls back to a whitespace word count.
+function narrationUnitCount(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return 0;
+  const cjk = trimmed.match(/[\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]/g);
+  if (cjk) return cjk.length;
+  return trimmed.split(/\s+/).filter(Boolean).length;
+}
+
 function timestampBoundaries(shots, transcription, target, options = {}) {
   const words = transcriptionWords(transcription);
   if (words.length < 2 || shots.length < 2 || target < shots.length * .6) return null;
-  const counts = shots.map((shot) => Math.max(1, shot.narration.split(/\s+/).filter(Boolean).length));
+  const counts = shots.map((shot) => Math.max(1, narrationUnitCount(shot.narration)));
   const total = counts.reduce((sum, count) => sum + count, 0);
   const boundaries = [0]; let consumed = 0;
   for (let index = 1; index < shots.length; index += 1) {
     consumed += counts[index - 1];
     const wordIndex = Math.max(1, Math.min(words.length - 1, Math.round(words.length * consumed / total)));
-    const pinnedOpening = index === 1 ? Number(options.firstShotDuration) || 0 : 0;
-    const candidate = pinnedOpening > 0 ? pinnedOpening : (words[wordIndex - 1].end + words[wordIndex].start) / 2;
+    const candidate = (words[wordIndex - 1].end + words[wordIndex].start) / 2;
     const remainingShots = shots.length - index;
     const minimumDuration = Math.max(.6, Number(options.minimumDuration) || .6);
     const maximumDuration = Math.max(minimumDuration, Number(options.maximumDuration) || target);
@@ -125,6 +140,8 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   const mixedMode = options.productionMode === "mixed";
   const targetClipDuration = Math.max(6, Math.min(12, Math.round(Number(options.targetClipDuration) || 10)));
   const shortClipDuration = Math.max(5, Math.min(20, Math.round(Number(options.shortClipDuration) || 15)));
+  const genre = getGenre(options.genre);
+  const storyGenre = genre.id === "story";
   let source = usable.map((item, index) => {
     const narration = String(item?.narration || item?.text || item?.voiceover || "").trim();
     const type = allowedTypes.has(item?.type) ? item.type : (index === 0 ? "Opening" : "Narrative");
@@ -157,21 +174,20 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   const target = Math.max(Number(audioDuration) || transcriptionDuration || rawTotal, source.length * .6);
   if (longScenes && target > source.length * 12 + .01) throw new Error("The planning provider returned too few long scenes to stay within the 12-second video limit");
   const longMinimumDuration = longScenes && target >= source.length * 6 ? 6 : .6;
-  const openingDuration = !longScenes && source.length > 1 ? Math.min(OPENING_HOOK_DURATION, target - (source.length - 1) * .6) : 0;
-  const pinnedOpening = openingDuration >= 3 ? Number(openingDuration.toFixed(2)) : 0;
-  const boundaries = timestampBoundaries(source, options.transcription, target, longScenes ? { minimumDuration:longMinimumDuration, maximumDuration:12 } : { firstShotDuration:pinnedOpening });
+  const boundaries = timestampBoundaries(source, options.transcription, target, longScenes ? { minimumDuration:longMinimumDuration, maximumDuration:12 } : {});
   if (boundaries) return source.map((shot, index) => {
     const start = Number(boundaries[index].toFixed(2));
     const end = Number(boundaries[index + 1].toFixed(2));
     return { ...shot, index, start, end, duration:Number((end - start).toFixed(2)) };
   });
+  // Distribute by narration length rather than the AI's raw per-shot duration.
+  // Raw durations can be degenerate (a saved episode already collapsed by an
+  // earlier bug, or a provider that returned tiny values), whereas narration
+  // length is a stable proxy for how long each shot's voiceover actually runs.
+  const unitCounts = source.map((shot) => Math.max(1, narrationUnitCount(shot.narration)));
+  const totalUnits = unitCounts.reduce((sum, count) => sum + count, 0);
   const remaining = target - source.length * .6;
-  let allocated = source.map((shot) => .6 + remaining * (shot.duration / rawTotal));
-  if (pinnedOpening) {
-    const restRaw = rawTotal - source[0].duration;
-    const restRemaining = target - pinnedOpening - (source.length - 1) * .6;
-    allocated = [pinnedOpening, ...source.slice(1).map((shot) => .6 + restRemaining * (shot.duration / restRaw))];
-  }
+  let allocated = source.map((shot, index) => .6 + remaining * (unitCounts[index] / totalUnits));
   if (longScenes && allocated.some((duration) => duration < longMinimumDuration || duration > 12)) allocated = source.map(() => target / source.length);
   let cursor = 0;
   return source.map((shot, index) => {

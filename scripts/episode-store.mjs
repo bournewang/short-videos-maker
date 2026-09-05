@@ -76,6 +76,7 @@ function episodeSummary(project, slug) {
     duration:shots.reduce((total, shot) => total + (Number(shot?.duration) || 0), 0),
     hasNarration:Boolean(project.audioData || project.audioPath),
     stage:String(project.stage || "episode"),
+    genre:project.genre,
   };
 }
 
@@ -342,10 +343,11 @@ export class EpisodeStore {
   }
 
   listEpisodes() {
-    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration FROM episodes ORDER BY created_at DESC, id DESC").all();
+    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration, project_json FROM episodes ORDER BY created_at DESC, id DESC").all();
     return rows.map((row) => ({
       id:row.id, title:row.title || "Untitled episode", slug:row.slug, savedAt:row.saved_at,
       stage:row.stage, shotCount:row.shot_count, duration:row.duration, hasNarration:Boolean(row.has_narration),
+      genre:JSON.parse(row.project_json || "{}").genre || "documentary",
     }));
   }
 

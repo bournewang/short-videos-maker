@@ -133,7 +133,7 @@ test("documentary script generation asks for a climax-first video hook", async (
   const system = request.messages[0].content;
   assert.match(system, /first two spoken sentences as a cold open for a video hook/);
   assert.match(system, /Sentence 1 must begin inside the story's most vivid, verified climax/);
-  assert.match(system, /one arresting 5-second opening video clip/);
+  assert.match(system, /Keep these two sentences concise and visually arresting/);
   assert.deepEqual(result, { title:"The Fall of a City", script:"The gates break at dawn. What happened next changed the kingdom." });
 });
 
@@ -144,7 +144,7 @@ test("local renderer produces a playable vertical MP4", { timeout: 120000 }, asy
     { duration:.8, image:png, narration:"The test finishes successfully.", chinese:"测试顺利完成。" },
   ] }, { id:`test-${Date.now()}`, output });
   const info = await stat(output); const duration = await probe(output);
-  assert.ok(info.size > 5000); assert.ok(duration >= 1.5 && duration <= 1.8); assert.equal(result.duration, 1.6);
+  assert.ok(info.size > 5000); assert.ok(duration >= 1.5 && duration <= 1.8); assert.equal(result.duration, 1.7);
   assert.equal(result.subtitleStyle.fontScale, 125); assert.equal(result.subtitleStyle.chineseColor, "#00ff00"); assert.equal(result.subtitleStyle.backgroundOpacity, 70); assert.equal(result.subtitleStyle.alignment, "right");
 });
 
@@ -211,6 +211,16 @@ test("local renderer keeps image shots visible after generated clips", { timeout
   const finalPixel = await samplePixel(output, 3.8);
   assert.ok(duration >= 3.9 && duration <= 4.1); assert.equal(result.clipsUsed, 2);
   assert.ok(Math.abs(finalPixel[0] - greenPixel[0]) + Math.abs(finalPixel[1] - greenPixel[1]) + Math.abs(finalPixel[2] - greenPixel[2]) > 25, `Expected final still to replace the preceding clip; green=${greenPixel}, final=${finalPixel}`);
+});
+
+test("local renderer stretches old storyboard timing to the narration duration", { timeout:120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "shortform-narration-clock-test-")); const output = path.join(dir, "episode.mp4");
+  const result = await renderEpisode({ width:360, height:640, narrationData:narrationWav(4), voicePreset:"original", shots:[
+    { duration:1, image:png, narration:"First narrated section.", chinese:"第一段解说。" },
+    { duration:1, image:png, narration:"Second narrated section.", chinese:"第二段解说。" },
+  ] }, { id:`narration-clock-${Date.now()}`, output });
+  assert.ok(Math.abs(result.duration - 4) < .02);
+  assert.ok(Math.abs((await probe(output)) - 4) < .1);
 });
 
 test("local renderer reports staged progress events", { timeout: 120000 }, async () => {
@@ -907,8 +917,8 @@ test("storyboard planning uses the transcript as an 82-second master timeline", 
   const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"The complete timed narration.", audioDuration:82, transcription }, { fetchImpl });
   const planningInput = JSON.parse(providerPayload.messages[1].content);
   assert.equal(planningInput.narrationDurationSeconds, 82);
-  assert.equal(planningInput.minimumShotCount, 9);
-  assert.equal(planningInput.targetShotCount, 14);
+  assert.equal(planningInput.minimumShotCount, 5);
+  assert.equal(planningInput.targetShotCount, 6);
   assert.match(providerPayload.messages[0].content, /videoPrompt/);
   assert.match(providerPayload.messages[0].content, /every image prompt must explicitly name the most accurate era or date and location/i);
   assert.match(providerPayload.messages[0].content, /period-accurate background/i);
@@ -978,8 +988,8 @@ test("mixed planning budgets a small set of image-to-video shots", async () => {
   const shots = await planEpisode({ textKind:"volcengine", endpoint:"https://ark.example.test/chat/completions", model:"doubao-test", apiKey:"ark-test", script:"A complete mixed-mode narration.", audioDuration:26, productionMode:"mixed" }, { fetchImpl });
   const planningInput = JSON.parse(providerPayload.messages[1].content);
   assert.equal(planningInput.productionMode, "mixed");
-  assert.equal(planningInput.targetShotCount, 5);
-  assert.equal(planningInput.targetAnimatedShotCount, 2);
+  assert.equal(planningInput.targetShotCount, 2);
+  assert.equal(planningInput.targetAnimatedShotCount, 1);
   assert.match(providerPayload.messages[0].content, /roughly one in every four shots/i);
   assert.equal(shots.filter((shot) => shot.videoRecommended).length, 2);
   assert.equal(shots[0].videoRecommended, true);

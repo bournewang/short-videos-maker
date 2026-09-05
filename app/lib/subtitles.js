@@ -14,17 +14,29 @@ function transcriptionWords(transcription) {
     const segStart = Number(segment?.start), segEnd = Number(segment?.end);
     if (!parts.length || !Number.isFinite(segStart) || !Number.isFinite(segEnd) || segEnd <= segStart) return [];
     return parts.map((text, i) => ({ start: segStart + (segEnd - segStart) * i / parts.length, end: segStart + (segEnd - segStart) * (i + 1) / parts.length, text }));
-  }).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end >= w.start);
+  }).filter((w) => Number.isFinite(w.start) && Number.isFinite(w.end) && w.end > w.start);
+}
+
+export function hasTimedTranscription(transcription) {
+  return transcriptionWords(transcription).length >= 2;
 }
 
 function normalizeWord(value) {
-  return String(value || "").toLowerCase().replace(/[^a-z0-9']/g, "").replace(/'/g, "");
+  return String(value || "").toLowerCase().replace(/[^a-z0-9'\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]/g, "").replace(/'/g, "");
+}
+
+function narrationTokens(value) {
+  return String(value || "").trim().match(/[\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]|[a-z0-9']+/gi) || [];
+}
+
+function cueWeight(chunk) {
+  return Math.max(1, narrationTokens(chunk?.english || chunk?.chinese).length);
 }
 
 function narrationWordsWithShots(shots) {
   const list = [];
   (Array.isArray(shots) ? shots : []).forEach((shot, shotIdx) => {
-    String(shot?.narration || "").trim().split(/\s+/).filter(Boolean)
+    narrationTokens(shot?.narration)
       .forEach((word) => list.push({ norm: normalizeWord(word), shotIdx }));
   });
   return list;
@@ -73,13 +85,31 @@ export function transcriptionForShots(transcription, shots) {
 // Builds cue objects with absolute start/end times.
 // With transcription: for multiple shots, maps each shot's narration to the
 // transcription words by text alignment — this gives correct timestamps even when
-// shot.end is wrong (e.g. the opening hook is pinned to 5s but the speech takes
-// 20s) and stays in sync when the transcriber's word count differs from the script.
+// shot.end is wrong and stays in sync when the transcriber's word count differs
+// from the script.
 // For a single shot, falls back to the time-range approach. Without transcription,
 // uses proportional word-count timing within shot.end.
 export function subtitleCues(shots, transcription = null) {
   const words = transcriptionWords(transcription);
   const shotsArr = Array.isArray(shots) ? shots : [];
+
+  // Some TTS providers return subtitle text with every timestamp set to zero.
+  // In that case, distribute captions across the complete audio timeline rather
+  // than letting outdated visual-shot boundaries make captions jump early.
+  if (transcription && !hasTimedTranscription(transcription)) {
+    const duration = shotsArr.reduce((latest, shot) => Math.max(latest, Number(shot?.end) || ((Number(shot?.start) || 0) + (Number(shot?.duration) || 0))), 0);
+    const chunks = shotsArr.flatMap((shot, shotIndex) => alignBilingualChunks(String(shot?.narration || ""), String(shot?.chinese || "")).map((chunk) => ({ chunk, shotIndex })));
+    const totalWeight = chunks.reduce((sum, item) => sum + cueWeight(item.chunk), 0);
+    if (duration > 0 && totalWeight > 0) {
+      let start = 0;
+      return chunks.map((item, index) => {
+        const end = index === chunks.length - 1 ? duration : start + duration * cueWeight(item.chunk) / totalWeight;
+        const cue = { start, end, chunk:item.chunk, shotIndex:item.shotIndex };
+        start = end;
+        return cue;
+      });
+    }
+  }
 
   // Multi-shot word-position mapping: ignore planned shot.end, use actual transcription timestamps
   const useWordPosition = words.length >= 2 && shotsArr.length > 1;
@@ -95,7 +125,7 @@ export function subtitleCues(shots, transcription = null) {
 
     if (!aligned.length) return [];
 
-    const weights = aligned.map((c) => Math.max(1, c.english.split(/\s+/).filter(Boolean).length || c.chinese.length));
+    const weights = aligned.map(cueWeight);
     const totalWeight = weights.reduce((s, w) => s + w, 0);
 
     let shotWords;
@@ -142,7 +172,7 @@ export function subtitleCues(shots, transcription = null) {
 export function splitSentences(text) {
   const raw = String(text || "").trim();
   if (!raw) return [];
-  return raw.split(/(?<=[.!?;！？。])\s*/).filter(Boolean);
+  return raw.split(/(?:\r?\n)+|(?<=[.!?;！？。])\s*/).map((line) => line.trim()).filter(Boolean);
 }
 
 export function splitLongSentence(text, maxWords = 15) {

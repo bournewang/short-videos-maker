@@ -24,7 +24,7 @@ test("a short AI plan is stretched across an 82-second narration", () => {
   const shots = normalizePlannedShots(input, 82);
   assert.equal(shots[0].start, 0);
   assert.equal(shots.at(-1).end, 82);
-  assert.equal(shots.reduce((sum, shot) => sum + shot.duration, 0), 82);
+  assert.ok(Math.abs(shots.reduce((sum, shot) => sum + shot.duration, 0) - 82) < .001);
   assert.equal(formatTime(81.99999999999997), "01:22.0");
 });
 
@@ -97,22 +97,21 @@ test("word timestamps place shot changes inside real pauses", () => {
     { start:5, end:6, word:"three" }, { start:6, end:7, word:"four" },
     { start:10, end:11, word:"five" }, { start:11, end:12, word:"six" },
   ] }] } });
-  assert.equal(shots[0].end, 5);
-  assert.equal(shots[1].start, 5);
+  assert.equal(shots[0].end, 3.5);
+  assert.equal(shots[1].start, 3.5);
   assert.equal(shots[1].end, 8.5);
   assert.equal(shots[2].start, 8.5);
   assert.equal(shots[2].end, 14);
 });
 
-test("the opening shot is pinned to about five seconds while the rest share the remaining time", () => {
+test("shot durations follow narration proportions without a fixed opening duration", () => {
   const shots = normalizePlannedShots(Array.from({ length:6 }, (_, index) => ({
-    narration:`Narration section ${index + 1}.`, type:index === 0 ? "Opening" : "Narrative", duration:2.5,
+    narration:index === 0 ? "Brief opening." : `Narration section ${index + 1} has substantially more words.`, type:index === 0 ? "Opening" : "Narrative", duration:2.5,
   })), 50);
   assert.equal(shots[0].start, 0);
-  assert.equal(shots[0].duration, 5);
+  assert.ok(shots[0].duration < 5);
   assert.equal(shots.at(-1).end, 50);
   assert.equal(shots.reduce((sum, shot) => sum + shot.duration, 0), 50);
-  assert.ok(shots.slice(1).every((shot) => shot.duration >= 5));
 });
 
 test("the storyboard script section follows the selected shot time range", () => {

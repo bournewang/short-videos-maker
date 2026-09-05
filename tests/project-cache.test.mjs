@@ -102,12 +102,12 @@ test("invalid project cache values are ignored", () => {
 });
 
 test("episode cache summaries omit media while preserving useful history metadata", () => {
-  const summary = episodeCacheSummary({ id:"episode-one", title:"  Launch story  ", savedAt:1234, stage:"storyboard", audioData:"data:audio/mpeg;base64,large", shots:[
+  const summary = episodeCacheSummary({ id:"episode-one", title:"  Launch story  ", genre:"story", savedAt:1234, stage:"storyboard", audioData:"data:audio/mpeg;base64,large", shots:[
     { duration:2.5, image:"data:image/png;base64,large" },
     { duration:3, video:"data:video/mp4;base64,large" },
   ] });
   assert.deepEqual(summary, {
-    id:"episode-one", title:"Launch story", savedAt:1234, shotCount:2, duration:5.5, hasNarration:true, stage:"storyboard",
+    id:"episode-one", title:"Launch story", savedAt:1234, shotCount:2, duration:5.5, hasNarration:true, stage:"storyboard", genre:"story",
   });
   assert.equal(JSON.stringify(summary).includes("base64"), false);
 });

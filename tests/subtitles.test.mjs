@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSrt, formatSrtTime, subtitleFileName, transcriptionForShots } from "../app/lib/subtitles.js";
+import { buildSrt, formatSrtTime, hasTimedTranscription, subtitleFileName, transcriptionForShots } from "../app/lib/subtitles.js";
 
 const shots = [
   { start:0, end:1.234, narration:"The story begins.", chinese:"故事开始了。" },
   { start:1.234, end:62.5, narration:"A second line.\nWith an edit.", chinese:"第二行。" },
 ];
 
-// Two shots whose planned times deliberately diverge from the spoken audio:
-// the opening hook is pinned to 5s on the timeline but its speech runs 0–16s.
+// Two shots whose planned times deliberately diverge from the spoken audio.
 const syncShots = [
   { index:0, start:0, end:5, duration:5, narration:"Welcome back to history.", chinese:"欢迎回到历史。" },
   { index:1, start:5, end:10, duration:5, narration:"Today we explore Rome.", chinese:"今天我们探索罗马。" },
@@ -75,4 +74,44 @@ const driftTranscription = { duration:33, segments:[{ start:0, end:33, words:[
 test("subtitle timing aligns shots to transcription text, not word-count proportion", () => {
   assert.equal(buildSrt(driftShots, "english", driftTranscription),
     "1\n00:00:00,000 --> 00:00:30,000\nAlpha bravo.\n\n2\n00:00:30,000 --> 00:00:33,000\nCharlie.\n");
+});
+
+test("Chinese narration aligns each shot to its own character timestamps", () => {
+  const chineseShots = [
+    { start:0, end:2, narration:"秦王登基", chinese:"" },
+    { start:2, end:4, narration:"统一六国", chinese:"" },
+  ];
+  const chineseTranscription = { duration:4, segments:[{ start:0, end:4, words:[
+    { start:0, end:.5, word:"秦" }, { start:.5, end:1, word:"王" }, { start:1, end:1.5, word:"登" }, { start:1.5, end:2, word:"基" },
+    { start:2, end:2.5, word:"统" }, { start:2.5, end:3, word:"一" }, { start:3, end:3.5, word:"六" }, { start:3.5, end:4, word:"国" },
+  ] }] };
+  assert.equal(buildSrt(chineseShots, "english", chineseTranscription),
+    "1\n00:00:00,000 --> 00:00:02,000\n秦王登基\n\n2\n00:00:02,000 --> 00:00:04,000\n统一六国\n");
+});
+
+test("subtitle line breaks create independently timed cues within one shot", () => {
+  const multiLineShot = [{ start:0, end:6, narration:"First spoken line\nSecond spoken line\nThird spoken line", chinese:"第一句\n第二句\n第三句" }];
+  const transcription = { duration:6, segments:[{ start:0, end:6, words:[
+    { start:0, end:1, word:"First" }, { start:1, end:2, word:"spoken" }, { start:2, end:2.5, word:"line" },
+    { start:2.5, end:3, word:"Second" }, { start:3, end:4, word:"spoken" }, { start:4, end:4.5, word:"line" },
+    { start:4.5, end:5, word:"Third" }, { start:5, end:5.5, word:"spoken" }, { start:5.5, end:6, word:"line" },
+  ] }] };
+  assert.equal(buildSrt(multiLineShot, "bilingual", transcription),
+    "1\n00:00:00,000 --> 00:00:02,500\nFirst spoken line\n第一句\n\n2\n00:00:02,500 --> 00:00:04,500\nSecond spoken line\n第二句\n\n3\n00:00:04,500 --> 00:00:06,000\nThird spoken line\n第三句\n");
+});
+
+test("zero-length provider timestamps are rejected instead of skipping subtitle lines", () => {
+  const invalid = { segments:[{ start:0, end:0, text:"第一句。第二句。", words:[{ start:0, end:0, word:"第一句。第二句。" }] }] };
+  const shot = [{ start:0, end:6, narration:"第一句。第二句。", chinese:"" }];
+  assert.equal(hasTimedTranscription(invalid), false);
+  assert.equal(buildSrt(shot, "english", invalid), "1\n00:00:00,000 --> 00:00:03,000\n第一句。\n\n2\n00:00:03,000 --> 00:00:06,000\n第二句。\n");
+});
+
+test("invalid timestamps use one character-weighted audio timeline across shots", () => {
+  const invalid = { segments:[{ start:0, end:0, text:"", words:[] }] };
+  const shots = [
+    { start:0, end:5, narration:"短句。", chinese:"" },
+    { start:5, end:15, narration:"这是明显更长的第二句字幕。", chinese:"" },
+  ];
+  assert.equal(buildSrt(shots, "english", invalid), "1\n00:00:00,000 --> 00:00:02,143\n短句。\n\n2\n00:00:02,143 --> 00:00:15,000\n这是明显更长的第二句字幕。\n");
 });

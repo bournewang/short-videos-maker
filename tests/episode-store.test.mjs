@@ -19,6 +19,7 @@ test("episode store persists metadata in SQLite and media in named episode direc
     id:"episode-rome",
     title:"When Rome Fell: China in 476 AD",
     stage:"storyboard",
+    genre:"story",
     savedAt:1234,
     audioName:"narration.wav",
     audioData:"data:audio/wav;base64,UklGRg==",
@@ -43,7 +44,7 @@ test("episode store persists metadata in SQLite and media in named episode direc
 
   assert.deepEqual(store.listEpisodes(), [{
     id:"episode-rome", title:"When Rome Fell: China in 476 AD", slug:"when-rome-fell-china-in-476-ad",
-    savedAt:1234, stage:"storyboard", shotCount:1, duration:2.5, hasNarration:true,
+    savedAt:1234, stage:"storyboard", shotCount:1, duration:2.5, hasNarration:true, genre:"story",
   }]);
   const episode = store.getActiveEpisode();
   assert.match(episode.audioData, /^http:\/\/127\.0\.0\.1:4317\/episodes\/episode-rome\/files\/audio\//);

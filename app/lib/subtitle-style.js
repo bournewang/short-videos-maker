@@ -6,6 +6,11 @@ export const SUBTITLE_FONTS = Object.freeze([
   { value:"Courier New", label:"Monospace" },
   { value:"Verdana", label:"Screen sans" },
   { value:"Trebuchet MS", label:"Modern sans" },
+  { value:"KaiTi", label:"楷体 Kaiti" },
+  { value:"SimSun", label:"宋体 SimSun" },
+  { value:"SimHei", label:"黑体 SimHei" },
+  { value:"STKaiti", label:"华文楷体 STKaiti" },
+  { value:"STSong", label:"华文宋体 STSong" },
 ]);
 
 export const DEFAULT_SUBTITLE_STYLE = Object.freeze({

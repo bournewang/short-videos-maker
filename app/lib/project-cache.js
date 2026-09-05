@@ -1,6 +1,7 @@
 import { defaultVideoPrompt, sanitizeImagePrompt } from "./timeline.js";
 import { normalizeSubtitleStyle } from "./subtitle-style.js";
 import { normalizeScreenRatio, videoResolution } from "./video.js";
+import { genreId } from "./genres.js";
 
 const DATABASE_NAME = "shortform-studio-cache";
 const STORE_NAME = "projects";
@@ -73,6 +74,7 @@ export function normalizeCachedProject(value) {
   }) : [];
   return {
     ...value,
+    genre:genreId(value.genre),
     productionMode:longScenes ? "long-scenes" : value.productionMode === "mixed" ? "mixed" : "short-shots",
     longClipDuration:Math.max(6, Math.min(12, Math.round(Number(value.longClipDuration) || 10))),
     subtitleStyle:normalizeSubtitleStyle(value.subtitleStyle),
@@ -123,6 +125,7 @@ export function episodeCacheSummary(value) {
     duration:project.shots.reduce((total, shot) => total + (Number(shot?.duration) || 0), 0),
     hasNarration:Boolean(project.audioData),
     stage:String(project.stage || "episode"),
+    genre:project.genre,
   };
 }
 
