@@ -71,6 +71,10 @@ const BGM_TRACKS = [
   { id:"solarflex-documentary", label:"Documentary", artist:"Solarflex", path:"/bgm/solarflex-documentary-documentary-music-558248.mp3" },
 ];
 
+function supportsImageGroups(model: string) {
+  return /seedream[-.]5[-.]0[-.]lite|seedream[-.]5[-.]0[-.]260128|seedream[-.]4[-.]5|seedream[-.]4[-.]0/i.test(model);
+}
+
 type MiniMaxVoice = { voice_id: string; name: string; type: string; language: string };
 
 function fileToDataUrl(file: File): Promise<string> {
@@ -671,7 +675,9 @@ export default function StudioApp() {
   async function requestShotImage(shot: Shot) {
     updateShot(shot.id, { status:"generating", imageStatus:"generating", imageError:"" });
     try {
-      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt:shot.prompt, screenRatio, episodeId, episodeTitle:title, assetKind:"images", assetName:shot.id }) });
+      const shotIndex = shots.findIndex((item) => item.id === shot.id);
+      const referenceImages = [shots[shotIndex - 1]?.image, shots[shotIndex + 1]?.image].filter((image): image is string => Boolean(image));
+      const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt:shot.prompt, referenceImages, screenRatio, episodeId, episodeTitle:title, assetKind:"images", assetName:shot.id }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
       const generatedShot = { ...shot, image, variants:[...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" };
       updateShot(shot.id, generatedShot);
@@ -724,6 +730,7 @@ export default function StudioApp() {
     const pending = source.filter((shot) => !shot.locked && !shot.image && shot.status !== "generating");
     if (!pending.length) { setMessage("No unlocked shots are waiting for image generation."); return source; }
     touchProject();
+    if (provider.kind === "volcengine" && supportsImageGroups(provider.model)) return await generateImageGroups(pending, source, successMessage);
     const concurrency = Math.max(1, Math.min(6, Math.floor(provider.imageConcurrency) || 3));
     const workerCount = Math.min(concurrency, pending.length);
     const failures: string[] = [];
@@ -739,6 +746,40 @@ export default function StudioApp() {
       const completed = pending.length - failures.length;
       setMessage(failures.length ? `${completed}/${pending.length} images generated. ${failures.length} failed and can be retried.` : successMessage);
       const generatedById = new Map(results.filter((result:any) => result.status === "fulfilled" && result.value?.ok).map((result:any) => [result.value.shot.id, result.value.shot]));
+      return source.map((shot) => generatedById.get(shot.id) || shot) as Shot[];
+    } finally { setBusy(""); }
+  }
+
+  async function generateImageGroups(pending: Shot[], source: Shot[], successMessage: string) {
+    const groups = Array.from({ length:Math.ceil(pending.length / 10) }, (_, index) => pending.slice(index * 10, index * 10 + 10));
+    const pendingIds = new Set(pending.map((shot) => shot.id));
+    const generatedById = new Map<string, Shot>();
+    const failures: string[] = [];
+    setShots((current) => current.map((shot) => pendingIds.has(shot.id) ? { ...shot, status:"generating", imageStatus:"queued", imageError:"" } : shot));
+    setBusy(`Generating coherent storyboard · 0/${pending.length}`);
+    try {
+      let completed = 0;
+      for (const group of groups) {
+        const response = await fetch(`${SERVICE}/image/generate-group/stream`, { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ ...provider, shots:group.map((shot) => ({ id:shot.id, prompt:shot.prompt })), screenRatio, episodeId, episodeTitle:title }) });
+        if (!response.ok || !response.body) throw new Error("Could not start streamed group generation");
+        const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let groupError = "";
+        const consume = (block:string) => {
+          const event = /^event:\s*(.+)$/m.exec(block)?.[1]; const text = /^data:\s*(.+)$/m.exec(block)?.[1];
+          if (!event || !text) return;
+          const data = JSON.parse(text);
+          if (event === "error") groupError = data.error || "Group generation failed";
+          if (event !== "image") return;
+          const shot = group.find((item) => item.id === data.id); if (!shot) return;
+          const generatedShot = { ...shot, image:data.image, variants:[...shot.variants, data.image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" };
+          generatedById.set(shot.id, generatedShot); updateShot(shot.id, generatedShot);
+          completed += 1; setBusy(`Generating coherent storyboard · ${completed}/${pending.length}`);
+        };
+        while (true) { const { done, value } = await reader.read(); buffer += decoder.decode(value || new Uint8Array(), { stream:!done }); const blocks = buffer.split("\n\n"); buffer = blocks.pop() || ""; blocks.forEach(consume); if (done) break; }
+        if (groupError) throw new Error(groupError);
+        group.filter((shot) => !generatedById.has(shot.id)).forEach((shot) => { failures.push(`Shot ${shot.index + 1}: Provider returned no image`); updateShot(shot.id, { status:"planned", imageStatus:"failed", imageError:"Provider returned no image" }); });
+      }
+      const succeeded = pending.length - failures.length;
+      setMessage(failures.length ? `${succeeded}/${pending.length} images generated in groups. ${failures.length} can be repaired individually.` : successMessage);
       return source.map((shot) => generatedById.get(shot.id) || shot) as Shot[];
     } finally { setBusy(""); }
   }
@@ -1814,7 +1855,7 @@ function Settings({ provider, setProvider, status, refreshStatus, close }: any) 
   const imageProviderChoice = provider.kind === "dashscope" ? "dashscope" : provider.kind === "volcengine" && isPlanEndpoint(provider.endpoint) ? "volcengine-plan" : provider.kind;
   const textProviderChoice = provider.textKind === "volcengine" && isPlanEndpoint(provider.textEndpoint) ? "volcengine-plan" : provider.textKind;
   const videoProviderChoice = provider.videoKind === "dashscope" ? "dashscope" : provider.videoKind === "pixstag" ? "pixstag" : isPlanEndpoint(provider.videoEndpoint) ? "plan" : "api";
-  const chooseImageProvider = (choice:string) => set(choice === "dashscope" ? { kind:"dashscope", endpoint:"https://dashscope.aliyuncs.com", model:"qwen-image-3.0-pro", apiKey:"" } : choice === "volcengine-plan" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedream-5.0-lite", apiKey:"" } : choice === "volcengine" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128", apiKey:"" } : choice === "sdwebui" ? { kind:choice, endpoint:"http://127.0.0.1:7860", model:"Local checkpoint", apiKey:"" } : { kind:choice, endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1", apiKey:"" });
+  const chooseImageProvider = (choice:string) => set(choice === "dashscope" ? { kind:"dashscope", endpoint:"https://dashscope.aliyuncs.com", model:"qwen-image-3.0-pro", apiKey:"" } : choice === "volcengine-plan" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", model:"doubao-seedream-4.0", apiKey:"" } : choice === "volcengine" ? { kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-4-0-250828", apiKey:"" } : choice === "sdwebui" ? { kind:choice, endpoint:"http://127.0.0.1:7860", model:"Local checkpoint", apiKey:"" } : { kind:choice, endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1", apiKey:"" });
   const chooseVideoProvider = (choice:string) => set(choice === "pixstag" ? { videoKind:"pixstag", videoEndpoint:"https://pixstag.com", videoModel:"MiniMax-H3", videoApiKey:"", videoResolution:"1080p" } : choice === "dashscope" ? { videoKind:"dashscope", videoEndpoint:"https://dashscope.aliyuncs.com", videoModel:"wan3.0-video", videoApiKey:"", videoResolution:"1080p" } : choice === "plan" ? { videoKind:"volcengine", videoEndpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", videoModel:"doubao-seedance-2.0", videoApiKey:"", videoResolution:"1080p" } : { videoKind:"volcengine", videoEndpoint:"https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks", videoModel:"doubao-seedance-2-0-260128", videoApiKey:"", videoResolution:"1080p" });
   const chooseTextProvider = (choice:string) => set(choice === "volcengine-plan" ? { textKind:"volcengine", textEndpoint:"https://ark.cn-beijing.volces.com/api/plan/v3", textModel:"ark-code-latest", textApiKey:"" } : choice === "volcengine" ? { textKind:"volcengine", textEndpoint:"https://ark.cn-beijing.volces.com/api/v3/chat/completions", textModel:"doubao-seed-2-1-turbo-260628", textApiKey:"" } : { textKind:"openai", textEndpoint:"https://api.openai.com/v1/chat/completions", textModel:"gpt-4.1-mini", textApiKey:"" });
   const [testing, setTesting] = useState("");

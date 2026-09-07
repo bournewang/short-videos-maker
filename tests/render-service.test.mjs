@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateImageGroup, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, streamImageGroup, supportsImageGroups, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -363,7 +363,7 @@ test("Volcengine image adapter sends a vertical Seedream request", async () => {
   const image = await generateImage({ kind:"volcengine", endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-pro-260628", apiKey:"ark-test", prompt:"A vertical cinematic scene" }, { fetchImpl });
   const payload = JSON.parse(request.body);
   assert.equal(requestUrl, "https://ark.cn-beijing.volces.com/api/v3/images/generations");
-  assert.equal(request.headers.Authorization, "Bearer ark-test"); assert.equal(payload.size, "2160x3840"); assert.equal(payload.watermark, false);
+  assert.equal(request.headers.Authorization, "Bearer ark-test"); assert.equal(payload.size, "2k"); assert.equal(payload.watermark, false);
   assert.equal(image, "https://example.test/seedream.png");
 });
 
@@ -379,9 +379,65 @@ test("image adapters use the selected screen ratio", async () => {
   };
   await generateImage({ kind:"volcengine", endpoint:"https://example.test", model:"seedream", apiKey:"key", prompt:"Scene", screenRatio:"16:9" }, { fetchImpl:volcengineFetch });
   await generateImage({ kind:"openai", endpoint:"https://example.test/images", model:"gpt-image", apiKey:"key", prompt:"Scene", screenRatio:"1:1" }, { fetchImpl:openaiFetch });
-  assert.equal(volcengineRequest.size, "3840x2160");
+  assert.equal(volcengineRequest.size, "2k");
   assert.match(volcengineRequest.prompt, /16:9 screen ratio/);
   assert.equal(openaiRequest.size, "1024x1024");
+});
+
+test("Volcengine group image adapter sends up to ten sequential 2k storyboard scenes", async () => {
+  let request;
+  const images = await generateImageGroup({ kind:"volcengine", endpoint:"https://example.test", model:"doubao-seedream-5-0-lite", apiKey:"key", screenRatio:"9:16", shots:[{ id:"one", prompt:"A detective enters a station" }, { id:"two", prompt:"The detective examines a clue" }] }, { fetchImpl:async (_url, options) => {
+    request = options;
+    return new Response(JSON.stringify({ data:[{ url:"https://example.test/one.png" }, { url:"https://example.test/two.png" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  } });
+  const payload = JSON.parse(request.body);
+  assert.equal(payload.size, "2k"); assert.equal(payload.sequential_image_generation, "auto"); assert.equal(payload.sequential_image_generation_options.max_images, 2); assert.equal(payload.stream, false);
+  assert.match(payload.prompt, /Scene 1:/); assert.match(payload.prompt, /Scene 2:/);
+  assert.deepEqual(images, ["https://example.test/one.png", "https://example.test/two.png"]);
+});
+
+test("only documented Seedream models use sequential image generation", () => {
+  assert.equal(supportsImageGroups("doubao-seedream-5-0-lite"), true);
+  assert.equal(supportsImageGroups("doubao-seedream-4-5-251128"), true);
+  assert.equal(supportsImageGroups("doubao-seedream-4-0-250828"), true);
+  assert.equal(supportsImageGroups("doubao-seedream-5-0-260128"), true);
+  assert.equal(supportsImageGroups("doubao-seedream-5-0-pro-260628"), false);
+  assert.equal(supportsImageGroups("doubao-seedream-5-0-260127"), false);
+});
+
+test("Volcengine group image adapter retries a transient Ark timeout once", async () => {
+  let attempts = 0;
+  const images = await generateImageGroup({ kind:"volcengine", endpoint:"https://example.test", model:"doubao-seedream-5-0-lite", apiKey:"key", shots:[{ id:"one", prompt:"A detective enters a station" }] }, { fetchImpl:async () => {
+    attempts += 1;
+    if (attempts === 1) throw Object.assign(new TypeError("fetch failed"), { cause:{ code:"UND_ERR_HEADERS_TIMEOUT" } });
+    return new Response(JSON.stringify({ data:[{ url:"https://example.test/one.png" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  }, sleepImpl:async () => {} });
+  assert.equal(attempts, 2);
+  assert.deepEqual(images, ["https://example.test/one.png"]);
+});
+
+test("Volcengine streamed group images emit each completed image in order", async () => {
+  const received = [];
+  await streamImageGroup({ kind:"volcengine", endpoint:"https://example.test", model:"doubao-seedream-5-0-260128", apiKey:"key", shots:[{ id:"one", prompt:"First scene" }, { id:"two", prompt:"Second scene" }] }, async (image, shot) => received.push({ image, id:shot.id }), { fetchImpl:async (_url, options) => {
+    assert.equal(JSON.parse(options.body).stream, true);
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({ start(controller) {
+      controller.enqueue(encoder.encode('data: {"data":[{"url":"https://example.test/one.png"}]}\n'));
+      controller.enqueue(encoder.encode('\ndata: {"data":[{"url":"https://example.test/two.png"}]}\n\n'));
+      controller.close();
+    } });
+    return new Response(body, { status:200, headers:{ "Content-Type":"text/event-stream" } });
+  } });
+  assert.deepEqual(received, [{ image:"https://example.test/one.png", id:"one" }, { image:"https://example.test/two.png", id:"two" }]);
+});
+
+test("Volcengine single-shot repair includes adjacent reference images", async () => {
+  let request;
+  await generateImage({ kind:"volcengine", endpoint:"https://example.test", model:"doubao-seedream-4-0-250828", apiKey:"key", prompt:"Repair the scene", referenceImages:["https://example.test/previous.png", "https://example.test/next.png"] }, { fetchImpl:async (_url, options) => {
+    request = options;
+    return new Response(JSON.stringify({ data:[{ url:"https://example.test/repaired.png" }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  } });
+  assert.deepEqual(JSON.parse(request.body).image, ["https://example.test/previous.png", "https://example.test/next.png"]);
 });
 
 test("Volcengine Agent Plan image adapter accepts the documented API base URL", async () => {

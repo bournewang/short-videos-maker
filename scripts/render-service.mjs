@@ -15,6 +15,7 @@ import { subtitleCues } from "../app/lib/subtitles.js";
 import { EpisodeStore } from "./episode-store.mjs";
 import { DigitalHumanStore } from "./digital-human-store.mjs";
 import { DigitalHumanProjectStore } from "./digital-human-project-store.mjs";
+import sharp from "sharp";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -119,7 +120,7 @@ async function syncHeyGenVideoRecord(video) {
 const providerDefaults = {
   image: {
     openai: { endpoint:"https://api.openai.com/v1/images/generations", model:"gpt-image-1" },
-    volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-5-0-260128" },
+    volcengine: { endpoint:"https://ark.cn-beijing.volces.com/api/v3/images/generations", model:"doubao-seedream-4-0-250828" },
     dashscope: { endpoint:"https://dashscope.aliyuncs.com", model:"qwen-image-3.0-pro" },
     sdwebui: { endpoint:"http://127.0.0.1:7860", model:"Local checkpoint" },
   },
@@ -233,6 +234,8 @@ function resolveImageProvider(data = {}) {
     model:data.model || configured.model,
     apiKey:data.apiKey || configured.apiKey,
     prompt:data.prompt,
+    shots:data.shots,
+    referenceImages:data.referenceImages,
     screenRatio:data.screenRatio,
   };
 }
@@ -1142,6 +1145,41 @@ ${ffmpegCmd}
   return { id, output, url:options.publicUrl || `/renders/${path.basename(output)}`, seconds:(Date.now() - started) / 1000, duration:total, clipsUsed:shots.filter((shot) => shot.video).length, subtitleStyle };
 }
 
+// Bridge-local reference images (e.g. http://127.0.0.1:4317/episodes/<id>/files/...)
+// are unreachable from external providers like Volcengine Ark. Convert them to
+// downscaled JPEG data URLs before forwarding as `image` reference inputs.
+// External URLs and data URLs pass through; Volcengine will fetch them itself.
+const LOCAL_REFERENCE_PATTERN = /^https?:\/\/(?:127\.0\.0\.1|localhost)(?::\d+)?\/episodes\/([^/]+)\/files\/(.+)$/;
+const REFERENCE_MAX_SIDE = 1024;
+const REFERENCE_JPEG_QUALITY = 85;
+
+async function resolveReferenceImage(url) {
+  if (!url || typeof url !== "string") return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("data:")) return trimmed;
+  const match = LOCAL_REFERENCE_PATTERN.exec(trimmed);
+  if (!match) return trimmed; // External URL — let the provider fetch.
+  try {
+    const episodeId = decodeURIComponent(match[1]);
+    const relativePath = match[2].split("/").map(decodeURIComponent).join(path.sep);
+    const { filename } = await episodeStore.fileForRequest(episodeId, relativePath);
+    const pipeline = sharp(filename).resize({ width:REFERENCE_MAX_SIDE, height:REFERENCE_MAX_SIDE, fit:"inside", withoutEnlargement:true }).jpeg({ quality:REFERENCE_JPEG_QUALITY, mozjpeg:true });
+    const buffer = await pipeline.toBuffer();
+    return `data:image/jpeg;base64,${buffer.toString("base64")}`;
+  } catch (error) {
+    // Don't fail the whole generation just because one neighbor reference can't
+    // be resolved — the caller can still produce a usable image without it.
+    return null;
+  }
+}
+
+async function resolveReferenceImages(urls) {
+  if (!Array.isArray(urls) || !urls.length) return [];
+  const resolved = await Promise.all(urls.map((url) => resolveReferenceImage(url)));
+  return resolved.filter((url) => Boolean(url));
+}
+
 export async function generateImage(data, options = {}) {
   data = resolveImageProvider(data);
   if (!data.endpoint) throw new Error("Provider endpoint is required");
@@ -1156,7 +1194,7 @@ export async function generateImage(data, options = {}) {
     const result = await response.json(); if (!response.ok) throw new Error(result.error || `Provider returned ${response.status}`); if (!result.images?.[0]) throw new Error("Provider returned no image");
     return `data:image/png;base64,${result.images[0]}`;
   }
-  const volcengineSize = screenRatio === "16:9" ? "3840x2160" : screenRatio === "1:1" ? "4096x4096" : "2160x3840";
+  const volcengineSize = "2k";
   const openaiSize = screenRatio === "16:9" ? "1536x1024" : screenRatio === "1:1" ? "1024x1024" : "1024x1536";
   if (data.kind === "dashscope") {
     // Qwen-Image 3.0 (sync multimodal-generation API); free pixel budget is
@@ -1173,13 +1211,97 @@ export async function generateImage(data, options = {}) {
     if (!item?.image) throw new Error("Provider returned no image");
     return item.image;
   }
+  const referenceImages = await resolveReferenceImages(data.referenceImages);
   const requestBody = data.kind === "volcengine"
-    ? { model:data.model, prompt, size:volcengineSize, response_format:"url", watermark:false }
+    ? { model:data.model, prompt, size:volcengineSize, ...(referenceImages.length ? { image:referenceImages } : {}), response_format:"url", watermark:false }
     : { model:data.model, prompt, size:openaiSize, n:1, response_format:"b64_json" };
   const endpoint = data.kind === "volcengine" ? providerEndpoint(data.endpoint, "images/generations") : data.endpoint;
   const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json",...(data.apiKey?{Authorization:`Bearer ${data.apiKey}`}:{})}, body:JSON.stringify(requestBody) });
   const result = await response.json(); if (!response.ok) throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); const item = result.data?.[0]; if (!item) throw new Error("Provider returned no image");
   return item.b64_json ? `data:image/png;base64,${item.b64_json}` : item.url;
+}
+
+export async function generateImageGroup(data, options = {}) {
+  data = resolveImageProvider(data);
+  const shots = Array.isArray(data.shots) ? data.shots.slice(0, 10) : [];
+  if (data.kind !== "volcengine") throw new Error("Group image generation is only available for Volcengine Seedream");
+  if (!supportsImageGroups(data.model)) throw new Error(`Model ${data.model} does not support sequential image generation. Use Seedream 5.0 Lite, 4.5, or 4.0 for image groups.`);
+  if (!data.endpoint) throw new Error("Provider endpoint is required");
+  if (!data.model) throw new Error("Provider model or endpoint ID is required");
+  if (!shots.length) throw new Error("At least one shot is required");
+  const fetchImpl = options.fetchImpl || fetch;
+  const screenRatio = normalizeScreenRatio(data.screenRatio);
+  const size = "2k";
+  const prompt = `Create a coherent sequential storyboard with one image for each numbered scene. Maintain character identity, wardrobe, setting, color grade, and cinematic style across the full sequence.\n\n${shots.map((shot, index) => `Scene ${index + 1}: ${promptForScreenRatio(shot.prompt, screenRatio)}`).join("\n\n")}`;
+  const request = { method:"POST", headers:{ "Content-Type":"application/json", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size, sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, stream:false, response_format:"url", watermark:false }) };
+  const endpoint = providerEndpoint(data.endpoint, "images/generations");
+  const sleepImpl = options.sleepImpl || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+  let response;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      response = await fetchImpl(endpoint, request);
+      break;
+    } catch (error) {
+      const code = error?.cause?.code || error?.code;
+      const retryable = ["UND_ERR_HEADERS_TIMEOUT", "UND_ERR_SOCKET", "ECONNRESET", "ENOTFOUND"].includes(code);
+      if (!retryable || attempt === 2) throw new Error(`Ark did not respond while generating the image group (${code || "network failure"}). Try again, or generate individual shots for this batch.`, { cause:error });
+      await sleepImpl(1000);
+    }
+  }
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`);
+  const images = (result.data || []).map((item) => item?.b64_json ? `data:image/png;base64,${item.b64_json}` : item?.url).filter(Boolean);
+  if (!images.length) throw new Error("Provider returned no images");
+  return images;
+}
+
+function imageUrlsFromStreamEvent(value) {
+  const urls = [];
+  const visit = (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    if (typeof entry.url === "string") urls.push(entry.url);
+    if (typeof entry.image === "string") urls.push(entry.image);
+    Object.values(entry).forEach((child) => { if (child && typeof child === "object") visit(child); });
+  };
+  visit(value);
+  return [...new Set(urls)];
+}
+
+export async function streamImageGroup(data, onImage, options = {}) {
+  data = resolveImageProvider(data);
+  const shots = Array.isArray(data.shots) ? data.shots.slice(0, 10) : [];
+  if (data.kind !== "volcengine" || !supportsImageGroups(data.model)) throw new Error("The selected model does not support streamed image groups");
+  const screenRatio = normalizeScreenRatio(data.screenRatio);
+  const prompt = `Create a coherent sequential storyboard with one image for each numbered scene. Maintain character identity, wardrobe, setting, color grade, and cinematic style across the full sequence.\n\n${shots.map((shot, index) => `Scene ${index + 1}: ${promptForScreenRatio(shot.prompt, screenRatio)}`).join("\n\n")}`;
+  const response = await (options.fetchImpl || fetch)(providerEndpoint(data.endpoint, "images/generations"), { method:"POST", headers:{ "Content-Type":"application/json", Accept:"text/event-stream", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size:"2k", sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, stream:true, response_format:"url", watermark:false }) });
+  if (!response.ok) { const result = await response.json(); throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); }
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("Ark did not return a streaming response");
+  const decoder = new TextDecoder(); let buffer = ""; let nextIndex = 0; const seen = new Set();
+  const consume = async (line) => {
+    if (!line.startsWith("data:")) return;
+    const text = line.slice(5).trim();
+    if (!text || text === "[DONE]") return;
+    try {
+      for (const image of imageUrlsFromStreamEvent(JSON.parse(text))) {
+        if (seen.has(image) || nextIndex >= shots.length) continue;
+        seen.add(image); await onImage(image, shots[nextIndex], nextIndex); nextIndex += 1;
+      }
+    } catch { /* Ignore non-JSON SSE keepalive events. */ }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream:!done });
+    const lines = buffer.split(/\r?\n/); buffer = lines.pop() || "";
+    for (const line of lines) await consume(line);
+    if (done) break;
+  }
+  if (!nextIndex) throw new Error("Ark completed the stream without returning an image");
+}
+
+export function supportsImageGroups(model) {
+  const normalized = String(model || "").toLowerCase();
+  return /seedream[-.]5[-.]0[-.]lite|seedream[-.]5[-.]0[-.]260128|seedream[-.]4[-.]5|seedream[-.]4[-.]0/.test(normalized);
 }
 
 function providerEndpoint(endpoint, pathSuffix) {
@@ -1781,12 +1903,39 @@ export function createRenderServer() {
         }
       }
       if (req.method === "POST" && url.pathname === "/image/generate") {
-        const payload = await body(req, 2*1024*1024);
+        const payload = await body(req, 16*1024*1024);
         const generated = await generateImage(payload);
         const cached = payload.episodeId
           ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, payload.assetKind === "covers" ? "covers" : "images", payload.assetName || randomUUID(), async (target) => await persistGeneratedImage(generated, { screenRatio:payload.screenRatio, ...target }))
           : await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
         json(res, 200, { image:cached.url, path:cached.path }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/image/generate-group") {
+        const payload = await body(req, 2*1024*1024);
+        const generated = await generateImageGroup(payload);
+        const images = await Promise.all(generated.map(async (image, index) => {
+          const shot = payload.shots?.[index] || {};
+          const cached = payload.episodeId
+            ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, "images", shot.id || randomUUID(), async (target) => await persistGeneratedImage(image, { screenRatio:payload.screenRatio, ...target }))
+            : await persistGeneratedImage(image, { screenRatio:payload.screenRatio });
+          return { id:shot.id, image:cached.url, path:cached.path };
+        }));
+        json(res, 200, { images }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/image/generate-group/stream") {
+        const payload = await body(req, 2*1024*1024);
+        res.writeHead(200, cors({ "Content-Type":"text/event-stream", "Cache-Control":"no-cache", Connection:"keep-alive" }));
+        const send = (event, value) => res.write(`event: ${event}\ndata: ${JSON.stringify(value)}\n\n`);
+        try {
+          await streamImageGroup(payload, async (image, shot, index) => {
+            const cached = payload.episodeId
+              ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, "images", shot?.id || randomUUID(), async (target) => await persistGeneratedImage(image, { screenRatio:payload.screenRatio, ...target }))
+              : await persistGeneratedImage(image, { screenRatio:payload.screenRatio });
+            send("image", { id:shot?.id, index, image:cached.url, path:cached.path });
+          });
+          send("complete", {});
+        } catch (error) { send("error", { error:error instanceof Error ? error.message : "Group generation failed" }); }
+        res.end(); return;
       }
       if (req.method === "POST" && url.pathname === "/image/upload") {
         const payload = await body(req, 16*1024*1024);
