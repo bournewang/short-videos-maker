@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { copyFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
-const MEDIA_DIRECTORIES = new Set(["audio", "images", "videos", "covers", "exports"]);
+const MEDIA_DIRECTORIES = new Set(["audio", "images", "videos", "covers", "exports", "characters"]);
 
 function safeEpisodeId(value) {
   const id = String(value || "").trim();
@@ -77,6 +77,8 @@ function episodeSummary(project, slug) {
     hasNarration:Boolean(project.audioData || project.audioPath),
     stage:String(project.stage || "episode"),
     genre:project.genre,
+    reviewStatus:String(project.reviewStatus || "draft"),
+    reviewedAt:Number(project.reviewedAt) || 0,
   };
 }
 
@@ -142,6 +144,8 @@ export class EpisodeStore {
         shot_count INTEGER NOT NULL,
         duration REAL NOT NULL,
         has_narration INTEGER NOT NULL,
+        review_status TEXT NOT NULL DEFAULT 'draft',
+        reviewed_at INTEGER,
         project_json TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS episodes_saved_at_idx ON episodes(saved_at DESC);
@@ -150,6 +154,11 @@ export class EpisodeStore {
         value TEXT NOT NULL
       );
     `);
+    // Idempotent migration for databases created before the review-status columns existed.
+    const episodeColumns = this.database.prepare("PRAGMA table_info(episodes)").all().map((column) => column.name);
+    if (!episodeColumns.includes("review_status")) this.database.exec("ALTER TABLE episodes ADD COLUMN review_status TEXT NOT NULL DEFAULT 'draft'");
+    if (!episodeColumns.includes("reviewed_at")) this.database.exec("ALTER TABLE episodes ADD COLUMN reviewed_at INTEGER");
+    this.database.exec("CREATE INDEX IF NOT EXISTS episodes_review_status_idx ON episodes(review_status)");
     return this;
   }
 
@@ -247,6 +256,8 @@ export class EpisodeStore {
     project.id = context.id;
     project.title = String(project.title || "");
     project.savedAt = Number(project.savedAt) || Date.now();
+    if (!["draft", "pending", "approved", "rejected"].includes(project.reviewStatus)) project.reviewStatus = "draft";
+    if (!Number.isFinite(Number(project.reviewedAt))) project.reviewedAt = 0;
     if (project.audioData) {
       project.audioPath = await this.persistMedia(project.audioData, context, "audio", "narration", path.extname(String(project.audioName || "")));
       delete project.audioData;
@@ -301,19 +312,25 @@ export class EpisodeStore {
     return this.queueWrite(async () => {
       await this.initialize();
       const context = await this.ensureEpisodeDirectory(input);
-      const project = await this.prepareProjectForStorage(input, context);
-      const summary = episodeSummary(project, context.slug);
       const existing = this.row(context.id);
+      // 审核状态以 server 为权威：普通内容保存（PUT/import/批量回写）不得用缺失或 stale 的
+      // reviewStatus 覆盖人工审核结论。审核状态只能通过 setReviewStatus 改写（或显式 overrideReview）。
+      const reviewInput = existing && options.overrideReview !== true
+        ? { ...input, reviewStatus: String(existing.review_status || "draft"), reviewedAt: Number(existing.reviewed_at) || 0 }
+        : input;
+      const project = await this.prepareProjectForStorage(reviewInput, context);
+      const summary = episodeSummary(project, context.slug);
       const createdAt = Number(existing?.created_at) || Date.now();
       const projectJson = JSON.stringify(project);
       await atomicWrite(path.join(context.directory, "episode.json"), `${JSON.stringify(project, null, 2)}\n`);
       const transaction = this.database.transaction(() => {
         this.database.prepare(`
-          INSERT INTO episodes (id, title, slug, saved_at, created_at, stage, shot_count, duration, has_narration, project_json)
-          VALUES (@id, @title, @slug, @savedAt, @createdAt, @stage, @shotCount, @duration, @hasNarration, @projectJson)
+          INSERT INTO episodes (id, title, slug, saved_at, created_at, stage, shot_count, duration, has_narration, review_status, reviewed_at, project_json)
+          VALUES (@id, @title, @slug, @savedAt, @createdAt, @stage, @shotCount, @duration, @hasNarration, @reviewStatus, @reviewedAt, @projectJson)
           ON CONFLICT(id) DO UPDATE SET
             title=excluded.title, slug=excluded.slug, saved_at=excluded.saved_at, stage=excluded.stage,
             shot_count=excluded.shot_count, duration=excluded.duration, has_narration=excluded.has_narration,
+            review_status=excluded.review_status, reviewed_at=excluded.reviewed_at,
             project_json=excluded.project_json
         `).run({ ...summary, createdAt, hasNarration:summary.hasNarration ? 1 : 0, projectJson });
         if (options.setActive !== false) this.database.prepare("INSERT INTO settings (key, value) VALUES ('activeEpisodeId', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(context.id);
@@ -330,6 +347,7 @@ export class EpisodeStore {
       if (!episode?.id) continue;
       const existing = this.row(episode.id);
       if (existing && Number(existing.saved_at) > (Number(episode.savedAt) || 0)) continue;
+      // 审核状态保护由 saveEpisode 统一处理（server 为权威，不覆盖人工审核结论）。
       imported.push((await this.saveEpisode(episode, { setActive:false })).summary);
     }
     if (activeEpisodeId && this.row(activeEpisodeId)) this.activateEpisode(activeEpisodeId);
@@ -343,12 +361,31 @@ export class EpisodeStore {
   }
 
   listEpisodes() {
-    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration, project_json FROM episodes ORDER BY created_at DESC, id DESC").all();
+    const rows = this.database.prepare("SELECT id, title, slug, saved_at, stage, shot_count, duration, has_narration, review_status, reviewed_at, project_json FROM episodes ORDER BY created_at DESC, id DESC").all();
     return rows.map((row) => ({
       id:row.id, title:row.title || "Untitled episode", slug:row.slug, savedAt:row.saved_at,
       stage:row.stage, shotCount:row.shot_count, duration:row.duration, hasNarration:Boolean(row.has_narration),
       genre:JSON.parse(row.project_json || "{}").genre || "documentary",
+      reviewStatus:String(row.review_status || "draft"),
+      reviewedAt:Number(row.reviewed_at) || 0,
     }));
+  }
+
+  async setReviewStatus(id, status) {
+    return this.queueWrite(async () => {
+      await this.initialize();
+      const normalizedId = safeEpisodeId(id);
+      const valid = ["draft", "pending", "approved", "rejected"].includes(status) ? status : "draft";
+      const row = this.database.prepare("SELECT * FROM episodes WHERE id = ?").get(normalizedId);
+      if (!row) throw new Error("Episode was not found");
+      const reviewedAt = Date.now();
+      const project = JSON.parse(row.project_json || "{}");
+      project.reviewStatus = valid;
+      project.reviewedAt = reviewedAt;
+      this.database.prepare("UPDATE episodes SET review_status = ?, reviewed_at = ?, project_json = ? WHERE id = ?").run(valid, reviewedAt, JSON.stringify(project), normalizedId);
+      await atomicWrite(path.join(this.episodesRoot, row.slug, "episode.json"), `${JSON.stringify(project, null, 2)}\n`).catch(() => {});
+      return { id:normalizedId, reviewStatus:valid, reviewedAt };
+    });
   }
 
   getEpisode(id) {

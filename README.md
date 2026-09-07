@@ -83,6 +83,127 @@ For a subscribed **Volcengine Agent Plan**, select the Agent Plan preset in Prov
 
 Provider settings supports MLX Audio speech synthesis, OpenAI-compatible images, Volcengine Ark Seedream and Seedance, and local Stable Diffusion WebUI. Storyboard planning and translation support OpenAI-compatible chat APIs and Volcengine Ark Doubao. Session keys remain in memory; environment keys stay inside the local provider bridge. Export requires narration and at least one generated visual asset for every shot.
 
+## Batch generation & export (CLI)
+
+For publishing pipelines (e.g. a daily slate of history-story or documentary episodes), two CLI scripts drive the same business logic the editor uses, end to end:
+
+```
+batch-generate.mjs →  scripts + narration + storyboard + images  → episode saved as "pending"
+        ↓  (human review in the editor)
+batch-export.mjs   →  optional video clips + FFmpeg MP4 + baked cover → episode updated with builds
+```
+
+Both scripts import the provider functions from `scripts/render-service.mjs` directly and reuse your `.env.local` provider config, so no bridge or `npm run dev` needs to be running. Run them with `node` (Node 22, the same runtime the project pins) from the project root.
+
+### 1. Batch generate
+
+Generates each topic into a full episode: script → genre-routed narration (Doubao for `story`, MiniMax for `documentary`) → character extraction + character-sheet library → storyboard (with `subject`/`characters` tags) → images. Each finished episode is stored with `reviewStatus: "pending"` for human review.
+
+```bash
+# Single topic
+node scripts/batch-generate.mjs --topic "辛弃疾" --genre story --duration 3
+
+# A batch from a topic list, with resume support
+node scripts/batch-generate.mjs --input topics.json --batch-id 20260907 --concurrency 2 --resume
+
+# Preview the topic list without doing any work
+node scripts/batch-generate.mjs --input topics.json --dry-run
+```
+
+`topics.json` is an array of topic objects (any field can be overridden by a CLI flag):
+
+```json
+[
+  { "topic": "辛弃疾", "genre": "story", "duration": 3, "screenRatio": "9:16" },
+  { "topic": "The Battle of Hastings", "genre": "documentary", "duration": 4 }
+]
+```
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--input <file>` | JSON file with the topic list (array, or `{ "topics": [...] }`) | — |
+| `--topic <str>` | Single topic (used when `--input` is absent) | — |
+| `--genre <id>` | `story` (中文人物故事) or `documentary` (English documentary) | — |
+| `--duration <min>` | Target length in minutes (2–6) | `3` |
+| `--production-mode <m>` | `short-shots` \| `mixed` \| `long-scenes` | `short-shots` |
+| `--screen-ratio <r>` | `9:16` \| `16:9` \| `1:1` | `9:16` |
+| `--content-format <s>` | Override the genre's default content format (see enumerated values below) | genre default |
+| `--visual-style <s>` | Override the genre's default visual style (see enumerated values below) | genre default |
+| `--creative-direction <s>` | Extra creative direction passed to scripting and planning (free text) | — |
+| `--concurrency <n>` | Image/concurrent-request limit | `2` |
+| `--image-mode <m>` | `group` (character library + segmented group images, anchors character consistency) or `single` (per-shot parallel, faster) | `group` |
+| `--batch-id <id>` | Batch id used for the resume manifest | `batch-<timestamp>` |
+| `--resume` | Skip topics already marked `success` in this batch's manifest | off |
+| `--force` | Re-run topics even if they already succeeded | off |
+| `--skip-images` | Generate script + narration + storyboard only, no images | off |
+| `--dry-run` | Print the topic list and exit | off |
+
+`--content-format` and `--visual-style` are free-text prompt fragments (the CLI does not hard-validate them — any string is passed through to the LLM unchanged), but the editor's dropdowns offer these presets:
+
+- **Content format**: `Documentary` · `Educational explainer` · `Narrative story` · `News recap` · `Product story` · `History documentary` · `Other`
+- **Visual style**: `Photorealistic` · `Cinematic illustration` · `Editorial collage` · `3D animation` · `Anime` · `Minimal graphic`
+
+Genre defaults: `story` → `Narrative story`, `documentary` → `Documentary` (both default to `Photorealistic` visual style).
+
+Image generation uses the **character-sheet + segmented group** strategy by default: core characters each get one "定妆图" (character sheet), character shots are grouped by the on-screen cast, and each group references the relevant sheets (`reference images + generated images ≤ 15`). Environment / text-card shots are generated individually in parallel. This keeps a protagonist consistent across an arbitrarily long episode. `--image-mode single` skips all of that and just generates every shot in parallel.
+
+### 2. Review in the editor
+
+Start the editor (`npm run dev`), open the **Episodes** library, and each episode shows a review badge. Click **通过 (approve)** or **驳回 (reject)**; the state (`draft` / `pending` / `approved` / `rejected`) is persisted to SQLite and the episode JSON. Only `approved` episodes are picked up by the default export path.
+
+### 3. Batch export
+
+Exports `approved` episodes (or an explicit set): optional image-to-video for selected shots → FFmpeg render to MP4 → cover image generation with the headline baked in server-side via sharp.
+
+```bash
+# Export all approved episodes as still-image videos
+node scripts/batch-export.mjs
+
+# Animate only the first shot of each episode, then render + cover
+node scripts/batch-export.mjs --video-shots first --video-provider volcengine
+
+# Export specific episodes by id (comma-separated)
+node scripts/batch-export.mjs --ids episode-<id1>,episode-<id2>
+
+# Preview which episodes would be exported
+node scripts/batch-export.mjs --dry-run
+```
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--ids <ep1,ep2>` | Export only the given episode ids | — |
+| `--all` | Export every episode, including non-approved | only `approved` |
+| `--video-shots <spec>` | `none` (still images) \| `first` \| `all` \| `0,2,3` (explicit indexes) | `none` |
+| `--video-provider <p>` | `pixstag` \| `volcengine` \| `dashscope` | `VIDEO_PROVIDER` from `.env.local` |
+| `--resolution <r>` | Final render resolution `480` \| `720` \| `1080` | `1080` |
+| `--video-resolution <r>` | Clip generation resolution `480p` \| `720p` \| `1080p` \| `2k` | `720p` |
+| `--skip-cover` | Skip cover generation | off |
+| `--dry-run` | Print the episodes that would be exported and exit | off |
+
+`--video-resolution` is normalized per provider: `volcengine`/`dashscope` accept `480p`/`720p`/`1080p` (invalid → `1080p`; Seedance `-fast` variants auto-downgrade `1080p` → `720p` → `480p` when the API rejects a resolution). `pixstag` accepts `720P`/`768P`/`1080P`/`2K`; `480p`/`720p` map to `720P`, `2k` maps to `2K`, anything else to `1080P`.
+
+### End-to-end example
+
+```bash
+cd /Users/wangxiaopei/work/short-videos-maker
+
+# 1. Generate three history-story episodes (script + narration + storyboard + images)
+node scripts/batch-generate.mjs --input topics.json --batch-id 20260907 --concurrency 2 --resume
+
+# 2. Open the editor, review each "pending" episode, click 通过 for the ones you keep
+npm run dev
+
+# 3. Export all approved episodes: animate the first shot, render 1080p, bake covers
+node scripts/batch-export.mjs --video-shots first --video-provider volcengine
+```
+
+### Notes & gotchas
+
+- **FFmpeg/FFprobe path** — the scripts auto-prepend common Homebrew/MacPorts locations (`/opt/homebrew/bin`, `/usr/local/bin`, `/opt/local/bin`) to `PATH` on load, so a bare `node scripts/...` works even when your shell `PATH` is minimal.
+- **Image-to-video provider** — `pixstag` requires a publicly reachable first-frame URL; the OSS presigned URL used for it has proven unreachable from the provider side in this environment. Use `volcengine` (Seedance) or `dashscope` (Wan), which accept a base64 first frame directly. Prefer `--video-provider volcengine`.
+- **Group-image limit** — Seedream caps group generation at **15** images, and reference images count against that budget (`references + generated ≤ 15`). The segmented-group strategy already respects this.
+- **Long batches** — image generation is slow (≈24–30s per image); run long batches in the background or use `--image-mode single` with a higher `--concurrency` for a faster (but less character-consistent) fallback. `--resume` lets a killed batch pick up where it left off.
+
 ## Verification
 
 ```bash

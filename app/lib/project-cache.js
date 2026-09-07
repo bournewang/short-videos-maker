@@ -126,6 +126,8 @@ export function episodeCacheSummary(value) {
     hasNarration:Boolean(project.audioData),
     stage:String(project.stage || "episode"),
     genre:project.genre,
+    reviewStatus:String(project.reviewStatus || "draft"),
+    reviewedAt:Number(project.reviewedAt) || 0,
   };
 }
 

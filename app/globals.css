@@ -362,3 +362,8 @@ button:disabled { cursor:not-allowed; opacity:.55; }
 .dh-video-card-footer { display:flex; align-items:center; justify-content:space-between; padding:6px 10px; }
 .dh-video-card-footer small { font-size:9px; color:#b0a89a; }
 .dh-video-card-footer .danger { padding:2px 6px; font-size:10px; line-height:1; }
+.episode-actions { display:flex; align-items:center; gap:6px; padding-right:12px; }.episode-actions .episode-delete { margin-right:0; }
+.review-status { padding:2px 7px; border-radius:9px; font-style:normal; font-weight:700; letter-spacing:.4px; }
+.review-pending { background:#f5ead2; color:#8a641f; }.review-approved { background:#e5efe0; color:#4f703d; }.review-rejected { background:#f7dfdf; color:#9c4a4a; }.review-draft { background:#ece9e2; color:#827a6d; }
+.review-btn { padding:6px 11px; border:1px solid var(--line); border-radius:5px; background:#fff; color:#5f574d; font-size:10px; font-weight:700; cursor:pointer; }.review-btn:hover:not(:disabled) { border-color:#9a6b2f; color:#5f421d; }.review-btn:disabled { opacity:.45; cursor:default; }
+.review-approve.active { background:#e5efe0; border-color:#86a06a; color:#4f703d; }.review-reject.active { background:#f7dfdf; border-color:#c67f7f; color:#9c4a4a; }

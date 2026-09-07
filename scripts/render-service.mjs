@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import https from "node:https";
 import { appendFile, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -40,6 +40,17 @@ async function loadEnvironmentFile(filename) {
 // Load local overrides first, then use .env to fill any settings they omit.
 await loadEnvironmentFile(".env.local");
 await loadEnvironmentFile(".env");
+// Ensure ffmpeg / ffprobe are reachable. WorkBuddy's restricted shell PATH
+// often omits /opt/homebrew/bin, which makes spawn("ffmpeg") fail with
+// ENOENT. Detect known install dirs and prepend whichever holds ffmpeg.
+{
+  const candidates = ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"];
+  const current = String(process.env.PATH || "").split(":").filter(Boolean);
+  for (const dir of candidates) {
+    if (current.includes(dir)) continue;
+    if (existsSync(path.join(dir, "ffmpeg"))) { process.env.PATH = [dir, ...current].join(":"); break; }
+  }
+}
 const port = Number(process.env.SHORTFORM_PORT || 4317);
 const workRoot = path.resolve(process.env.SHORTFORM_STORAGE_DIR || path.join(root, ".shortform"));
 const exportRoot = path.join(workRoot, "exports");
@@ -259,6 +270,7 @@ function resolveTextProvider(data = {}) {
     screenRatio: data.screenRatio,
     audioDuration: data.audioDuration,
     transcription: data.transcription,
+    characters: data.characters,
   };
 }
 
@@ -647,6 +659,27 @@ async function synthesizeSpeechDoubao({ script, speaker, model = "seed-tts-2.0",
     speed: speechRate,
     transcription: doubaoSentencesToTranscription(sentences, script),
   };
+}
+
+// Route TTS to the provider declared by the genre config (story → Doubao
+// suspense narrator, documentary → MiniMax English narrator). Returns the same
+// shape both provider implementations produce so batch pipelines can treat the
+// result uniformly: { audioData, filename, mimeType, model, voice, speed, transcription }.
+export async function synthesizeSpeechByGenre(payload = {}, options = {}) {
+  const genre = getGenre(payload.genre);
+  const script = String(payload.script || payload.input || "").trim();
+  if (!script) throw new Error("Script is required for TTS");
+  const fetchImpl = options.fetchImpl || fetch;
+  if (genre.id === "story") {
+    const speaker = String(payload.speaker || payload.voice || genre.tts.voice).trim();
+    const speechRate = Number.isFinite(Number(payload.speechRate)) ? Number(payload.speechRate) : (Number.isFinite(Number(genre.tts.speechRate)) ? Number(genre.tts.speechRate) : 0);
+    const model = String(payload.model || genre.tts.model);
+    return synthesizeSpeechDoubao({ script, speaker, model, speechRate, format:"mp3", sampleRate:24000, explicitLanguage:"zh-cn", fetchImpl });
+  }
+  const voiceId = String(payload.voice || payload.voiceId || genre.tts.voice).trim();
+  const speed = Number(payload.speed ?? genre.tts.speed);
+  const model = String(payload.model || genre.tts.model);
+  return synthesizeSpeechMiniMax({ script, voiceId, model, speed, subtitleType:"word", fetchImpl });
 }
 
 // Fetch and normalize the MiniMax voice list. The voice list API endpoint and
@@ -1221,9 +1254,18 @@ export async function generateImage(data, options = {}) {
   return item.b64_json ? `data:image/png;base64,${item.b64_json}` : item.url;
 }
 
+// 组图（sequential_image_generation）单次请求最多可生成的图片数。
+// 火山方舟 Seedream 官方上限：文生组图 ≤15；单图生组图 ≤14；多图生组图「参考图数 + 生成图数 ≤15」。
+// 本项目组图走纯文生（无参考图），故取官方上限 15。
+export const MAX_GROUP_IMAGES = 15;
+
 export async function generateImageGroup(data, options = {}) {
   data = resolveImageProvider(data);
-  const shots = Array.isArray(data.shots) ? data.shots.slice(0, 10) : [];
+  const referenceImages = await resolveReferenceImages(data.referenceImages);
+  const referenceCount = referenceImages.length;
+  // 官方约束：参考图数 + 生成图数 ≤ 15。有参考图时生成额度相应减少。
+  const maxShots = Math.max(1, MAX_GROUP_IMAGES - referenceCount);
+  const shots = Array.isArray(data.shots) ? data.shots.slice(0, maxShots) : [];
   if (data.kind !== "volcengine") throw new Error("Group image generation is only available for Volcengine Seedream");
   if (!supportsImageGroups(data.model)) throw new Error(`Model ${data.model} does not support sequential image generation. Use Seedream 5.0 Lite, 4.5, or 4.0 for image groups.`);
   if (!data.endpoint) throw new Error("Provider endpoint is required");
@@ -1233,7 +1275,7 @@ export async function generateImageGroup(data, options = {}) {
   const screenRatio = normalizeScreenRatio(data.screenRatio);
   const size = "2k";
   const prompt = `Create a coherent sequential storyboard with one image for each numbered scene. Maintain character identity, wardrobe, setting, color grade, and cinematic style across the full sequence.\n\n${shots.map((shot, index) => `Scene ${index + 1}: ${promptForScreenRatio(shot.prompt, screenRatio)}`).join("\n\n")}`;
-  const request = { method:"POST", headers:{ "Content-Type":"application/json", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size, sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, stream:false, response_format:"url", watermark:false }) };
+  const request = { method:"POST", headers:{ "Content-Type":"application/json", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size, sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, ...(referenceImages.length ? { image:referenceImages } : {}), stream:false, response_format:"url", watermark:false }) };
   const endpoint = providerEndpoint(data.endpoint, "images/generations");
   const sleepImpl = options.sleepImpl || ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
   let response;
@@ -1269,11 +1311,14 @@ function imageUrlsFromStreamEvent(value) {
 
 export async function streamImageGroup(data, onImage, options = {}) {
   data = resolveImageProvider(data);
-  const shots = Array.isArray(data.shots) ? data.shots.slice(0, 10) : [];
+  const referenceImages = await resolveReferenceImages(data.referenceImages);
+  const referenceCount = referenceImages.length;
+  const maxShots = Math.max(1, MAX_GROUP_IMAGES - referenceCount);
+  const shots = Array.isArray(data.shots) ? data.shots.slice(0, maxShots) : [];
   if (data.kind !== "volcengine" || !supportsImageGroups(data.model)) throw new Error("The selected model does not support streamed image groups");
   const screenRatio = normalizeScreenRatio(data.screenRatio);
   const prompt = `Create a coherent sequential storyboard with one image for each numbered scene. Maintain character identity, wardrobe, setting, color grade, and cinematic style across the full sequence.\n\n${shots.map((shot, index) => `Scene ${index + 1}: ${promptForScreenRatio(shot.prompt, screenRatio)}`).join("\n\n")}`;
-  const response = await (options.fetchImpl || fetch)(providerEndpoint(data.endpoint, "images/generations"), { method:"POST", headers:{ "Content-Type":"application/json", Accept:"text/event-stream", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size:"2k", sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, stream:true, response_format:"url", watermark:false }) });
+  const response = await (options.fetchImpl || fetch)(providerEndpoint(data.endpoint, "images/generations"), { method:"POST", headers:{ "Content-Type":"application/json", Accept:"text/event-stream", ...(data.apiKey ? { Authorization:`Bearer ${data.apiKey}` } : {}) }, body:JSON.stringify({ model:data.model, prompt, size:"2k", sequential_image_generation:"auto", sequential_image_generation_options:{ max_images:shots.length }, ...(referenceImages.length ? { image:referenceImages } : {}), stream:true, response_format:"url", watermark:false }) });
   if (!response.ok) { const result = await response.json(); throw new Error(result.error?.message || result.error || `Provider returned ${response.status}`); }
   const reader = response.body?.getReader();
   if (!reader) throw new Error("Ark did not return a streaming response");
@@ -1673,6 +1718,87 @@ QUALITY: Create attention through real stakes — not invented drama. Do not use
   return { title, script };
 }
 
+// Chinese suspense-driven character-story script generator (story genre),
+// matching the "档案 / 悬疑解说" account tone. Mirrors generateDocumentaryScript's
+// request flow but produces a single-language Chinese narration with hook,
+// layered reveals, and period-accurate historical grounding.
+export async function generateStoryScript(data, options = {}) {
+  const config = resolveTextProvider(data);
+  if (!config.endpoint || !config.apiKey || !config.model) throw new Error("Text endpoint, API key, and model or endpoint ID are required");
+  const topic = String(data.topic || "").trim();
+  if (!topic) throw new Error("A topic is required to generate the script");
+  const duration = Math.max(2, Math.min(6, Math.round(Number(data.duration) || 3)));
+  const creativeDirection = String(data.creativeDirection || "").trim();
+  const charRanges = { 2:[440,520], 3:[660,780], 4:[880,1040], 5:[1100,1300], 6:[1320,1560] };
+  const [minChars, maxChars] = charRanges[duration];
+  const hookTimes = { 2:"0–15秒", 3:"0–20秒", 4:"0–30秒", 5:"0–35秒", 6:"0–45秒" };
+  const setupTimes = { 2:"15–45秒", 3:"20–65秒", 4:"30–90秒", 5:"35–110秒", 6:"45–135秒" };
+  const coreTimes = { 2:"45–100秒", 3:"65–150秒", 4:"90–200秒", 5:"110–250秒", 6:"135–300秒" };
+  const closeTimes = { 2:"100–120秒", 3:"150–180秒", 4:"200–240秒", 5:"250–300秒", 6:"300–360秒" };
+  const system = `你是深耕历史人物故事的短视频解说编剧，对标头部「人物档案 / 悬疑解说」账号的调性。根据用户给出的人物或历史事件，写一条高留存的中文人物故事解说文案。
+
+只返回一个紧凑的 RFC 8259 JSON 对象，不要 Markdown、注释或解释。JSON 必须包含两个字段："title"（一个清晰、有钩子、史实准确的中文视频标题）和 "script"（纯口播解说文案，不要任何小标题、时间标签或字数备注）。字符串值内的引号、反斜杠和换行都要转义。
+
+史实要求：人名、年代、地点、事件必须真实可考；明确区分史实与传说/演义，不虚构对话、动机或细节；拿不准的用更宽泛但准确的历史时期表述，不编造精确数字。
+
+叙事要求：
+1. 悬疑钩子：开头不按时间顺序，不从"今天讲谁"这类套路开场。第一句直接切入人物一生中最戏剧性的转折、绝境、反转或致命抉择，用具体画面感加一个悬而未决的问题，让观众必须看下去。前两句是冷开场钩子。
+2. 分层揭示：正文像剥洋葱一样层层推进——先给悬念，再给背景，再给冲突与抉择，最后揭晓真相与余波。中间至少埋一个「重新钩住」的反转或惊人事实。
+3. 语言：口语化、克制、有电影感，多用短句，节奏张弛有度。用人物的真实处境制造张力，不靠耸动标题党，不滥用最高级形容词。
+4. 视角：第三人称、冷静有分寸的旁白，像在讲述一段被重新发现的档案。
+
+时长：${duration} 分钟，写 ${minChars}–${maxChars} 字的口播（按每分钟约 240 字），只统计口播字数。
+
+结构：
+1. HOOK（${hookTimes[duration]}）：冷开场钩子，切入最戏剧性的绝境/反转/抉择，用具体画面加悬念问题。
+2. 背景铺垫（${setupTimes[duration]}）：交代人物、时代、处境，以及这件事为什么重要。
+3. 冲突与揭示（${coreTimes[duration]}）：用行动、抉择、压力、挫折、反转层层推进，中间埋一个重新钩住的反转；到达关键转折点后揭晓开头埋下的答案。
+4. 全局视角与收尾（${closeTimes[duration]}）：点明这件事的历史影响与余波，用一句留白式、可回味的结尾收束。
+
+不要加镜头表、剪辑提示、配乐提示或行动号召。`;
+
+  const userMessage = JSON.stringify({
+    topic,
+    durationMinutes: duration,
+    targetCharRange: `${minChars}–${maxChars} 字`,
+    creativeDirection: creativeDirection || undefined,
+    instruction: `围绕「${topic}」写一条 ${duration} 分钟的中文人物故事解说文案。script 字段只放口播正文（无小标题、无时间标签、无字数备注），title 字段放一个清晰有钩子的标题。`,
+  });
+
+  const fetchImpl = options.fetchImpl || fetch;
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.TEXT_REQUEST_TIMEOUT_MS) || 120000);
+  const endpoint = config.kind === "volcengine" ? textCompletionsEndpoint(config.endpoint) : config.endpoint;
+  const payload = config.kind === "volcengine" && isVolcenginePlanEndpoint(endpoint)
+    ? { model:config.model, messages:[{ role:"system", content:system }, { role:"user", content:userMessage }], max_tokens:8000 }
+    : { model:config.model, temperature:.3, max_tokens:8000, response_format:{ type:"json_object" }, ...(config.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages:[{ role:"system", content:system }, { role:"user", content:userMessage }] };
+  const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${config.apiKey}`}, body:JSON.stringify(payload) };
+  const callProvider = () => fetchImpl(endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
+  let response;
+  try { response = await callProvider(); }
+  catch (error) {
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    try { response = await callProvider(); }
+    catch (retryError) {
+      if (retryError?.name === "TimeoutError" || retryError?.name === "AbortError") throw new Error(`Text provider timed out after ${Math.round(timeoutMs / 1000)} seconds`);
+      throw retryError;
+    }
+  }
+  if (response.status === 429 || response.status >= 500) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    response = await callProvider();
+  }
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error?.message || `Provider returned ${response.status}`);
+  const raw = result.choices?.[0]?.message?.content || "{}";
+  const parsed = parseProviderJson(raw);
+  const title = String(parsed.title || "").trim();
+  const script = String(parsed.script || "").trim();
+  if (!title) throw new Error("The provider did not return a title");
+  if (!script) throw new Error("The provider did not return a script");
+  return { title, script };
+}
+
 function parseProviderJson(raw) {
   let source = String(raw || "").trim();
   source = source.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
@@ -1702,6 +1828,26 @@ async function translate(data) {
   const parsed = await parseOrRepairProviderJson(raw, resolveTextProvider(data), {}, "an object with a translations array"); if (!Array.isArray(parsed.translations)) throw new Error("Translation provider returned an unexpected format"); return parsed.translations;
 }
 
+// 从剧本提取核心角色清单，供「角色定妆图 + 分段组图」使用。
+// 返回 [{ name, appearance }]，appearance 是英文生图 prompt（供定妆图与一致性锚点）。
+export async function extractCharacters(data, options = {}) {
+  const config = resolveTextProvider(data);
+  if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
+  const script = String(data.script || "").trim();
+  if (!script) throw new Error("A script is required");
+  const narrationLang = getGenre(data.genre).primaryLanguage === "zh" ? "Simplified Chinese" : "English";
+  const system = `You are a casting director for a short-form ${narrationLang} narrative video. Extract the core recurring human characters from the supplied narration so their appearance stays consistent across AI-generated images. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a "characters" array. Each entry must contain: name (the canonical name used in the narration) and appearance (a concise visual description for a portrait reference image, written in English for the image model — age, face, build, hairstyle, distinctive clothing, and one era-accurate wardrobe detail; at most 45 words; no text, no watermark). Include only characters who appear in multiple scenes or are visually central; skip one-off or unnamed background figures. Return at most 8 characters, ordered by story importance. If the narration has no recurring human characters, return an empty characters array.`;
+  const raw = await completeText(config, [
+    { role:"system", content:system },
+    { role:"user", content:JSON.stringify({ script }) },
+  ], { temperature:.2, maxTokens:4000, fetchImpl:options.fetchImpl });
+  const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a characters array");
+  const characters = (Array.isArray(parsed.characters) ? parsed.characters : [])
+    .map((item) => ({ name:String(item?.name || "").trim(), appearance:String(item?.appearance || "").trim() }))
+    .filter((item) => item.name && item.appearance);
+  return characters.slice(0, 8);
+}
+
 export async function planEpisode(data, options = {}) {
   const config = resolveTextProvider(data);
   if (!config.apiKey || !config.model) throw new Error("No planning API key or model is configured");
@@ -1718,7 +1864,7 @@ export async function planEpisode(data, options = {}) {
     ? `for a suspense-driven character story in the style of ${genre.visualTone}`
     : "suited to the requested content format and visual style";
   const chineseField = storyGenre ? "" : ", chinese (concise Simplified Chinese translation)";
-  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied ${narrationLang} narration into compelling visual shots ${formatDirective}. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt)${chineseField}, type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
+  const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied ${narrationLang} narration into compelling visual shots ${formatDirective}. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt)${chineseField}, type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third), subject (one of "character", "environment", "text-card": whether the shot features the story's named human subject(s), a location/object/atmosphere without the named characters, or a diagram/text card such as a map or timeline), and characters (an array of canonical character names from the supplied character list who visibly appear in this shot; an empty array if none appear). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const unrestrictedShortSystem = shortSystem
     .replace("The opening hook must be about 5 seconds; ", "")
     .replace("Avoid shots shorter than 5 seconds, except the opening hook.", "Avoid arbitrary fixed durations; let each shot follow its narration excerpt.");
@@ -1732,7 +1878,7 @@ export async function planEpisode(data, options = {}) {
   const maximumShotCount = narrationDuration && longScenes ? Math.max(targetShotCount, Math.floor(narrationDuration / 6)) : null;
   const targetAnimatedShotCount = mixedMode && targetShotCount ? Math.max(1, Math.ceil(targetShotCount / 4)) : null;
   const screenRatio = normalizeScreenRatio(config.screenRatio);
-  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetShotDurationSeconds:longScenes ? null : shortClipDuration, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
+  const raw = await completeText(config, [{role:"system",content:system},{role:"user",content:JSON.stringify({script:config.script, contentFormat:config.contentFormat || "Documentary", visualStyle:config.visualStyle || "Photorealistic", creativeDirection:config.creativeDirection || "", productionMode, targetClipDurationSeconds:longScenes ? targetClipDuration : null, targetShotDurationSeconds:longScenes ? null : shortClipDuration, targetAnimatedShotCount, screenRatio, narrationDurationSeconds:narrationDuration || null, minimumShotCount, targetShotCount, maximumShotCount, localTranscriptionSegments:transcriptionSegments, characters:(Array.isArray(config.characters) ? config.characters : []).map((character) => ({ name:character.name, appearance:character.appearance }))})}], { temperature:.25, maxTokens:8000, fetchImpl:options.fetchImpl });
   const parsed = await parseOrRepairProviderJson(raw, config, options, "an object with a shots array");
   return normalizePlannedShots(parsed.shots, Number(config.audioDuration) || 0, { genre:genre.id, contentFormat:config.contentFormat, visualStyle:config.visualStyle, creativeDirection:config.creativeDirection, productionMode, targetClipDuration, shortClipDuration, screenRatio, transcription:config.transcription });
 }
@@ -1842,6 +1988,12 @@ export function createRenderServer() {
       if (req.method === "POST" && episodeActivateMatch) {
         episodeStore.activateEpisode(decodeURIComponent(episodeActivateMatch[1]));
         json(res, 200, { ok:true }); return;
+      }
+      const episodeReviewMatch = /^\/episodes\/([^/]+)\/review$/.exec(url.pathname);
+      if (req.method === "POST" && episodeReviewMatch) {
+        const payload = await body(req, 64 * 1024);
+        const result = await episodeStore.setReviewStatus(decodeURIComponent(episodeReviewMatch[1]), String(payload.status || "pending"));
+        json(res, 200, result); return;
       }
       const episodeMatch = /^\/episodes\/([^/]+)$/.exec(url.pathname);
       if (req.method === "GET" && episodeMatch) {
@@ -1960,6 +2112,7 @@ export function createRenderServer() {
       if (req.method === "POST" && url.pathname === "/text/translate") { json(res, 200, { lines:await translate(await body(req, 2*1024*1024)) }); return; }
       if (req.method === "POST" && url.pathname === "/text/plan") { json(res, 200, { shots:await planEpisode(await body(req, 4*1024*1024)) }); return; }
       if (req.method === "POST" && url.pathname === "/text/generate-documentary-script") { json(res, 200, await generateDocumentaryScript(await body(req, 4*1024*1024))); return; }
+      if (req.method === "POST" && url.pathname === "/text/generate-story-script") { json(res, 200, await generateStoryScript(await body(req, 4*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/text/opening-hook") { json(res, 200, await regenerateOpeningHook(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/synthesize") { json(res, 200, await synthesizeSpeech(await body(req, 2*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/audio/synthesize-minimax") {

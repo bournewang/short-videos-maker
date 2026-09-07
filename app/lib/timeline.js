@@ -132,6 +132,11 @@ function mixedVideoIndexes(shots) {
   return selected;
 }
 
+// 分镜模型未返回 subject 时，按 shot 类型回退推断镜头属性。
+function inferSubject(type) {
+  return type === "Map" || type === "Timeline" ? "text-card" : "character";
+}
+
 export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
   if (!Array.isArray(input) || !input.length) throw new Error("The planning provider returned no shots");
   const usable = input.slice(0, 80).filter((item) => String(item?.narration || item?.text || item?.voiceover || "").trim());
@@ -154,6 +159,8 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
     const prompt = sanitizeImagePrompt(item?.prompt || fallbackPrompt);
     const needsHistoricalAccuracy = historicalFormat.test(`${contentFormat} ${creativeDirection}`) && !/\b(?:no anachronisms?|period[- ]accurate|historically accurate)\b/i.test(prompt);
     const motion = shotMotion(item?.motion, index);
+    const subject = ["character", "environment", "text-card"].includes(item?.subject) ? item.subject : inferSubject(type);
+    const characters = Array.isArray(item?.characters) ? item.characters.map((name) => String(name || "").trim()).filter(Boolean) : [];
     return {
       type,
       duration,
@@ -163,6 +170,8 @@ export function normalizePlannedShots(input, audioDuration = 0, options = {}) {
       videoPrompt: String(item?.videoPrompt || (longScenes ? defaultLongVideoPrompt({ ...item, narration, motion }, index, options) : defaultVideoPrompt({ ...item, narration, motion }, index))).trim(),
       videoRecommended:Boolean(item?.videoRecommended),
       motion,
+      subject,
+      characters,
     };
   });
   if (mixedMode) {

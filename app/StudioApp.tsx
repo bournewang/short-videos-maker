@@ -17,6 +17,11 @@ import { COVER_TITLE_POSITIONS, coverPromptSuggestion, downloadCoverFile, normal
 import { MINIMAX_TTS_MODELS, MINIMAX_VOICE_FALLBACK, LANG_LABELS, GENDER_LABELS, filterVoices } from "./lib/minimax-voices";
 import { getGenre, genreId, GENRE_LIST } from "./lib/genres";
 
+// 组图（sequential_image_generation）单次请求最多可生成的图片数。
+// 火山方舟 Seedream 官方上限：文生组图 ≤15；单图生组图 ≤14；多图生组图「参考图数 + 生成图数 ≤15」。
+// 本项目组图走纯文生（无参考图），故取官方上限 15。
+const MAX_GROUP_IMAGES = 15;
+
 type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
   type: string; narration: string; chinese: string; prompt: string; videoPrompt: string; status: string;
@@ -42,7 +47,7 @@ type SubtitleStyle = ReturnType<typeof normalizeSubtitleStyle>;
 type HeadlineStyle = ReturnType<typeof normalizeHeadlineStyle>;
 
 type EpisodeSummary = {
-  id:string; title:string; savedAt:number; shotCount:number; duration:number; hasNarration:boolean; stage:string; genre:string;
+  id:string; title:string; savedAt:number; shotCount:number; duration:number; hasNarration:boolean; stage:string; genre:string; reviewStatus:string; reviewedAt:number;
 };
 
 type VideoBuild = {
@@ -463,6 +468,16 @@ export default function StudioApp() {
     await refreshEpisodeHistory();
   }
 
+  async function reviewEpisode(id:string, status:"approved" | "rejected") {
+    try {
+      const response = await fetch(`${SERVICE}/episodes/${encodeURIComponent(id)}/review`, { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ status }) });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Review update failed");
+      setMessage(status === "approved" ? "Episode approved — ready for batch export." : "Episode rejected — send back for revision.");
+      await refreshEpisodeHistory();
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Review update failed"); }
+  }
+
   async function loadEpisodeDataForLivestream(id: string) {
     try {
       const parsed = serverStorageReady.current
@@ -751,7 +766,7 @@ export default function StudioApp() {
   }
 
   async function generateImageGroups(pending: Shot[], source: Shot[], successMessage: string) {
-    const groups = Array.from({ length:Math.ceil(pending.length / 10) }, (_, index) => pending.slice(index * 10, index * 10 + 10));
+    const groups = Array.from({ length:Math.ceil(pending.length / MAX_GROUP_IMAGES) }, (_, index) => pending.slice(index * MAX_GROUP_IMAGES, index * MAX_GROUP_IMAGES + MAX_GROUP_IMAGES));
     const pendingIds = new Set(pending.map((shot) => shot.id));
     const generatedById = new Map<string, Shot>();
     const failures: string[] = [];
@@ -1030,7 +1045,7 @@ export default function StudioApp() {
           <div className="top-actions"><span className={`save-state storage-${storageState}`}>● {storageState === "server" ? "Saved to server" : storageState === "browser" ? "Browser backup only" : storageState === "error" ? "Save failed" : "Saving…"}</span><button className="ghost" onClick={() => void newEpisode()} disabled={!!activityLabel}>New episode</button><button className="ghost" onClick={() => setSettingsOpen(true)}>Provider settings</button><button className="primary" onClick={() => setStage("export")} disabled={!!busy}>Build & Preview</button></div>
         </header>}
 
-        {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} /> : <>
+        {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} reviewEpisode={(id:string, status:"approved" | "rejected") => void reviewEpisode(id, status)} /> : <>
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} shortClipDuration={shortClipDuration} setShortClipDuration={setShortClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} minimaxVoice={minimaxVoice} setMinimaxVoice={setMinimaxVoice} minimaxModel={minimaxModel} setMinimaxModel={setMinimaxModel} minimaxSpeed={minimaxSpeed} setMinimaxSpeed={setMinimaxSpeed} minimaxVoices={minimaxVoices} minimaxVoiceLang={minimaxVoiceLang} setMinimaxVoiceLang={setMinimaxVoiceLang} minimaxVoiceGender={minimaxVoiceGender} setMinimaxVoiceGender={setMinimaxVoiceGender} genre={genre} setGenre={setGenre} doubaoSpeaker={doubaoSpeaker} setDoubaoSpeaker={setDoubaoSpeaker} doubaoSpeechRate={doubaoSpeechRate} setDoubaoSpeechRate={setDoubaoSpeechRate} analyze={analyze} generateDocumentaryScript={generateDocumentaryScript} scriptDuration={scriptDuration} setScriptDuration={setScriptDuration} busy={busy} />}
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} handleShotImageUpload={handleShotImageUpload} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} previewActive={previewActive} setPreviewActive={setPreviewActive} regenerateOpeningVisual={regenerateOpeningVisual} audioElapsed={audioElapsed} translateAll={translateAll} genre={genre} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} genre={genre} />}
@@ -1106,15 +1121,19 @@ function NarrationBar({ audioData, audioName, audioDuration, autoplayRequest, pr
   </div>;
 }
 
-function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode }:any) {
+function reviewStatusLabel(status:string) {
+  return { draft:"草稿", pending:"待审核", approved:"已通过", rejected:"已驳回" }[status] || String(status || "draft");
+}
+
+function EpisodeLibrary({ episodes, currentId, loading, openEpisode, deleteEpisode, newEpisode, reviewEpisode }:any) {
   const currentGenre = genreId(episodes.find((episode:EpisodeSummary) => episode.id === currentId)?.genre);
   const [selectedGenre, setSelectedGenre] = useState(currentGenre);
   const filteredEpisodes = episodes.filter((episode:EpisodeSummary) => genreId(episode.genre) === selectedGenre);
   useEffect(() => {
     if (episodes.some((episode:EpisodeSummary) => episode.id === currentId)) setSelectedGenre(currentGenre);
   }, [currentId, currentGenre, episodes]);
-  return <div className="panel episode-library-page"><div className="section-head"><div><span className="eyebrow">LOCAL WORKSPACE</span><h1>Episodes</h1><p>Every episode is saved locally on this device, including its script, narration, storyboard, captions, and generated assets.</p></div><button className="primary large" onClick={newEpisode}>New episode</button></div>
-    {loading ? <div className="episode-library-empty">Loading saved episodes…</div> : episodes.length ? <><div className="episode-genre-tabs" role="tablist" aria-label="Episode genre">{GENRE_LIST.map((genre) => <button key={genre.id} type="button" role="tab" aria-selected={selectedGenre === genre.id} className={selectedGenre === genre.id ? "active" : ""} onClick={() => setSelectedGenre(genre.id)}>{genre.labelZh}<span>{episodes.filter((episode:EpisodeSummary) => genreId(episode.genre) === genre.id).length}</span></button>)}</div><div className="episode-history">{filteredEpisodes.map((episode:EpisodeSummary) => <article key={episode.id} className={episode.id === currentId ? "current" : ""}><button className="episode-open" onClick={() => openEpisode(episode.id)}><span className="episode-title"><b>{episode.title}</b>{episode.id === currentId && <em>Current</em>}</span><span className="episode-meta"><time>{formatEpisodeDate(episode.savedAt)}</time><i>{episode.shotCount} shots</i><i>{formatTime(episode.duration)}</i><i>{episode.hasNarration ? "Narration attached" : "No narration"}</i></span></button><button className="episode-delete" onClick={() => deleteEpisode(episode)} aria-label={`Delete ${episode.title}`}>Delete</button></article>)}</div></> : <div className="episode-library-empty"><b>No saved episodes yet</b><span>Start a new episode and it will appear here automatically.</span></div>}
+  return <div className="panel episode-library-page"><div className="section-head"><div><span className="eyebrow">LOCAL WORKSPACE</span><h1>Episodes</h1><p>Every episode is saved locally on this device, including its script, narration, storyboard, captions, and generated assets. Review generated episodes here, then export the approved ones in batch.</p></div><button className="primary large" onClick={newEpisode}>New episode</button></div>
+    {loading ? <div className="episode-library-empty">Loading saved episodes…</div> : episodes.length ? <><div className="episode-genre-tabs" role="tablist" aria-label="Episode genre">{GENRE_LIST.map((genre) => <button key={genre.id} type="button" role="tab" aria-selected={selectedGenre === genre.id} className={selectedGenre === genre.id ? "active" : ""} onClick={() => setSelectedGenre(genre.id)}>{genre.labelZh}<span>{episodes.filter((episode:EpisodeSummary) => genreId(episode.genre) === genre.id).length}</span></button>)}</div><div className="episode-history">{filteredEpisodes.map((episode:EpisodeSummary) => <article key={episode.id} className={episode.id === currentId ? "current" : ""}><button className="episode-open" onClick={() => openEpisode(episode.id)}><span className="episode-title"><b>{episode.title}</b>{episode.id === currentId && <em>Current</em>}</span><span className="episode-meta"><time>{formatEpisodeDate(episode.savedAt)}</time><i>{episode.shotCount} shots</i><i>{formatTime(episode.duration)}</i><i>{episode.hasNarration ? "Narration attached" : "No narration"}</i><i className={`review-status review-${episode.reviewStatus || "draft"}`}>{reviewStatusLabel(episode.reviewStatus)}</i></span></button><span className="episode-actions"><button type="button" className={`review-btn review-approve${episode.reviewStatus === "approved" ? " active" : ""}`} onClick={() => reviewEpisode(episode.id, "approved")} disabled={episode.reviewStatus === "approved"} aria-label={`Approve ${episode.title}`}>通过</button><button type="button" className={`review-btn review-reject${episode.reviewStatus === "rejected" ? " active" : ""}`} onClick={() => reviewEpisode(episode.id, "rejected")} disabled={episode.reviewStatus === "rejected"} aria-label={`Reject ${episode.title}`}>驳回</button><button className="episode-delete" onClick={() => deleteEpisode(episode)} aria-label={`Delete ${episode.title}`}>Delete</button></span></article>)}</div></> : <div className="episode-library-empty"><b>No saved episodes yet</b><span>Start a new episode and it will appear here automatically.</span></div>}
   </div>;
 }
 
