@@ -797,6 +797,112 @@ function assetContentType(filename) {
   return "application/octet-stream";
 }
 
+function coverDimensions(screenRatio) {
+  const ratio = normalizeScreenRatio(screenRatio);
+  return ratio === "16:9" ? { width:1280, height:720 } : ratio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
+}
+
+function escapeSvgText(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+}
+
+function coverTextUnits(value) {
+  return Array.from(String(value)).reduce((total, character) => {
+    if (/\s/.test(character)) return total + .28;
+    if (/[\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]/.test(character)) return total + 1;
+    if (/[A-Z0-9]/.test(character)) return total + .64;
+    if (/[a-z]/.test(character)) return total + .53;
+    return total + .36;
+  }, 0);
+}
+
+function coverTextLines(headline, maxUnits) {
+  const text = String(headline || "").trim();
+  if (!text) return [];
+  const tokens = /\s/.test(text) ? text.split(/\s+/).filter(Boolean) : Array.from(text);
+  const separator = /\s/.test(text) ? " " : "";
+  const lines = []; let line = "";
+  for (const word of tokens) {
+    const candidate = line ? `${line}${separator}${word}` : word;
+    if (line && coverTextUnits(candidate) > maxUnits) { lines.push(line); line = word; }
+    else line = candidate;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+function coverTitleSvg(width, height, headline, options = {}) {
+  const titleScale = Math.max(50, Math.min(200, Number(options.titleScale) || 100));
+  const titleWidth = Math.max(50, Math.min(95, Number(options.titleWidth) || 84));
+  const titleVertical = Math.max(2, Math.min(92, Number(options.titleVertical) || 90));
+  const horizontal = String(options.titlePosition || "bottom-left").split("-")[1] || "left";
+  const maxWidth = width * titleWidth / 100;
+  let fontSize = Math.round(width * .085 * titleScale / 100);
+  let lines = coverTextLines(headline, maxWidth / fontSize);
+  while (lines.length > 3 && fontSize > width * .045) {
+    fontSize -= Math.max(2, Math.round(width * .004));
+    lines = coverTextLines(headline, maxWidth / fontSize);
+  }
+  lines = lines.slice(0, 3);
+  if (!lines.length) return "";
+  const lineHeight = Math.round(fontSize * 1.06);
+  const marginX = (1 - titleWidth / 100) / 2;
+  const x = horizontal === "center" ? width * .5 : horizontal === "right" ? width * (1 - marginX) : width * marginX;
+  const baseline = Math.max(fontSize, Math.min(height - fontSize * .2, height * titleVertical / 100 - lineHeight * (lines.length - 1) * .5 + fontSize * .35));
+  const strokeWidth = Math.max(5, fontSize * .12);
+  const accentWidth = width * .13;
+  const accentHeight = Math.max(6, width * .008);
+  const accentX = horizontal === "center" ? x - accentWidth * .5 : horizontal === "right" ? x - accentWidth : x;
+  const accentY = Math.max(height * .025, baseline - fontSize * .82 - strokeWidth * .5 - Math.max(8, fontSize * .18) - accentHeight);
+  const anchor = horizontal === "center" ? "middle" : horizontal === "right" ? "end" : "start";
+  const v = titleVertical / 100;
+  const stops = [[0,0],[Math.max(0,v-.35),0],[Math.max(0,v-.18),.18],[v,.76],[Math.min(1,v+.18),.18],[1,0]].map(([offset, opacity]) => `<stop offset="${offset.toFixed(3)}" stop-color="#000" stop-opacity="${opacity.toFixed(3)}"/>`).join("");
+  const text = lines.map((line, index) => `<text x="${Math.round(x)}" y="${Math.round(baseline + index * lineHeight)}" font-family="'PingFang SC','Heiti SC',Arial,sans-serif" font-size="${fontSize}" font-weight="800" fill="#fffdf7" stroke="rgba(0,0,0,.82)" stroke-width="${strokeWidth.toFixed(1)}" stroke-linejoin="round" paint-order="stroke" text-anchor="${anchor}">${escapeSvgText(line)}</text>`).join("");
+  return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">${stops}</linearGradient></defs><rect width="${width}" height="${height}" fill="url(#shade)"/><rect x="${Math.round(accentX)}" y="${Math.round(accentY)}" width="${Math.round(accentWidth)}" height="${Math.round(accentHeight)}" fill="#d7a552"/>${text}</svg>`;
+}
+
+export async function bakeEpisodeCover(payload) {
+  const episodeId = String(payload?.episodeId || "");
+  const renderedImage = String(payload?.image || "");
+  if (episodeId && renderedImage) {
+    const { mime, data } = fromDataUrl(renderedImage);
+    if (!mime.startsWith("image/")) throw new Error("The saved cover must be an image");
+    const screenRatio = normalizeScreenRatio(payload.screenRatio);
+    const coverId = `cover-${screenRatio.replace(":", "x")}`;
+    return await episodeStore.withMediaTarget(episodeId, payload.title, "covers", coverId, async (target) => {
+      const filename = path.join(target.directory, `${target.baseName}.png`);
+      await writeFile(filename, data);
+      await unlink(path.join(target.directory, `${target.baseName}.jpg`)).catch(() => {});
+      const publicPath = `${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.png`)}`;
+      const createdAt = Date.now();
+      return { id:coverId, path:publicPath, url:`http://127.0.0.1:${port}${publicPath}?v=${createdAt}`, screenRatio, createdAt };
+    });
+  }
+  const backgroundUrl = String(payload?.backgroundUrl || "");
+  if (!episodeId || !backgroundUrl) throw new Error("An episode and cover background are required");
+  let backgroundPathname = "";
+  try {
+    const url = new URL(backgroundUrl);
+    if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") throw new Error("Invalid cover background host");
+    backgroundPathname = url.pathname;
+  } catch { throw new Error("The cover background must be a local episode image"); }
+  const backgroundPath = /^\/episodes\/([^/]+)\/files\/(.+)$/.exec(backgroundPathname);
+  if (!backgroundPath || decodeURIComponent(backgroundPath[1]) !== episodeId) throw new Error("The cover background must belong to this episode");
+  const { filename } = await episodeStore.fileForRequest(episodeId, backgroundPath[2].split("/").map(decodeURIComponent).join(path.sep));
+  const dimensions = coverDimensions(payload.screenRatio);
+  const base = await sharp(filename).resize(dimensions.width, dimensions.height, { fit:"cover", position:"attention" }).png().toBuffer();
+  const output = await sharp(base).composite([{ input:Buffer.from(coverTitleSvg(dimensions.width, dimensions.height, payload.headline, payload)) }]).jpeg({ quality:92 }).toBuffer();
+  const screenRatio = normalizeScreenRatio(payload.screenRatio);
+  const coverId = `cover-${screenRatio.replace(":", "x")}`;
+  return await episodeStore.withMediaTarget(episodeId, payload.title, "covers", coverId, async (target) => {
+    const filename = path.join(target.directory, `${target.baseName}.jpg`);
+    await writeFile(filename, output);
+    const publicPath = `${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.jpg`)}`;
+    const createdAt = Date.now();
+    return { id:coverId, path:publicPath, url:`http://127.0.0.1:${port}${publicPath}?v=${createdAt}`, screenRatio, createdAt };
+  });
+}
+
 async function providerImageUrl(value) {
   if (!value) throw new Error("A generated storyboard image is required before creating a clip");
   if (/^data:image\//.test(value)) return value;
@@ -1650,6 +1756,10 @@ export async function generateDocumentaryScript(data, options = {}) {
   if (!topic) throw new Error("A topic is required to generate the script");
   const duration = Math.max(2, Math.min(6, Math.round(Number(data.duration) || 3)));
   const creativeDirection = String(data.creativeDirection || "").trim();
+  const genre = getGenre(data.genre);
+  const templateDirection = genre.id === "documentary"
+    ? ""
+    : `\n\nSELECTED CONTENT TEMPLATE: ${genre.label}. Write this as a ${genre.defaultContentFormat}. Follow this editorial structure: ${genre.planningStyle}. Visual planning later uses this tone: ${genre.visualTone}. Treat any history-specific instruction below as applicable only when the topic itself is historical.`;
   const wordRanges = { 2:[180,220], 3:[270,330], 4:[360,440], 5:[450,550], 6:[540,660] };
   const [minWords, maxWords] = wordRanges[duration];
   const hookTimes = { 2:"0–15 sec", 3:"0–20 sec", 4:"0–30 sec", 5:"0–35 sec", 6:"0–45 sec" };
@@ -1674,14 +1784,14 @@ STRUCTURE:
 
 NARRATIVE VOICE: Calm, confident, cinematic, humane at a measured documentary pace. Create tension from real stakes and uncertainty — not clickbait. Center human agency while acknowledging institutions, geography, technology, belief, and chance. Do not add shot lists, editing directions, or music cues.
 
-QUALITY: Create attention through real stakes — not invented drama. Do not use unsupported superlatives. Do not repeat facts merely to fill time. Do not add calls to action.`;
+QUALITY: Create attention through real stakes — not invented drama. Do not use unsupported superlatives. Do not repeat facts merely to fill time. Do not add calls to action.${templateDirection}`;
 
   const userMessage = JSON.stringify({
     topic,
     durationMinutes: duration,
     targetWordRange: `${minWords}–${maxWords} words`,
     creativeDirection: creativeDirection || undefined,
-    instruction: `Write a ${duration}-minute history documentary script about "${topic}". The script field must contain only the spoken narration (no headings, no timing labels, no word counts). The title field must be a clear, engaging video title.`,
+    instruction: `Write a ${duration}-minute ${genre.id === "documentary" ? "history documentary" : genre.label} script about "${topic}". The script field must contain only the spoken narration (no headings, no timing labels, no word counts). The title field must be a clear, engaging video title.`,
   });
 
   const fetchImpl = options.fetchImpl || fetch;
@@ -1729,13 +1839,18 @@ export async function generateStoryScript(data, options = {}) {
   if (!topic) throw new Error("A topic is required to generate the script");
   const duration = Math.max(2, Math.min(6, Math.round(Number(data.duration) || 3)));
   const creativeDirection = String(data.creativeDirection || "").trim();
+  const genre = getGenre(data.genre);
+  const isHistoricalStory = genre.id === "story";
   const charRanges = { 2:[440,520], 3:[660,780], 4:[880,1040], 5:[1100,1300], 6:[1320,1560] };
   const [minChars, maxChars] = charRanges[duration];
   const hookTimes = { 2:"0–15秒", 3:"0–20秒", 4:"0–30秒", 5:"0–35秒", 6:"0–45秒" };
   const setupTimes = { 2:"15–45秒", 3:"20–65秒", 4:"30–90秒", 5:"35–110秒", 6:"45–135秒" };
   const coreTimes = { 2:"45–100秒", 3:"65–150秒", 4:"90–200秒", 5:"110–250秒", 6:"135–300秒" };
   const closeTimes = { 2:"100–120秒", 3:"150–180秒", 4:"200–240秒", 5:"250–300秒", 6:"300–360秒" };
-  const system = `你是深耕历史人物故事的短视频解说编剧，对标头部「人物档案 / 悬疑解说」账号的调性。根据用户给出的人物或历史事件，写一条高留存的中文人物故事解说文案。
+  const system = isHistoricalStory
+    ? `你是深耕历史人物故事的短视频解说编剧，对标头部「人物档案 / 悬疑解说」账号的调性。根据用户给出的人物或历史事件，写一条高留存的中文人物故事解说文案。`
+    : `你是中文短视频知识类解说编剧。请按「${genre.labelZh}」模板写一条高留存、事实准确的中文口播。模板结构：${genre.planningStyle}。视觉基调：${genre.visualTone}。围绕一个具体、可回答的问题展开，先给反直觉钩子，再用清晰因果解释，结尾回到观众日常理解。不要将题目泛化成宽泛的百科介绍，不要编造事实或数字。`;
+  const requirements = isHistoricalStory ? `
 
 只返回一个紧凑的 RFC 8259 JSON 对象，不要 Markdown、注释或解释。JSON 必须包含两个字段："title"（一个清晰、有钩子、史实准确的中文视频标题）和 "script"（纯口播解说文案，不要任何小标题、时间标签或字数备注）。字符串值内的引号、反斜杠和换行都要转义。
 
@@ -1755,22 +1870,35 @@ export async function generateStoryScript(data, options = {}) {
 3. 冲突与揭示（${coreTimes[duration]}）：用行动、抉择、压力、挫折、反转层层推进，中间埋一个重新钩住的反转；到达关键转折点后揭晓开头埋下的答案。
 4. 全局视角与收尾（${closeTimes[duration]}）：点明这件事的历史影响与余波，用一句留白式、可回味的结尾收束。
 
-不要加镜头表、剪辑提示、配乐提示或行动号召。`;
+不要加镜头表、剪辑提示、配乐提示或行动号召。` : `
+
+只返回一个紧凑的 RFC 8259 JSON 对象，不要 Markdown、注释或解释。JSON 必须包含 "title"（清晰、有钩子的中文标题）和 "script"（纯中文口播正文，不要小标题、时间标签或字数备注）字段。引用事实时保持准确；不确定的信息要用审慎、可验证的表述，不能虚构来源、数据或经历。
+
+时长：${duration} 分钟，写 ${minChars}–${maxChars} 字口播（每分钟约 240 字），只统计口播字数。
+
+结构：
+1. HOOK（${hookTimes[duration]}）：第一句直接抛出观众熟悉却不知道答案的具体反差、问题或场景，第二句承诺解释关键原因。
+2. 拆解（${setupTimes[duration]}）：明确对象、条件和核心概念，用最少必要背景建立理解。
+3. 原理与证据（${coreTimes[duration]}）：按因果链分步解释；至少有一个能改变直觉的细节或反转；例子必须服务于结论。
+4. 收束（${closeTimes[duration]}）：回到开头的问题，说明这条机制会怎样影响真实世界或日常选择。
+
+语言：自然、口语化、具体、克制；短句为主，避免空泛形容词、标题党和行动号召。不要加镜头表、剪辑提示或配乐提示。`;
+  const fullSystem = `${system}${requirements}`;
 
   const userMessage = JSON.stringify({
     topic,
     durationMinutes: duration,
     targetCharRange: `${minChars}–${maxChars} 字`,
     creativeDirection: creativeDirection || undefined,
-    instruction: `围绕「${topic}」写一条 ${duration} 分钟的中文人物故事解说文案。script 字段只放口播正文（无小标题、无时间标签、无字数备注），title 字段放一个清晰有钩子的标题。`,
+    instruction: `围绕「${topic}」写一条 ${duration} 分钟的${isHistoricalStory ? "中文人物故事" : `中文${genre.labelZh}`}解说文案。script 字段只放口播正文（无小标题、无时间标签、无字数备注），title 字段放一个清晰有钩子的标题。`,
   });
 
   const fetchImpl = options.fetchImpl || fetch;
   const timeoutMs = Math.max(1000, Number(options.timeoutMs) || Number(process.env.TEXT_REQUEST_TIMEOUT_MS) || 120000);
   const endpoint = config.kind === "volcengine" ? textCompletionsEndpoint(config.endpoint) : config.endpoint;
   const payload = config.kind === "volcengine" && isVolcenginePlanEndpoint(endpoint)
-    ? { model:config.model, messages:[{ role:"system", content:system }, { role:"user", content:userMessage }], max_tokens:8000 }
-    : { model:config.model, temperature:.3, max_tokens:8000, response_format:{ type:"json_object" }, ...(config.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages:[{ role:"system", content:system }, { role:"user", content:userMessage }] };
+    ? { model:config.model, messages:[{ role:"system", content:fullSystem }, { role:"user", content:userMessage }], max_tokens:8000 }
+    : { model:config.model, temperature:.3, max_tokens:8000, response_format:{ type:"json_object" }, ...(config.kind === "volcengine" ? { thinking:{ type:"disabled" } } : {}), messages:[{ role:"system", content:fullSystem }, { role:"user", content:userMessage }] };
   const request = { method:"POST", headers:{"Content-Type":"application/json",Authorization:`Bearer ${config.apiKey}`}, body:JSON.stringify(payload) };
   const callProvider = () => fetchImpl(endpoint, { ...request, signal:AbortSignal.timeout(timeoutMs) });
   let response;
@@ -1862,7 +1990,7 @@ export async function planEpisode(data, options = {}) {
   const narrationLang = storyGenre ? "Simplified Chinese" : "English";
   const formatDirective = storyGenre
     ? `for a suspense-driven character story in the style of ${genre.visualTone}`
-    : "suited to the requested content format and visual style";
+    : `for ${genre.planningStyle}, with the visual tone of ${genre.visualTone}`;
   const chineseField = storyGenre ? "" : ", chinese (concise Simplified Chinese translation)";
   const shortSystem = `You are a senior storyboard editor for short-form social video. Break the supplied ${narrationLang} narration into compelling visual shots ${formatDirective}. Preserve every spoken word in order across the narration fields; do not add unsupported facts. Return one compact RFC 8259 JSON object only, without Markdown, comments, or explanation, with a shots array. Escape every quote, backslash, and line break inside string values. Each shot must contain: narration (a non-empty exact consecutive excerpt)${chineseField}, type (Opening, Narrative, Climax, Map, Timeline, or Emotion), duration in seconds, prompt (a concise still-image generation prompt, at most 55 words, faithful to the narration, content format, visual style, creative direction, and requested screen ratio, with subject, setting, composition, lighting, and exclusions for text and watermark), videoPrompt (a separate image-to-video prompt, at most 55 words, describing specific subject action, secondary environmental motion, pace, camera behavior, and continuity from the supplied first frame; demand one continuous shot with stable identity and anatomy, and exclude cuts, new subjects, text, logos, flicker, warping, and morphing), and motion (one of Slow push-in, Slow pull-out, Slow drift, Slow rise, Slow sink, Diagonal drift, Push to subject, Static; vary the choice across shots, prefer Push to subject when the frame's subject occupies the upper third), subject (one of "character", "environment", "text-card": whether the shot features the story's named human subject(s), a location/object/atmosphere without the named characters, or a diagram/text card such as a map or timeline), and characters (an array of canonical character names from the supplied character list who visibly appear in this shot; an empty array if none appear). For historical subjects or whenever the narration contains a date or period cue, every image prompt must explicitly name the most accurate era or date and location supported by the script, then describe a period-accurate background and relevant architecture, landscape or interior, clothing, materials, props, transport, weapons, and technology. Never mix eras or include anachronisms. If the precise year is uncertain, use a broader historically accurate period rather than inventing specificity. The videoPrompt must animate what is already established by prompt and must agree with motion; it must not invent a different scene. The first shot (type Opening) is the visual hook that determines whether viewers stay or swipe away — over half of viewers leave within 2 seconds if the opening image is weak. Its image prompt must create immediate visual impact: dramatic cinematic lighting (chiaroscuro, golden hour, atmospheric haze, volumetric light), striking composition (strong focal point, depth, scale contrast, leading lines), and visual tension or mystery that sparks curiosity. Never use a map, chart, timeline, diagram, split-screen comparison, or flat informational establishing shot as the first shot. Prefer a dramatic close-up, an epic wide shot with scale contrast, or a moment of human emotion over a flat wide establishing shot. The opening image should feel like a movie poster or a cinematic teaser, not a textbook illustration. Never return an empty object, empty narration, placeholder shot, or trailing item merely to reach a requested count. Timing guidance: the requested target shot length is ${shortClipDuration} seconds. Keep every ordinary shot close to ${shortClipDuration} seconds and never longer than ${shortClipDuration + 4} seconds. Prefer natural topic shifts, scene changes, or turning points, but split as soon as the subject, location, or action changes instead of bundling unrelated sentences to fill time. The opening hook must be about 5 seconds; ordinary narration ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}; climaxes 6–12; maps and timelines ${shortClipDuration}–${Math.max(12, shortClipDuration + 6)}; emotional turns ${Math.max(5, shortClipDuration - 3)}–${shortClipDuration + 2}. Avoid shots shorter than 5 seconds, except the opening hook. When narration duration and shot-count guidance are supplied, create at least the minimum number of shots and aim for the target count by grouping sentences into meaningful clusters; if the script cannot be grouped further, return fewer complete shots rather than an empty placeholder. The sum of shot durations must match the supplied narration duration. Adapt visual vocabulary to the episode instead of assuming any particular topic.`;
   const unrestrictedShortSystem = shortSystem
@@ -2062,6 +2190,7 @@ export function createRenderServer() {
           : await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
         json(res, 200, { image:cached.url, path:cached.path }); return;
       }
+      if (req.method === "POST" && url.pathname === "/covers/bake") { json(res, 200, await bakeEpisodeCover(await body(req, 16*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/image/generate-group") {
         const payload = await body(req, 2*1024*1024);
         const generated = await generateImageGroup(payload);

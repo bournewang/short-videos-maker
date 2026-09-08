@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { formatTime, normalizePlannedShots, scriptSectionForDuration } from "../app/lib/timeline.js";
+import { GENRE_LIST, getGenre } from "../app/lib/genres.js";
+
+test("the ten new content templates are registered with storyboard guidance", () => {
+  const ids = ["micro-learning", "career-inside", "civilization-comparison", "engineering-explained", "map-story", "time-travel", "world-systems", "why-everything", "failure-case", "rules-explained"];
+  assert.equal(GENRE_LIST.length, 12);
+  for (const id of ids) {
+    const genre = getGenre(id);
+    assert.equal(genre.id, id);
+    assert.ok(genre.planningStyle);
+    assert.ok(genre.visualTone);
+  }
+});
 
 test("AI shot timing is normalized to the narration duration", () => {
   const shots = normalizePlannedShots([

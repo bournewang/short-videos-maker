@@ -196,8 +196,8 @@ async function generateEpisode(entry, ctx, { skipImages }) {
   console.log(`\n▶ [${entry.genre}] ${entry.topic}（${entry.duration} 分钟）`);
 
   // 1. 脚本
-  const scriptFn = genre.id === "story" ? generateStoryScript : generateDocumentaryScript;
-  const { title, script } = await scriptFn({ topic: entry.topic, duration: entry.duration, creativeDirection: entry.creativeDirection });
+  const scriptFn = genre.primaryLanguage === "zh" ? generateStoryScript : generateDocumentaryScript;
+  const { title, script } = await scriptFn({ topic: entry.topic, duration: entry.duration, genre:genre.id, creativeDirection: entry.creativeDirection });
   console.log(`  标题：${title}`);
 
   // 2. 配音（按 genre 路由 MiniMax / 豆包）

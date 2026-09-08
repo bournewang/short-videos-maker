@@ -10,26 +10,19 @@
 //
 // --video-shots：none(默认，纯静态图) | first(仅第一个 shot) | all(全部) | 0,2,3(指定下标)
 
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { EpisodeStore } from "./episode-store.mjs";
 import {
   renderEpisode,
   generateVideo,
-  generateImage,
   persistGeneratedVideo,
 } from "./render-service.mjs";
-import { getGenre } from "../app/lib/genres.js";
-import { coverPromptSuggestion } from "../app/lib/cover.js";
 import { normalizeScreenRatio, videoResolution } from "../app/lib/video.js";
-import sharp from "sharp";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workRoot = path.resolve(process.env.SHORTFORM_STORAGE_DIR || path.join(root, ".shortform"));
-const batchRoot = path.join(workRoot, "batch");
-
 const store = new EpisodeStore({
   storageRoot: workRoot,
   assetRoot: path.join(workRoot, "assets"),
@@ -73,16 +66,6 @@ async function fileToDataUrl(filename) {
   return `data:${mime};base64,${buf.toString("base64")}`;
 }
 
-async function imageToBuffer(value) {
-  if (/^data:/.test(value)) {
-    const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(value));
-    return match?.[2] ? Buffer.from(match[3], "base64") : Buffer.from(decodeURIComponent(match[3]));
-  }
-  const response = await fetch(value);
-  if (!response.ok) throw new Error(`Could not download cover image (${response.status})`);
-  return Buffer.from(await response.arrayBuffer());
-}
-
 function resolveVideoShotIndexes(spec, shotCount) {
   if (!spec || spec === "none") return [];
   if (spec === "all") return Array.from({ length: shotCount }, (_, index) => index);
@@ -91,73 +74,22 @@ function resolveVideoShotIndexes(spec, shotCount) {
   return [...new Set(indexes)];
 }
 
-// 用 sharp 复刻浏览器端 cover.js 的标题烘焙：底部渐变遮罩 + 金色 accent 条 + 标题文字。
-function wrapHeadline(text, maxChars) {
-  const trimmed = String(text || "").trim();
-  if (!trimmed) return [];
-  const cjk = /[\u3400-\u4dbf\u4e00-\u9fff\uF900-\uFAFF]/.test(trimmed);
-  if (cjk) {
-    const lines = [];
-    for (let i = 0; i < trimmed.length && lines.length < 3; i += maxChars) lines.push(trimmed.slice(i, i + maxChars));
-    return lines;
-  }
-  const words = trimmed.split(/\s+/).filter(Boolean);
-  const lines = [];
-  let line = "";
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    if (candidate.length > maxChars && line) { lines.push(line); line = word; }
-    else line = candidate;
-    if (lines.length === 2) break;
-  }
-  if (line && lines.length < 3) lines.push(line);
-  return lines.slice(0, 3);
+export function hasMatchingBuild(project, resolution) {
+  const screenRatio = normalizeScreenRatio(project?.screenRatio);
+  return (Array.isArray(project?.videoBuilds) ? project.videoBuilds : []).some((build) =>
+    normalizeScreenRatio(build?.screenRatio) === screenRatio && String(build?.resolution || "") === String(resolution)
+  );
 }
 
-function coverOverlaySvg(width, height, headline, opts = {}) {
-  const titleScale = Math.max(50, Math.min(200, Number(opts.titleScale) || 100));
-  const titleWidth = Math.max(50, Math.min(95, Number(opts.titleWidth) || 84));
-  const titleVertical = Math.max(2, Math.min(92, Number(opts.titleVertical) || 90));
-  const horizontal = String(opts.titlePosition || "bottom-left").split("-")[1] || "left";
-  const v = titleVertical / 100;
-  const maxWidth = width * (titleWidth / 100);
-  const fontSize = Math.round(width * 0.085 * titleScale / 100);
-  const maxChars = Math.max(4, Math.floor(maxWidth / fontSize));
-  const lines = wrapHeadline(headline, maxChars);
-  const lineHeight = Math.round(fontSize * 1.06);
-  const marginX = (1 - titleWidth / 100) / 2;
-  const x = horizontal === "center" ? width * 0.5 : horizontal === "right" ? width * (1 - marginX) : width * marginX;
-  const firstBaseline = height * v - lineHeight * (lines.length - 1) * 0.5 + fontSize * 0.35;
-  const accentWidth = width * 0.13;
-  const accentHeight = Math.max(6, width * 0.008);
-  const accentGap = Math.max(8, fontSize * 0.18);
-  const textAscent = fontSize * 0.82;
-  const strokeWidth = Math.max(5, fontSize * 0.12);
-  const accentY = Math.max(height * 0.025, firstBaseline - textAscent - strokeWidth * 0.5 - accentGap - accentHeight);
-  const anchor = horizontal === "center" ? "middle" : horizontal === "right" ? "end" : "start";
-  const accentX = horizontal === "center" ? x - accentWidth * 0.5 : horizontal === "right" ? x - accentWidth : x;
-  const gradientStops = [
-    { offset: 0, opacity: 0 },
-    { offset: Math.max(0, v - 0.35), opacity: 0 },
-    { offset: Math.max(0, v - 0.18), opacity: 0.18 },
-    { offset: v, opacity: 0.76 },
-    { offset: Math.min(1, v + 0.18), opacity: 0.18 },
-    { offset: 1, opacity: 0 },
-  ];
-  const gradient = gradientStops.map((stop) => `<stop offset="${stop.offset.toFixed(3)}" stop-color="#000000" stop-opacity="${stop.opacity.toFixed(3)}"/>`).join("");
-  const textNodes = lines.map((line, index) => {
-    const y = Math.round(firstBaseline + index * lineHeight);
-    return `<text x="${Math.round(x)}" y="${y}" font-family="'PingFang SC','Heiti SC',Arial,sans-serif" font-size="${fontSize}" font-weight="800" fill="#fffdf7" stroke="rgba(0,0,0,0.82)" stroke-width="${strokeWidth.toFixed(1)}" stroke-linejoin="round" paint-order="stroke" text-anchor="${anchor}">${line.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</text>`;
-  }).join("");
-  return `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">${gradient}</linearGradient></defs><rect width="${width}" height="${height}" fill="url(#g)"/><rect x="${Math.round(accentX)}" y="${Math.round(accentY)}" width="${Math.round(accentWidth)}" height="${Math.round(accentHeight)}" fill="#d7a552"/>${textNodes}</svg>`;
-}
-
-async function bakeCover(baseImage, headline, opts = {}) {
-  const ratio = normalizeScreenRatio(opts.screenRatio);
-  const dimensions = ratio === "16:9" ? { width: 1280, height: 720 } : ratio === "1:1" ? { width: 1080, height: 1080 } : { width: 1080, height: 1920 };
-  const base = await sharp(baseImage).resize(dimensions.width, dimensions.height, { fit: "cover", position: "attention" }).png().toBuffer();
-  const svg = coverOverlaySvg(dimensions.width, dimensions.height, headline, opts);
-  return sharp(base).composite([{ input: Buffer.from(svg) }]).jpeg({ quality: 92 }).toBuffer();
+export async function hasExportArtifact(episode, storageRoot = workRoot) {
+  const slug = String(episode?.slug || "").trim();
+  if (!slug) return false;
+  try {
+    const files = await readdir(path.join(storageRoot, "episodes", slug, "exports"));
+    return files.some((filename) => path.extname(filename).toLowerCase() === ".mp4");
+  } catch {
+    return false;
+  }
 }
 
 async function generateVideos(project, indexes, videoResolution, videoProvider) {
@@ -188,7 +120,6 @@ async function generateVideos(project, indexes, videoResolution, videoProvider) 
 async function exportEpisode(episode, opts) {
   const project = store.getEpisode(episode.id);
   if (!project) throw new Error("Episode not found");
-  const genre = getGenre(project.genre);
   console.log(`\n▶ ${project.title}（${episode.id}）`);
 
   const shots = Array.isArray(project.shots) ? project.shots : [];
@@ -249,37 +180,7 @@ async function exportEpisode(episode, opts) {
   project.videoBuilds = [buildRecord, ...(Array.isArray(project.videoBuilds) ? project.videoBuilds : [])];
   console.log(`  MP4 完成：${result.duration.toFixed(1)}s`);
 
-  // 3. 封面
-  if (!opts.skipCover) {
-    const prompt = String(project.coverPrompt || "").trim() || coverPromptSuggestion(project.title, project.script, project.contentFormat, project.visualStyle, project.creativeDirection);
-    const coverImage = await generateImage({ prompt, screenRatio: project.screenRatio });
-    const headline = String(project.coverHeadline || project.title || "").trim();
-    const jpg = await bakeCover(await imageToBuffer(coverImage), headline, {
-      screenRatio: project.screenRatio,
-      titlePosition: project.coverTitlePosition || "bottom-left",
-      titleScale: project.coverTitleScale || 100,
-      titleWidth: project.coverTitleWidth || 84,
-      titleVertical: project.coverTitleVertical || 90,
-    });
-    const coverId = `cover-${Date.now()}`;
-    const cached = await store.withMediaTarget(project.id, project.title, "covers", coverId, async (target) => {
-      const filename = path.join(target.directory, `${target.baseName}.jpg`);
-      await writeFile(filename, jpg);
-      return { url: `${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.jpg`)}` };
-    });
-    project.covers = [{
-      id: coverId,
-      path: cached.url,
-      url: cached.url,
-      screenRatio: project.screenRatio,
-      prompt,
-      provider: "generated",
-      createdAt: Date.now(),
-    }, ...(Array.isArray(project.covers) ? project.covers : [])];
-    console.log(`  封面完成`);
-  }
-
-  // 4. 回写 episode（videoBuilds + covers）
+  // 3. 回写 episode（封面需在 Web 编辑器中审核后手动保存）
   await store.saveEpisode(project, { setActive: false });
   return { id: project.id, title: project.title, buildUrl: buildRecord.url };
 }
@@ -299,7 +200,7 @@ async function main() {
   --video-provider <p>    生视频 provider：pixstag|volcengine|dashscope（默认取 .env.local 的 VIDEO_PROVIDER）
   --resolution <r>        渲染分辨率 480|720|1080，默认 1080
   --video-resolution <r>  生视频分辨率 480p|720p|1080p|2k，默认 720p
-  --skip-cover            跳过封面生成
+  --force                 即使已有相同画幅和分辨率的成片也重新导出
   --dry-run               只打印将导出的集，不执行`);
     return;
   }
@@ -316,19 +217,32 @@ async function main() {
     targets = all.filter((episode) => episode.reviewStatus === "approved");
   }
 
-  if (args["dry-run"]) {
-    console.log(`待导出 ${targets.length} 集（dry-run）：`);
-    targets.forEach((episode, index) => console.log(`  ${index + 1}. [${episode.reviewStatus}] ${episode.title} · ${episode.shotCount} shots · ${episode.id}`));
-    return;
-  }
-
   const opts = {
     videoShots: args["video-shots"] || "none",
     resolution: args.resolution || "1080",
     videoResolution: args["video-resolution"] || "720p",
     videoProvider: args["video-provider"] || "",
-    skipCover: Boolean(args["skip-cover"]),
+    force: Boolean(args.force),
   };
+  const skipped = [];
+  if (!opts.force) {
+    const pending = [];
+    for (const episode of targets) {
+      const project = store.getEpisode(episode.id);
+      if (hasMatchingBuild(project, opts.resolution) || await hasExportArtifact(episode)) skipped.push(episode);
+      else pending.push(episode);
+    }
+    targets = pending;
+  }
+
+  if (args["dry-run"]) {
+    console.log(`待导出 ${targets.length} 集（dry-run）：`);
+    targets.forEach((episode, index) => console.log(`  ${index + 1}. [${episode.reviewStatus}] ${episode.title} · ${episode.shotCount} shots · ${episode.id}`));
+    if (skipped.length) console.log(`跳过已导出 ${skipped.length} 集（使用 --force 可重导）：\n${skipped.map((episode) => `  ${episode.title} · ${episode.id}`).join("\n")}`);
+    return;
+  }
+
+  if (skipped.length) console.log(`跳过已导出 ${skipped.length} 集（使用 --force 可重导）`);
   console.log(`待导出 ${targets.length} 集${opts.videoShots !== "none" ? ` · 生视频 ${opts.videoShots}${opts.videoProvider ? `（${opts.videoProvider}）` : ""}` : " · 纯静态图"}`);
 
   const results = [];
@@ -349,7 +263,9 @@ async function main() {
   if (results.some((item) => item.status === "failed")) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  console.error(`\n${error instanceof Error ? error.message : error}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`\n${error instanceof Error ? error.message : error}`);
+    process.exitCode = 1;
+  });
+}

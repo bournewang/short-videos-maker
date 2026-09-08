@@ -178,6 +178,7 @@ node scripts/batch-export.mjs --dry-run
 | `--resolution <r>` | Final render resolution `480` \| `720` \| `1080` | `1080` |
 | `--video-resolution <r>` | Clip generation resolution `480p` \| `720p` \| `1080p` \| `2k` | `720p` |
 | `--skip-cover` | Skip cover generation | off |
+| `--force` | Re-export episodes that already have the requested ratio and final resolution | off |
 | `--dry-run` | Print the episodes that would be exported and exit | off |
 
 `--video-resolution` is normalized per provider: `volcengine`/`dashscope` accept `480p`/`720p`/`1080p` (invalid → `1080p`; Seedance `-fast` variants auto-downgrade `1080p` → `720p` → `480p` when the API rejects a resolution). `pixstag` accepts `720P`/`768P`/`1080P`/`2K`; `480p`/`720p` map to `720P`, `2k` maps to `2K`, anything else to `1080P`.

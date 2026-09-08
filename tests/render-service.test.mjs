@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
-import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateImageGroup, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, streamImageGroup, supportsImageGroups, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateImageGroup, generateStoryScript, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, streamImageGroup, supportsImageGroups, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -135,6 +135,29 @@ test("documentary script generation asks for a climax-first video hook", async (
   assert.match(system, /Sentence 1 must begin inside the story's most vivid, verified climax/);
   assert.match(system, /Keep these two sentences concise and visually arresting/);
   assert.deepEqual(result, { title:"The Fall of a City", script:"The gates break at dawn. What happened next changed the kingdom." });
+});
+
+test("template script generation includes the selected editorial direction", async () => {
+  let request;
+  const fetchImpl = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ title:"Why Bridges Stand", script:"A bridge carries its load through a carefully balanced structure." }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateDocumentaryScript({ endpoint:"https://openai.example.test/chat/completions", model:"test-model", apiKey:"test-key", genre:"engineering-explained", topic:"Why bridges do not fall", duration:3 }, { fetchImpl });
+  assert.match(request.messages[0].content, /SELECTED CONTENT TEMPLATE: Engineering explained/);
+  assert.match(request.messages[0].content, /reveal forces, constraints, and the design solution/);
+});
+
+test("Chinese templates generate Chinese knowledge scripts instead of history stories", async () => {
+  let request;
+  const fetchImpl = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return new Response(JSON.stringify({ choices:[{ message:{ content:JSON.stringify({ title:"大桥为什么不会倒", script:"桥梁把重量分散到结构和地基上。" }) } }] }), { status:200, headers:{ "Content-Type":"application/json" } });
+  };
+  await generateStoryScript({ endpoint:"https://openai.example.test/chat/completions", model:"test-model", apiKey:"test-key", genre:"engineering-explained", topic:"为什么桥不会倒", duration:3 }, { fetchImpl });
+  assert.match(request.messages[0].content, /中文短视频知识类解说编剧/);
+  assert.match(request.messages[0].content, /工程揭秘/);
+  assert.match(request.messages[0].content, /forces, constraints, and the design solution/);
 });
 
 test("local renderer produces a playable vertical MP4", { timeout: 120000 }, async () => {
