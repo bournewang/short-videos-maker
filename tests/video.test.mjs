@@ -18,6 +18,7 @@ test("screen ratios reshape export dimensions and reject unsupported values", ()
   assert.deepEqual(videoResolution("720", "16:9"), { label:"720p", width:1280, height:720 });
   assert.deepEqual(videoResolution("1080", "1:1"), { label:"1080p", width:1080, height:1080 });
   assert.equal(normalizeScreenRatio("4:3"), "9:16");
+  assert.equal(normalizeScreenRatio("2:3"), "2:3");
 });
 
 test("screen ratio changes synchronize existing prompt framing", () => {

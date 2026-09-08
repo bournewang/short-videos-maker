@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { copyFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 const MEDIA_DIRECTORIES = new Set(["audio", "images", "videos", "covers", "exports", "characters"]);
@@ -223,6 +223,21 @@ export class EpisodeStore {
     const relative = path.relative(directory, filename);
     if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Invalid episode file path");
     return filename;
+  }
+
+  async listCharacterAssets(id) {
+    const row = this.row(id);
+    if (!row) return [];
+    const project = JSON.parse(row.project_json);
+    const names = [...new Set((Array.isArray(project.shots) ? project.shots : []).flatMap((shot) => Array.isArray(shot?.characters) ? shot.characters : []).map((name) => String(name || "").trim()).filter(Boolean))];
+    let files = [];
+    try { files = await readdir(path.join(this.episodesRoot, row.slug, "characters")); }
+    catch (error) { if (error?.code === "ENOENT") return []; throw error; }
+    return names.flatMap((name) => {
+      const prefix = `${safeMediaName(name)}-`;
+      const filename = files.find((file) => file.startsWith(prefix) && [".png", ".jpg", ".jpeg", ".webp"].includes(path.extname(file).toLowerCase()));
+      return filename ? [{ name, appearance:"", image:relativeServerPath(id, path.join("characters", filename)) }] : [];
+    });
   }
 
   async persistMedia(value, context, mediaDirectory, name, fallbackExtension = "") {

@@ -171,8 +171,8 @@ async function generateCharacterImages(characters, ctx) {
   const result = [];
   for (const character of characters) {
     try {
-      const image = await generateImage({ prompt: character.appearance, screenRatio: ctx.screenRatio });
-      const cached = await store.withMediaTarget(ctx.episodeId, ctx.title, "characters", character.name, async (target) => persistGeneratedImage(image, { screenRatio: ctx.screenRatio, ...target }));
+      const image = await generateImage({ prompt: character.appearance, screenRatio: "2:3" });
+      const cached = await store.withMediaTarget(ctx.episodeId, ctx.title, "characters", character.name, async (target) => persistGeneratedImage(image, { screenRatio: "2:3", ...target }));
       result.push({ name: character.name, appearance: character.appearance, image: cached.url });
       console.log(`  角色「${character.name}」定妆图 ✓`);
     } catch (error) {

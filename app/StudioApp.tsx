@@ -27,6 +27,7 @@ type Shot = {
   id: string; index: number; start: number; end: number; duration: number;
   type: string; narration: string; chinese: string; prompt: string; videoPrompt: string; status: string;
   locked: boolean; image: string; variants: string[]; provider: string; seed: string; motion: string;
+  subject?: string; characters?: string[];
   imageStatus: string; imageError: string;
   video: string; videoStatus: string; videoError: string; videoProvider: string; videoRecommended: boolean;
 };
@@ -59,6 +60,8 @@ type VideoBuild = {
 type CoverImage = {
   id:string; path:string; url:string; screenRatio:string; prompt:string; provider:string; createdAt:number;
 };
+
+type CharacterAsset = { name:string; appearance:string; image:string };
 
 type CoverTitleLayout = { vertical:number; scale:number; width:number };
 
@@ -153,6 +156,7 @@ export default function StudioApp() {
   const [visualStyle, setVisualStyle] = useState("Photorealistic");
   const [creativeDirection, setCreativeDirection] = useState("");
   const [shots, setShots] = useState<Shot[]>([]);
+  const [characters, setCharacters] = useState<CharacterAsset[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [audioName, setAudioName] = useState("");
   const [audioData, setAudioData] = useState("");
@@ -235,7 +239,7 @@ export default function StudioApp() {
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { id:episodeId, stage, title, script, genre, doubaoSpeaker, doubaoSpeechRate, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, genre, doubaoSpeaker, doubaoSpeechRate, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, characters, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
   async function persistProject(snapshot = projectSnapshot()) {
@@ -270,7 +274,8 @@ export default function StudioApp() {
     setTitle(parsed.title || ""); setScript(parsed.script || "");
     setGenre(genreId(parsed.genre)); setDoubaoSpeaker(String(parsed.doubaoSpeaker || "zh_male_xuanyijieshuo_uranus_bigtts")); setDoubaoSpeechRate(Number.isFinite(Number(parsed.doubaoSpeechRate)) ? Number(parsed.doubaoSpeechRate) : -10);
     setContentFormat(parsed.contentFormat || "Documentary"); setVisualStyle(parsed.visualStyle || "Photorealistic");
-    setCreativeDirection(parsed.creativeDirection || ""); setProductionMode(parsed.productionMode === "long-scenes" ? "long-scenes" : parsed.productionMode === "mixed" ? "mixed" : "short-shots"); setLongClipDuration(Math.max(6, Math.min(12, Math.round(Number(parsed.longClipDuration) || 10)))); setShortClipDuration(Math.max(5, Math.min(20, Math.round(Number(parsed.shortClipDuration) || 15)))); setShots(parsed.shots || []); setSelectedId(parsed.shots?.[0]?.id || "");
+    setCreativeDirection(parsed.creativeDirection || ""); setProductionMode(parsed.productionMode === "long-scenes" ? "long-scenes" : parsed.productionMode === "mixed" ? "mixed" : "short-shots"); setLongClipDuration(Math.max(6, Math.min(12, Math.round(Number(parsed.longClipDuration) || 10)))); setShortClipDuration(Math.max(5, Math.min(20, Math.round(Number(parsed.shortClipDuration) || 15)))); setShots(parsed.shots || []); setCharacters((Array.isArray(parsed.characters) ? parsed.characters : []).map((character:CharacterAsset) => { const image = String(character.image || ""); return { ...character, name:String(character.name || ""), appearance:String(character.appearance || ""), image:image.startsWith("/") ? `${SERVICE}${image}` : image }; }).filter((character:CharacterAsset) => character.name)); setSelectedId(parsed.shots?.[0]?.id || "");
+    if (!parsed.characters?.length) void recoverCharacterAssets(id);
     setAudioName(parsed.audioData ? (parsed.audioName || "") : ""); setAudioData(parsed.audioData || ""); setNarrationAutoplayRequest(0); setAudioDuration(Number(parsed.audioDuration) || 0); setTranscription(parsed.transcription || null);
     const savedBgmVolume = Number(parsed.bgmVolume);
     setBgm(BGM_TRACKS.some((track) => track.path === parsed.bgm) ? parsed.bgm : ""); setBgmVolume(Number.isFinite(savedBgmVolume) ? Math.max(0, Math.min(20, savedBgmVolume)) : 8); setMode(parsed.mode || "Review then batch"); setDenoiseNarration(parsed.denoiseNarration ?? parsed.voicePresetId !== "original");
@@ -293,7 +298,7 @@ export default function StudioApp() {
     const legacyUrl = String(parsed.downloadUrl || parsed.previewUrl || "");
     setVideoBuilds(savedBuilds.length ? savedBuilds.map((build:VideoBuild) => ({ ...build, url:build.url || (build.path.startsWith("/") ? `${SERVICE}${build.path}` : build.path) })) : legacyUrl ? [{ id:"legacy-build", path:"", url:legacyUrl, screenRatio:normalizeScreenRatio(parsed.screenRatio), resolution:String(parsed.downloadResolution || "1080"), ...videoResolution(parsed.downloadResolution, parsed.screenRatio), duration:Number(parsed.audioDuration) || 0, createdAt:Number(parsed.savedAt) || 0 }] : []);
     setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(restoredRatio);
-    setStage(["episode","storyboard","captions","export","cover","livestream","prompter"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
+    setStage(["episode","characters","storyboard","export","cover","livestream","prompter"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
     if (recoveryMessage) setMessage(recoveryMessage);
     if (id !== parsed.id) void writeProjectCache({ ...parsed, id }).catch(() => {});
     return id;
@@ -369,7 +374,7 @@ export default function StudioApp() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => persistProject(), 250);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio]);
+  }, [episodeId, stage, title, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, characters, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio]);
 
   useEffect(() => {
     if (stage !== "livestream" || !episodeId) return;
@@ -424,6 +429,16 @@ export default function StudioApp() {
 
   function touchProject() { allowSave.current = true; }
 
+  async function recoverCharacterAssets(id:string) {
+    try {
+      const response = await fetch(`${SERVICE}/episodes/${encodeURIComponent(id)}/characters`);
+      const data = await response.json();
+      if (!response.ok || episodeIdRef.current !== id || !Array.isArray(data.characters) || !data.characters.length) return;
+      setCharacters(data.characters.map((character:CharacterAsset) => { const image = String(character.image || ""); return { name:String(character.name || ""), appearance:String(character.appearance || ""), image:image.startsWith("/") ? `${SERVICE}${image}` : image }; }).filter((character:CharacterAsset) => character.name && character.image));
+      setMessage("Recovered saved character portrait assets.");
+    } catch { /* Older bridges and episodes without character files remain usable. */ }
+  }
+
   function changeProductionMode(value:string) {
     const next = value === "long-scenes" ? "long-scenes" : value === "mixed" ? "mixed" : "short-shots";
     if (next === productionMode) return;
@@ -462,7 +477,7 @@ export default function StudioApp() {
     cacheEpoch.current += 1;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     const id = createEpisodeId();
-    const blank = { id, stage:"episode", title:"", script:"", genre:"documentary", doubaoSpeaker:"zh_male_xuanyijieshuo_uranus_bigtts", doubaoSpeechRate:-10, contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], coverShotId:"", chosenCoverUrl:"", videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
+    const blank = { id, stage:"episode", title:"", script:"", genre:"documentary", doubaoSpeaker:"zh_male_xuanyijieshuo_uranus_bigtts", doubaoSpeechRate:-10, contentFormat:"Documentary", visualStyle:"Photorealistic", creativeDirection:"", productionMode:"short-shots", longClipDuration:10, shortClipDuration:15, shots:[], characters:[], selectedId:"", audioName:"", audioData:"", audioDuration:0, transcription:null, denoiseNarration:true, bgm:"", bgmVolume:8, subtitleStyle:normalizeSubtitleStyle(), broadcastMode:false, headlineText:"", headlinePosition:4, headlineStyle:DEFAULT_HEADLINE_STYLE, mode:"Review then batch", previewUrl:"", downloadUrl:"", coverHeadline:"", coverTitlePosition:"bottom-left", coverTitleVertical:90, coverTitleScale:100, coverTitleWidth:84, coverPrompt:"", covers:[], coverShotId:"", chosenCoverUrl:"", videoBuilds:[], downloadResolution:"1080", screenRatio:"9:16" };
     applyProjectState(blank, "New empty episode created. Your previous episodes remain in the library.");
     setEpisodesOpen(false);
     if (!saveBlank) { allowSave.current = false; return; }
@@ -540,10 +555,11 @@ export default function StudioApp() {
     touchProject();
     if (!script.trim()) { setMessage("Add the episode script before planning shots."); return; }
     if (audioName && !transcription) { setMessage("Wait for local transcription to finish before planning shots. Its word timestamps are the master timeline."); return; }
+    if (stage === "episode") { setStage("characters"); setMessage("Review character assets before planning the storyboard."); return; }
     if (!provider.textApiKey && !providerStatus.text.configured) { setMessage("Configure a text AI provider before analyzing the script."); setSettingsOpen(true); return; }
     setBusy("AI is planning the episode");
     try {
-      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...textProviderPayload(), genre, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, screenRatio, audioDuration, transcription }) });
+      const response = await fetch(`${SERVICE}/text/plan`, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ ...textProviderPayload(), genre, script, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, screenRatio, audioDuration, transcription, characters }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Planning failed");
       const planned:Shot[] = data.shots.map((shot:Partial<Shot>, index:number) => ({ ...shot, id:`shot-${Date.now()}-${index}`, index, status:"planned", locked:false, image:"", variants:[], imageStatus:"idle", imageError:"", provider:"", seed:"", video:"", videoStatus:"idle", videoError:"", videoProvider:"" })) as Shot[];
       persistProject(projectSnapshot({ shots:planned, selectedId:planned[0]?.id || "", stage:"storyboard", previewUrl:"", downloadUrl:"" }));
@@ -562,6 +578,41 @@ export default function StudioApp() {
       }
     } catch (error) { setMessage(error instanceof Error ? error.message : "Planning failed"); }
     finally { setBusy(""); }
+  }
+
+  async function extractEpisodeCharacters() {
+    touchProject();
+    if (!script.trim()) { setMessage("Add the episode script before identifying characters."); return; }
+    if (!provider.textApiKey && !providerStatus.text.configured) { setMessage("Configure a text AI provider before identifying characters."); setSettingsOpen(true); return; }
+    setBusy("Identifying recurring characters");
+    try {
+      const response = await fetch(`${SERVICE}/text/characters`, { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ ...textProviderPayload(), genre, script }) });
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || "Character extraction failed");
+      const extracted = (Array.isArray(data.characters) ? data.characters : []).map((character:any) => ({ name:String(character.name || "").trim(), appearance:String(character.appearance || "").trim(), image:"" })).filter((character:CharacterAsset) => character.name && character.appearance);
+      setCharacters(extracted); setMessage(extracted.length ? `${extracted.length} recurring characters identified.` : "No recurring characters found in this script.");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Character extraction failed"); }
+    finally { setBusy(""); }
+  }
+
+  async function generateCharacterPortrait(index:number) {
+    const character = characters[index];
+    if (!character || !imageProviderReady()) return;
+    setBusy(`Generating ${character.name} reference`);
+    try {
+      const response = await fetch(`${SERVICE}/image/generate`, { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify({ ...provider, prompt:character.appearance, screenRatio:"2:3", episodeId, episodeTitle:title, assetKind:"characters", assetName:character.name }) });
+      const data = await response.json(); if (!response.ok) throw new Error(data.error || "Character reference generation failed");
+      setCharacters((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, image:data.image } : item));
+      setMessage(`${character.name} reference generated.`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "Character reference generation failed"); }
+    finally { setBusy(""); }
+  }
+
+  function updateCharacter(index:number, patch:Partial<CharacterAsset>) {
+    touchProject(); setCharacters((current) => current.map((character, characterIndex) => characterIndex === index ? { ...character, ...patch } : character));
+  }
+
+  function addCharacter() {
+    touchProject(); setCharacters((current) => [...current, { name:"New character", appearance:"", image:"" }]);
   }
 
   async function generateDocumentaryScript() {
@@ -705,14 +756,6 @@ export default function StudioApp() {
     setBusy("");
   }
 
-  function selectBgm(path: string) {
-    touchProject();
-    setPreviewUrl(""); setDownloadUrl("");
-    setBgm(path);
-    const track = BGM_TRACKS.find((item) => item.path === path);
-    setMessage(path ? `${track?.label || "Background music"} selected.` : "Background music disabled.");
-  }
-
   function changeSubtitleStyle(patch:Partial<SubtitleStyle> | SubtitleStyle) {
     touchProject(); setPreviewUrl(""); setDownloadUrl("");
     setSubtitleStyle((current) => normalizeSubtitleStyle({ ...current, ...patch }));
@@ -727,7 +770,8 @@ export default function StudioApp() {
     updateShot(shot.id, { status:"generating", imageStatus:"generating", imageError:"" });
     try {
       const shotIndex = shots.findIndex((item) => item.id === shot.id);
-      const referenceImages = [shots[shotIndex - 1]?.image, shots[shotIndex + 1]?.image].filter((image): image is string => Boolean(image));
+      const characterReferences = (Array.isArray(shot.characters) ? shot.characters : []).flatMap((name) => characters.find((character) => character.name === name)?.image || []);
+      const referenceImages = [...characterReferences, shots[shotIndex - 1]?.image, shots[shotIndex + 1]?.image].filter((image): image is string => Boolean(image));
       const response = await fetch(`${SERVICE}/image/generate`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...provider, prompt:shot.prompt, referenceImages, screenRatio, episodeId, episodeTitle:title, assetKind:"images", assetName:shot.id }) });
       const data = await response.json(); if (!response.ok) throw new Error(data.error || "Generation failed"); const image = data.image;
       const generatedShot = { ...shot, image, variants:[...shot.variants, image], status:"generated", imageStatus:"generated", imageError:"", provider:provider.model, video:"", videoStatus:"idle", videoError:"", videoProvider:"" };
@@ -1089,7 +1133,7 @@ export default function StudioApp() {
         <div className="brand"><div className="brand-mark">S</div><div><strong>Shortform</strong><span>STUDIO</span></div></div>
         <nav aria-label="Workspace navigation">
           <button type="button" onClick={() => void openEpisodeLibrary()} className={episodesOpen ? "nav-active" : ""} disabled={!!activityLabel} aria-current={episodesOpen ? "page" : undefined}><span>LIB</span>Episodes</button>
-          {[['episode','01','Episode'],['storyboard','02','Storyboard'],['captions','03','Audio & captions'],['export','04','Build & Preview'],['cover','05','Cover'],['livestream','06','Livestream']].map(([id, n, label]) => (
+          {[['episode','01','Episode'],['characters','02','Characters'],['storyboard','03','Storyboard'],['export','04','Build & Preview'],['cover','05','Cover'],['livestream','06','Livestream']].map(([id, n, label]) => (
             <button key={id} onClick={() => goToStage(id)} className={!episodesOpen && stage === id ? "nav-active" : ""}><span>{n}</span>{label}</button>
           ))}
           <button onClick={() => goToStage("prompter")} className={!episodesOpen && stage === "prompter" ? "nav-active" : ""}><span>07</span>Prompter</button>
@@ -1106,8 +1150,8 @@ export default function StudioApp() {
 
         {episodesOpen ? <EpisodeLibrary episodes={episodeHistory} currentId={episodeId} loading={historyLoading} openEpisode={(id:string) => void openSavedEpisode(id)} deleteEpisode={(summary:EpisodeSummary) => void removeSavedEpisode(summary)} newEpisode={() => void newEpisode()} reviewEpisode={(id:string, status:"approved" | "rejected") => void reviewEpisode(id, status)} /> : <>
           {stage === "episode" && <EpisodePanel title={title} setTitle={setTitle} script={script} setScript={setScript} contentFormat={contentFormat} setContentFormat={setContentFormat} visualStyle={visualStyle} setVisualStyle={setVisualStyle} creativeDirection={creativeDirection} setCreativeDirection={setCreativeDirection} productionMode={productionMode} setProductionMode={changeProductionMode} longClipDuration={longClipDuration} setLongClipDuration={setLongClipDuration} shortClipDuration={shortClipDuration} setShortClipDuration={setShortClipDuration} mode={mode} setMode={setMode} touchProject={touchProject} audioName={audioName} transcription={transcription} handleAudio={handleAudio} generateNarration={generateNarration} minimaxVoice={minimaxVoice} setMinimaxVoice={setMinimaxVoice} minimaxModel={minimaxModel} setMinimaxModel={setMinimaxModel} minimaxSpeed={minimaxSpeed} setMinimaxSpeed={setMinimaxSpeed} minimaxVoices={minimaxVoices} minimaxVoiceLang={minimaxVoiceLang} setMinimaxVoiceLang={setMinimaxVoiceLang} minimaxVoiceGender={minimaxVoiceGender} setMinimaxVoiceGender={setMinimaxVoiceGender} genre={genre} setGenre={setGenre} doubaoSpeaker={doubaoSpeaker} setDoubaoSpeaker={setDoubaoSpeaker} doubaoSpeechRate={doubaoSpeechRate} setDoubaoSpeechRate={setDoubaoSpeechRate} analyze={analyze} generateDocumentaryScript={generateDocumentaryScript} scriptDuration={scriptDuration} setScriptDuration={setScriptDuration} busy={busy} />}
+          {stage === "characters" && <CharactersPanel characters={characters} extractCharacters={extractEpisodeCharacters} updateCharacter={updateCharacter} addCharacter={addCharacter} removeCharacter={(index:number) => { touchProject(); setCharacters((current) => current.filter((_, characterIndex) => characterIndex !== index)); }} generatePortrait={generateCharacterPortrait} continueToStoryboard={() => goToStage("storyboard")} busy={busy} />}
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} handleShotImageUpload={handleShotImageUpload} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} previewActive={previewActive} setPreviewActive={setPreviewActive} regenerateOpeningVisual={regenerateOpeningVisual} audioElapsed={audioElapsed} translateAll={translateAll} genre={genre} />}
-          {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} genre={genre} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} transcription={transcription} genre={genre} />}
           {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), vertical:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), scale:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), width:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={(value:string) => { touchProject(); setCoverShotId(value); setChosenCoverUrl(value ? (shots.find((s:Shot) => s.id === value)?.image || "") : ""); }} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={(url:string) => { touchProject(); setChosenCoverUrl(url); }} generateCover={generateCover} downloadCover={downloadCover} saveCover={saveCover} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} busy={busy} coverPreviewRef={coverPreviewRef} />}
 {stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} chosenCoverUrl={chosenCoverUrl} transcription={transcription} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
@@ -1414,18 +1458,6 @@ function GenerationTaskManager({ productionMode, shot, generateOne, generateOneV
   </section>;
 }
 
-function Captions({ script, shots, updateShot, translateAll, audioName, audioData, transcription, denoiseNarration, setDenoiseNarration, bgm, selectBgm, bgmVolume, setBgmVolume, genre }: any) {
-  const isStory = getGenre(genre).id === "story";
-  const bgmPreviewRef = useRef<HTMLAudioElement | null>(null);
-  useEffect(() => {
-    if (bgmPreviewRef.current) bgmPreviewRef.current.volume = Math.max(0, Math.min(.2, bgmVolume / 100));
-  }, [bgm, bgmVolume]);
-  return <div className="panel"><div className="section-head"><div><span className="eyebrow">SOUND & LANGUAGE</span><h1>Audio and captions</h1><p>{isStory ? "编辑中文解说字幕，字幕外观在分镜页控制。" : "Edit English and Chinese lines while subtitle appearance is controlled from Storyboard."}</p></div>{!isStory && <button className="primary" onClick={translateAll}>Translate all lines</button>}</div>
-    <div className="audio-grid"><div className="audio-card"><h3>Narration</h3><div className="narration-source"><b>{audioName || "No spoken audio attached"}</b><span>{script.trim() ? `${script.trim().split(/\s+/).length} script words reused from Episode` : "Add the narration script in Episode"}</span>{transcription && <small>Local timing ready · {transcription.segments.length} segments</small>}{audioData && <audio controls preload="metadata" src={audioData}/>}</div>
-      <label className="denoise-option"><input type="checkbox" checked={denoiseNarration} onChange={(event) => setDenoiseNarration(event.target.checked)}/><span><b>De-noise narration</b><small>Apply light local background-noise reduction during export.</small></span></label><h3>Background music</h3><p className="helper-copy">Choose a built-in track. It will be looped and trimmed beneath narration.</p><div className="bgm-options">{BGM_TRACKS.map((track) => <button type="button" key={track.id} className={bgm === track.path ? "chosen" : ""} onClick={() => selectBgm(track.path)}><b>{track.label}</b><span>{track.artist}</span></button>)}</div>{bgm && <><label className="bgm-volume"><span><b>Music volume</b><output>{bgmVolume}%</output></span><input type="range" min="0" max="20" step="1" value={bgmVolume} onChange={(event) => setBgmVolume(Number(event.target.value))}/></label><audio className="bgm-preview" controls preload="metadata" src={bgm} ref={bgmPreviewRef} onVolumeChange={(event) => { const ceiling = Math.max(0, Math.min(.2, bgmVolume / 100)); if (event.currentTarget.volume > ceiling) event.currentTarget.volume = ceiling; }}/></>}</div>
-      <div className="caption-list">{shots.length ? shots.map((shot: Shot) => <div className="caption-row" key={shot.id}><span>{formatTime(shot.start)}</span><div><textarea value={shot.narration} aria-label={isStory ? `中文解说 ${shot.index + 1}` : `English caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{narration:e.target.value})}/>{!isStory && <textarea className="chinese" value={shot.chinese} aria-label={`Chinese caption ${shot.index + 1}`} onChange={(e)=>updateShot(shot.id,{chinese:e.target.value})}/>}</div><i>{shot.duration.toFixed(1)}s</i></div>) : <div className="empty-state small"><h2>{isStory ? "暂无字幕" : "No captions yet"}</h2><p>{isStory ? "AI 分镜后会自动生成中文解说字幕。" : "AI-generated bilingual lines appear after script analysis."}</p></div>}</div></div></div>;
-}
-
 function ExportPanel({ title, productionMode, shots, approved, duration, audioName, bgm, build, buildSample, subtitleStyle, broadcastMode, headlineText, headlinePosition, previewUrl, downloadUrl, videoBuilds, deleteBuild, downloadResolution, setDownloadResolution, screenRatio, busy, buildProgress, transcription, genre }: any) {
   const isStory = getGenre(genre).id === "story";
   const longScenes = productionMode === "long-scenes";
@@ -1459,6 +1491,16 @@ function CoverPanel({ title, coverHeadline, setCoverHeadline, coverTitlePosition
   return <div className={`panel cover-panel ratio-${screenRatio.replace(':','-')}`}><div className="section-head"><div><span className="eyebrow">PUBLISHING ASSETS</span><h1>Cover artwork</h1><p>Generate a striking cover image for your episode, or pick a storyboard frame as the background. Add your headline and position it to avoid the main subject.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={setCoverTitleVertical} coverTitleScale={coverTitleScale} setTitleScale={setCoverTitleScale} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={setCoverTitleWidth} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={setCoverShotId} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={setChosenCoverUrl} generateCover={generateCover} downloadCover={downloadCover} saveCover={saveCover} screenRatio={screenRatio} busy={busy} coverPreviewRef={coverPreviewRef}/></div>;
 }
 
+function CharactersPanel({ characters, extractCharacters, updateCharacter, addCharacter, removeCharacter, generatePortrait, continueToStoryboard, busy }: any) {
+  return <div className="panel characters-panel"><div className="section-head"><div><span className="eyebrow">VISUAL CONTINUITY</span><h1>Character assets</h1><p>Confirm recurring characters and generate reference portraits before planning the storyboard. Portraits anchor their appearance during image generation.</p></div><button type="button" className="primary" onClick={extractCharacters} disabled={!!busy}>{busy === "Identifying recurring characters" ? "Identifying..." : "Identify characters"}</button></div>
+    {!characters.length ? <div className="characters-empty"><b>No character assets yet</b><span>Identify the recurring people in the script, then refine their portrait descriptions before generating references.</span></div> : <div className="characters-grid">{characters.map((character:CharacterAsset, index:number) => <article className="character-card" key={`${character.name}-${index}`}>
+      <div className="character-portrait">{character.image ? <img src={character.image} alt={`${character.name} reference portrait`}/> : <span>{character.name.slice(0, 1).toUpperCase()}</span>}</div>
+      <div className="character-card-body"><label className="field"><span>Name</span><input value={character.name} onChange={(event) => updateCharacter(index, { name:event.target.value })}/></label><label className="field"><span>Portrait direction</span><textarea rows={4} value={character.appearance} onChange={(event) => updateCharacter(index, { appearance:event.target.value })}/></label><div className="character-actions"><button type="button" className="primary" onClick={() => generatePortrait(index)} disabled={!!busy || !character.name.trim() || !character.appearance.trim()}>{busy === `Generating ${character.name} reference` ? "Generating..." : character.image ? "Regenerate" : "Generate portrait"}</button><button type="button" className="ghost" onClick={() => removeCharacter(index)} disabled={!!busy}>Remove</button></div></div>
+    </article>)}</div>}
+    <div className="characters-footer"><button type="button" className="ghost" onClick={addCharacter}>Add character</button><button type="button" className="primary large" onClick={continueToStoryboard}>Continue to storyboard</button></div>
+  </div>;
+}
+
 function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, chosenCoverUrl, setChosenCoverUrl, generateCover, downloadCover, saveCover, screenRatio, busy, coverPreviewRef }:any) {
   const generatedCover = covers.find((cover:CoverImage) => cover.screenRatio === screenRatio);
   const shotBackgrounds = (shots || []).filter((shot:Shot) => shot.image);
@@ -1490,6 +1532,13 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 <b>Generate the artwork first</b>
 <small>{shotBackgrounds.length ? "Or pick a storyboard frame below as the background." : "Then place the title while seeing the real image."}</small>
 </div>}</div>
+{shotBackgrounds.length > 0 && <div className="cover-shots">
+<h3>Storyboard frames</h3>
+<p>Use a generated storyboard frame as the cover background{generatedCover ? " instead of the generated artwork" : ""}. Click the selected frame again to switch back.</p>
+<div>{shotBackgrounds.map((shot:Shot, index:number) => <button type="button" key={shot.id} className={coverShotId === shot.id ? "chosen" : ""} style={{ aspectRatio:screenRatio.replace(":"," / ") }} title={`Shot ${index + 1}`} aria-pressed={coverShotId === shot.id} onClick={() => { const id = coverShotId === shot.id ? "" : shot.id; setCoverShotId(id); setChosenCoverUrl(id ? shot.image : ""); }}>
+<img src={shot.image} alt={`Storyboard shot ${index + 1}`}/>
+</button>)}</div>
+</div>}
 <div className="cover-controls">
 <p>{currentCover ? "Now choose a headline and position that avoids the subject. Your choice is baked into the downloaded PNG." : "Create the clean artwork first. Title editing and placement controls will appear after the image is ready."}</p>
 <label className="field">
@@ -1537,13 +1586,7 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 <button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button>
 <button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <><button type="button" className="primary" onClick={() => void saveCover(currentCover)} disabled={!!busy}>{busy === "Saving cover artwork" ? "Saving…" : "Save cover"}</button><button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button></>}</div>
 </div>
-</div>{shotBackgrounds.length > 0 && <div className="cover-shots">
-<h3>Storyboard frames</h3>
-<p>Use a generated storyboard frame as the cover background{generatedCover ? " instead of the generated artwork" : ""}. Click the selected frame again to switch back.</p>
-<div>{shotBackgrounds.map((shot:Shot, index:number) => <button type="button" key={shot.id} className={coverShotId === shot.id ? "chosen" : ""} style={{ aspectRatio:screenRatio.replace(":"," / ") }} title={`Shot ${index + 1}`} aria-pressed={coverShotId === shot.id} onClick={() => { const id = coverShotId === shot.id ? "" : shot.id; setCoverShotId(id); setChosenCoverUrl(id ? shot.image : ""); }}>
-<img src={shot.image} alt={`Storyboard shot ${index + 1}`}/>
-</button>)}</div>
-</div>}{covers.length > 0 && <div className="cover-history">
+</div>{covers.length > 0 && <div className="cover-history">
 <h3>Saved covers</h3>
 <div>{covers.map((cover:CoverImage) => <article key={cover.id}>
 <div className={`cover-history-image title-${coverTitlePosition}`} style={{ aspectRatio:cover.screenRatio.replace(":"," / ") }}>

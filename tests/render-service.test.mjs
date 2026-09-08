@@ -96,9 +96,17 @@ test("subtitle ASS uses the editable episode style", () => {
   });
   assert.match(ass, /Style: Main,Georgia,81,&H00332211,&H000000FF,&H00563412,&HFF000000,0,0,0,0,100,100,0,0,1,3\.5,0,1,70,70,480,1/);
   assert.match(ass, /Style: Box,Arial,1,&H33563412,&H33563412,&H33563412,&H33563412/);
-  assert.match(ass, /Dialogue: 0,0:00:00\.00,0:00:01\.25,Box,,0,0,0,,\{\\an7\\pos\(70,1185\)\\p1\}m 0 0 l 940 0 l 940 300 l 0 300\{\\p0\}/);
+  assert.match(ass, /Dialogue: 0,0:00:00\.00,0:00:01\.25,Box,,0,0,0,,\{\\an7\\pos\(70,1202\)\\p1\}m 0 0 l 940 0 l 940 266 l 0 266\{\\p0\}/);
   assert.match(ass, /English （line）\\N\{\\c&HEFCDAB&\}中文/);
   assert.doesNotMatch(buildSubtitleAss([{ start:0, end:1, narration:"No box" }], 1080, 1920, { backgroundOpacity:0 }), /,Box,,/);
+});
+
+test("landscape subtitle sizing increases 260 percent text to 180 pixels", () => {
+  const ass = buildSubtitleAss([{ start:0, end:1, narration:"Landscape caption" }], 1920, 1080, {
+    fontScale:260, position:5,
+  });
+  assert.match(ass, /Style: Main,Arial,180,/);
+  assert.match(ass, /,125,125,54,1\n/);
 });
 
 test("subtitle ASS cues follow transcription word timestamps, not planned shot times", () => {

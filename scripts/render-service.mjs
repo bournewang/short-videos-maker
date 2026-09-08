@@ -756,7 +756,7 @@ export async function persistGeneratedImage(value, options = {}) {
     const ratio = normalizeScreenRatio(options.screenRatio);
     // Keep the provider's native 4K resolution so exports always downscale
     // from real detail instead of upscaling a shrunken cache.
-    const dimensions = ratio === "16:9" ? { width:3840, height:2160 } : ratio === "1:1" ? { width:4096, height:4096 } : { width:2160, height:3840 };
+    const dimensions = ratio === "16:9" ? { width:3840, height:2160 } : ratio === "1:1" ? { width:4096, height:4096 } : ratio === "2:3" ? { width:2730, height:4096 } : { width:2160, height:3840 };
     const output = path.join(directory, `${id}-${ratio.replace(":", "x")}.png`);
     const filter = `scale=${dimensions.width}:${dimensions.height}:force_original_aspect_ratio=increase,crop=${dimensions.width}:${dimensions.height},setsar=1`;
     try {
@@ -1077,7 +1077,8 @@ function assText(value) { return String(value || "").replace(/\\/g, "\\\\").repl
 
 export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode = false, headlineText = "", headlinePosition = 4, transcription = null) {
   const style = normalizeSubtitleStyle(value);
-  const fontSize = Math.max(10, Math.round(height * .028 * style.fontScale / 100));
+  const fontSizeBase = width > height ? width * .036 : height * .028;
+  const fontSize = Math.max(10, Math.round(fontSizeBase * style.fontScale / 100));
   const marginV = Math.round(height * style.position / 100); const marginH = Math.round(width * .065);
   const alignment = { left:1, center:2, right:3 }[style.alignment];
   const primary = subtitleAssColor(style.englishColor); const chinese = subtitleAssOverrideColor(style.chineseColor);
@@ -1326,7 +1327,7 @@ export async function generateImage(data, options = {}) {
   const fetchImpl = options.fetchImpl || fetch;
   const screenRatio = normalizeScreenRatio(data.screenRatio);
   const prompt = promptForScreenRatio(data.prompt, screenRatio);
-  const sdSize = screenRatio === "16:9" ? { width:1344, height:768 } : screenRatio === "1:1" ? { width:1024, height:1024 } : { width:768, height:1344 };
+  const sdSize = screenRatio === "16:9" ? { width:1344, height:768 } : screenRatio === "1:1" ? { width:1024, height:1024 } : screenRatio === "2:3" ? { width:832, height:1248 } : { width:768, height:1344 };
   if (data.kind === "sdwebui") {
     const endpoint = data.endpoint.includes("txt2img") ? data.endpoint : `${data.endpoint.replace(/\/$/,"")}/sdapi/v1/txt2img`;
     const response = await fetchImpl(endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ prompt, negative_prompt:"text, watermark, logo, low quality, distorted anatomy, duplicate subjects", ...sdSize, steps:28 }) });
@@ -1338,7 +1339,7 @@ export async function generateImage(data, options = {}) {
   if (data.kind === "dashscope") {
     // Qwen-Image 3.0 (sync multimodal-generation API); free pixel budget is
     // 512*512 to 2048*2048, so 16:9 / 9:16 / 1:1 map to 2048-wide frames.
-    const dashscopeSize = screenRatio === "16:9" ? "2048*1152" : screenRatio === "1:1" ? "2048*2048" : "1152*2048";
+    const dashscopeSize = screenRatio === "16:9" ? "2048*1152" : screenRatio === "1:1" ? "2048*2048" : screenRatio === "2:3" ? "1365*2048" : "1152*2048";
     const response = await fetchImpl(dashscopeImageGenerationEndpoint(data.endpoint), { method:"POST", headers:{"Content-Type":"application/json", Authorization:`Bearer ${data.apiKey}`}, body:JSON.stringify({
       model:data.model,
       input:{ messages:[{ role:"user", content:[{ text:prompt }] }] },
@@ -2123,6 +2124,10 @@ export function createRenderServer() {
         const result = await episodeStore.setReviewStatus(decodeURIComponent(episodeReviewMatch[1]), String(payload.status || "pending"));
         json(res, 200, result); return;
       }
+      const episodeCharactersMatch = /^\/episodes\/([^/]+)\/characters$/.exec(url.pathname);
+      if (req.method === "GET" && episodeCharactersMatch) {
+        json(res, 200, { characters:await episodeStore.listCharacterAssets(decodeURIComponent(episodeCharactersMatch[1])) }); return;
+      }
       const episodeMatch = /^\/episodes\/([^/]+)$/.exec(url.pathname);
       if (req.method === "GET" && episodeMatch) {
         const episode = episodeStore.getEpisode(decodeURIComponent(episodeMatch[1]));
@@ -2185,10 +2190,15 @@ export function createRenderServer() {
       if (req.method === "POST" && url.pathname === "/image/generate") {
         const payload = await body(req, 16*1024*1024);
         const generated = await generateImage(payload);
+        const assetDirectory = payload.assetKind === "covers" ? "covers" : payload.assetKind === "characters" ? "characters" : "images";
         const cached = payload.episodeId
-          ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, payload.assetKind === "covers" ? "covers" : "images", payload.assetName || randomUUID(), async (target) => await persistGeneratedImage(generated, { screenRatio:payload.screenRatio, ...target }))
+          ? await episodeStore.withMediaTarget(payload.episodeId, payload.episodeTitle, assetDirectory, payload.assetName || randomUUID(), async (target) => await persistGeneratedImage(generated, { screenRatio:payload.screenRatio, ...target }))
           : await persistGeneratedImage(generated, { screenRatio:payload.screenRatio });
         json(res, 200, { image:cached.url, path:cached.path }); return;
+      }
+      if (req.method === "POST" && url.pathname === "/text/characters") {
+        const payload = await body(req);
+        json(res, 200, { characters:await extractCharacters(payload) }); return;
       }
       if (req.method === "POST" && url.pathname === "/covers/bake") { json(res, 200, await bakeEpisodeCover(await body(req, 16*1024*1024))); return; }
       if (req.method === "POST" && url.pathname === "/image/generate-group") {

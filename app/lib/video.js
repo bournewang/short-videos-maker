@@ -11,7 +11,8 @@ export const SCREEN_RATIOS = {
 };
 
 export function normalizeScreenRatio(value) {
-  return Object.hasOwn(SCREEN_RATIOS, String(value)) ? String(value) : "9:16";
+  const ratio = String(value);
+  return Object.hasOwn(SCREEN_RATIOS, ratio) || ratio === "2:3" ? ratio : "9:16";
 }
 
 export function promptForScreenRatio(value, screenRatio = "9:16") {

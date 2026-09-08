@@ -10,7 +10,7 @@
 //
 // --video-shots：none(默认，纯静态图) | first(仅第一个 shot) | all(全部) | 0,2,3(指定下标)
 
-import { readdir, readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { EpisodeStore } from "./episode-store.mjs";
@@ -81,14 +81,28 @@ export function hasMatchingBuild(project, resolution) {
   );
 }
 
-export async function hasExportArtifact(episode, storageRoot = workRoot) {
+export async function hasExportArtifact(episode, project, resolution, storageRoot = workRoot) {
   const slug = String(episode?.slug || "").trim();
   if (!slug) return false;
+  const build = (Array.isArray(project?.videoBuilds) ? project.videoBuilds : []).find((item) =>
+    normalizeScreenRatio(item?.screenRatio) === normalizeScreenRatio(project?.screenRatio) && String(item?.resolution || "") === String(resolution)
+  );
+  if (!build) return false;
+  let pathname = String(build.path || build.url || "");
   try {
-    const files = await readdir(path.join(storageRoot, "episodes", slug, "exports"));
-    return files.some((filename) => path.extname(filename).toLowerCase() === ".mp4");
+    pathname = new URL(pathname, "http://127.0.0.1").pathname;
   } catch {
-    return false;
+    // A filesystem path can still be a valid artifact reference.
+  }
+  const prefix = `/episodes/${encodeURIComponent(episode.id)}/files/exports/`;
+  const filename = pathname.startsWith(prefix)
+    ? path.join(storageRoot, "episodes", slug, "exports", ...pathname.slice(prefix.length).split("/").map(decodeURIComponent))
+    : pathname;
+  try {
+    return (await stat(filename)).isFile();
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -229,7 +243,7 @@ async function main() {
     const pending = [];
     for (const episode of targets) {
       const project = store.getEpisode(episode.id);
-      if (hasMatchingBuild(project, opts.resolution) || await hasExportArtifact(episode)) skipped.push(episode);
+      if (hasMatchingBuild(project, opts.resolution) && await hasExportArtifact(episode, project, opts.resolution)) skipped.push(episode);
       else pending.push(episode);
     }
     targets = pending;
