@@ -60,6 +60,34 @@ type CoverImage = {
   id:string; path:string; url:string; screenRatio:string; prompt:string; provider:string; createdAt:number;
 };
 
+type CoverTitleLayout = { vertical:number; scale:number; width:number };
+
+const COVER_TITLE_LAYOUT_DEFAULTS:Record<string, CoverTitleLayout> = {
+  "9:16": { vertical:70, scale:110, width:73 },
+  "16:9": { vertical:70, scale:65, width:73 },
+  "1:1": { vertical:70, scale:100, width:73 },
+};
+const COVER_TITLE_LAYOUTS_STORAGE_KEY = "shortform-studio-cover-title-layouts-v1";
+
+function coverTitleLayout(value:any, ratio:string):CoverTitleLayout {
+  const fallback = COVER_TITLE_LAYOUT_DEFAULTS[normalizeScreenRatio(ratio)];
+  return {
+    vertical:Math.max(2, Math.min(92, Math.round(Number(value?.vertical) || fallback.vertical))),
+    scale:Math.max(50, Math.min(200, Math.round(Number(value?.scale) || fallback.scale))),
+    width:Math.max(50, Math.min(95, Math.round(Number(value?.width) || fallback.width))),
+  };
+}
+
+function readCoverTitleLayouts():Record<string, CoverTitleLayout> {
+  if (typeof window === "undefined") return Object.fromEntries(Object.keys(COVER_TITLE_LAYOUT_DEFAULTS).map((ratio) => [ratio, { ...COVER_TITLE_LAYOUT_DEFAULTS[ratio] }]));
+  try {
+    const saved = JSON.parse(localStorage.getItem(COVER_TITLE_LAYOUTS_STORAGE_KEY) || "{}");
+    return Object.fromEntries(Object.keys(COVER_TITLE_LAYOUT_DEFAULTS).map((ratio) => [ratio, coverTitleLayout(saved[ratio], ratio)]));
+  } catch {
+    return Object.fromEntries(Object.keys(COVER_TITLE_LAYOUT_DEFAULTS).map((ratio) => [ratio, { ...COVER_TITLE_LAYOUT_DEFAULTS[ratio] }]));
+  }
+}
+
 type ProviderStatus = {
   image: { configured: boolean; kind: "openai" | "volcengine" | "dashscope" | "sdwebui"; endpoint: string; model: string; source: string };
   video: { configured: boolean; kind: "volcengine" | "dashscope" | "pixstag"; endpoint: string; model: string; source: string };
@@ -169,9 +197,10 @@ export default function StudioApp() {
   const [previewActive, setPreviewActive] = useState(false);
   const [coverHeadline, setCoverHeadline] = useState("");
   const [coverTitlePosition, setCoverTitlePosition] = useState("bottom-left");
-  const [coverTitleVertical, setCoverTitleVertical] = useState(90);
-  const [coverTitleScale, setCoverTitleScale] = useState(100);
-  const [coverTitleWidth, setCoverTitleWidth] = useState(84);
+  const [coverTitleLayouts, setCoverTitleLayouts] = useState<Record<string, CoverTitleLayout>>(readCoverTitleLayouts);
+  const [coverTitleVertical, setCoverTitleVertical] = useState(COVER_TITLE_LAYOUT_DEFAULTS["9:16"].vertical);
+  const [coverTitleScale, setCoverTitleScale] = useState(COVER_TITLE_LAYOUT_DEFAULTS["9:16"].scale);
+  const [coverTitleWidth, setCoverTitleWidth] = useState(COVER_TITLE_LAYOUT_DEFAULTS["9:16"].width);
   const [coverPrompt, setCoverPrompt] = useState("");
   const [covers, setCovers] = useState<CoverImage[]>([]);
   const coverPreviewRef = useRef<HTMLDivElement | null>(null);
@@ -206,7 +235,7 @@ export default function StudioApp() {
   const [activeManualImageCount, setActiveManualImageCount] = useState(0);
 
   function projectSnapshot(overrides:Record<string, unknown> = {}) {
-    return { id:episodeId, stage, title, script, genre, doubaoSpeaker, doubaoSpeechRate, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverTitleVertical, coverTitleScale, coverTitleWidth, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio, ...overrides };
+    return { id:episodeId, stage, title, script, genre, doubaoSpeaker, doubaoSpeechRate, contentFormat, visualStyle, creativeDirection, productionMode, longClipDuration, shortClipDuration, shots, selectedId, audioName, audioData, audioDuration, transcription, denoiseNarration, bgm, bgmVolume, subtitleStyle, broadcastMode, headlineText, headlinePosition, headlineStyle, mode, previewUrl, downloadUrl, coverHeadline, coverTitlePosition, coverPrompt, covers, coverShotId, chosenCoverUrl, videoBuilds, downloadResolution, screenRatio, ...overrides };
   }
 
   async function persistProject(snapshot = projectSnapshot()) {
@@ -251,7 +280,10 @@ export default function StudioApp() {
     setHeadlinePosition(Math.max(0, Math.min(100, Math.round(Number(parsed.headlinePosition) || 4))));
     setHeadlineStyle(normalizeHeadlineStyle(parsed.headlineStyle));
     setCoverHeadline(String(parsed.coverHeadline || ""));
-    setCoverTitlePosition(normalizeCoverTitlePosition(parsed.coverTitlePosition)); setCoverTitleVertical(Math.max(2, Math.min(92, Math.round(Number(parsed.coverTitleVertical) || 90)))); setCoverTitleScale(Math.max(50, Math.min(200, Math.round(Number(parsed.coverTitleScale) || 100)))); setCoverTitleWidth(Math.max(50, Math.min(95, Math.round(Number(parsed.coverTitleWidth) || 84))));
+    setCoverTitlePosition(normalizeCoverTitlePosition(parsed.coverTitlePosition));
+    const restoredRatio = normalizeScreenRatio(parsed.screenRatio);
+    const restoredLayout = coverTitleLayouts[restoredRatio] || COVER_TITLE_LAYOUT_DEFAULTS[restoredRatio];
+    setCoverTitleVertical(restoredLayout.vertical); setCoverTitleScale(restoredLayout.scale); setCoverTitleWidth(restoredLayout.width);
     setCoverPrompt(String(parsed.coverPrompt || ""));
     setCovers((Array.isArray(parsed.covers) ? parsed.covers : []).map((cover:CoverImage) => ({ ...cover, url:cover.url || (cover.path.startsWith("/") ? `${SERVICE}${cover.path}` : cover.path) })));
     const restoredCoverShotId = String(parsed.coverShotId || "");
@@ -260,7 +292,7 @@ export default function StudioApp() {
     const savedBuilds = Array.isArray(parsed.videoBuilds) ? parsed.videoBuilds : [];
     const legacyUrl = String(parsed.downloadUrl || parsed.previewUrl || "");
     setVideoBuilds(savedBuilds.length ? savedBuilds.map((build:VideoBuild) => ({ ...build, url:build.url || (build.path.startsWith("/") ? `${SERVICE}${build.path}` : build.path) })) : legacyUrl ? [{ id:"legacy-build", path:"", url:legacyUrl, screenRatio:normalizeScreenRatio(parsed.screenRatio), resolution:String(parsed.downloadResolution || "1080"), ...videoResolution(parsed.downloadResolution, parsed.screenRatio), duration:Number(parsed.audioDuration) || 0, createdAt:Number(parsed.savedAt) || 0 }] : []);
-    setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(normalizeScreenRatio(parsed.screenRatio));
+    setPreviewUrl(parsed.previewUrl || ""); setDownloadUrl(parsed.downloadUrl || ""); setDownloadResolution(String(parsed.downloadResolution || "1080")); setScreenRatio(restoredRatio);
     setStage(["episode","storyboard","captions","export","cover","livestream","prompter"].includes(parsed.stage) ? parsed.stage : (parsed.shots?.length ? "storyboard" : "episode"));
     if (recoveryMessage) setMessage(recoveryMessage);
     if (id !== parsed.id) void writeProjectCache({ ...parsed, id }).catch(() => {});
@@ -1037,7 +1069,8 @@ export default function StudioApp() {
   function changeScreenRatio(value:string) {
     const next = normalizeScreenRatio(value);
     if (next === screenRatio) return;
-    touchProject(); setScreenRatio(next); setPreviewUrl(""); setDownloadUrl("");
+    const nextLayout = coverTitleLayouts[next] || COVER_TITLE_LAYOUT_DEFAULTS[next];
+    touchProject(); setScreenRatio(next); setCoverTitleVertical(nextLayout.vertical); setCoverTitleScale(nextLayout.scale); setCoverTitleWidth(nextLayout.width); setPreviewUrl(""); setDownloadUrl("");
     setShots((current) => current.map((shot) => ({ ...shot, prompt:promptForScreenRatio(shot.prompt, next), videoPrompt:promptForScreenRatio(shot.videoPrompt, next) })));
     setMessage(`Screen ratio changed to ${next} and shot prompts were updated. Existing assets are preserved; regenerate them to apply the new framing.`);
   }
@@ -1076,7 +1109,7 @@ export default function StudioApp() {
           {stage === "storyboard" && <Storyboard productionMode={productionMode} script={script} transcription={transcription} shots={shots} selected={selected} setSelectedId={setSelectedId} updateShot={updateShot} generateOne={generateOne} generateAll={generateAll} generateOneVideo={generateOneVideo} generateAllVideos={generateAllVideos} handleShotImageUpload={handleShotImageUpload} totalDuration={totalDuration} busy={busy} activeManualImageCount={activeManualImageCount} activeManualVideoCount={activeManualVideoCount} imageConcurrency={provider.imageConcurrency} videoConcurrency={provider.videoConcurrency} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} previewActive={previewActive} setPreviewActive={setPreviewActive} regenerateOpeningVisual={regenerateOpeningVisual} audioElapsed={audioElapsed} translateAll={translateAll} genre={genre} />}
           {stage === "captions" && <Captions script={script} shots={shots} updateShot={updateShot} translateAll={translateAll} audioName={audioName} audioData={audioData} transcription={transcription} denoiseNarration={denoiseNarration} setDenoiseNarration={(checked:boolean)=>{ touchProject(); setDenoiseNarration(checked); setPreviewUrl(""); setDownloadUrl(""); }} bgm={bgm} selectBgm={selectBgm} bgmVolume={bgmVolume} setBgmVolume={(value:number)=>{ touchProject(); setBgmVolume(value); setPreviewUrl(""); setDownloadUrl(""); }} genre={genre} />}
           {stage === "export" && <ExportPanel title={title} productionMode={productionMode} shots={shots} approved={approved} duration={totalDuration} audioName={audioName} bgm={BGM_TRACKS.find((track) => track.path === bgm)?.label || "None"} build={() => renderVideo(downloadResolution)} buildSample={() => renderSampleVideo(downloadResolution)} subtitleStyle={subtitleStyle} broadcastMode={broadcastMode} headlineText={headlineText} headlinePosition={headlinePosition} previewUrl={previewUrl} downloadUrl={downloadUrl} videoBuilds={videoBuilds} deleteBuild={deleteBuild} downloadResolution={downloadResolution} setDownloadResolution={(value:string) => { touchProject(); setDownloadResolution(value); setPreviewUrl(""); setDownloadUrl(""); }} screenRatio={screenRatio} busy={busy} buildProgress={buildProgress} transcription={transcription} genre={genre} />}
-          {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { touchProject(); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { touchProject(); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { touchProject(); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={(value:string) => { touchProject(); setCoverShotId(value); setChosenCoverUrl(value ? (shots.find((s:Shot) => s.id === value)?.image || "") : ""); }} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={(url:string) => { touchProject(); setChosenCoverUrl(url); }} generateCover={generateCover} downloadCover={downloadCover} saveCover={saveCover} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} busy={busy} coverPreviewRef={coverPreviewRef} />}
+          {stage === "cover" && <CoverPanel title={title} coverHeadline={coverHeadline} setCoverHeadline={(value:string) => { touchProject(); setCoverHeadline(value); }} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={(value:string) => { touchProject(); setCoverTitlePosition(normalizeCoverTitlePosition(value)); }} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), vertical:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleVertical(value); }} coverTitleScale={coverTitleScale} setCoverTitleScale={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), scale:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleScale(value); }} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={(value:number) => { const layout = { ...coverTitleLayouts, [screenRatio]:{ ...(coverTitleLayouts[screenRatio] || COVER_TITLE_LAYOUT_DEFAULTS[screenRatio]), width:value } }; localStorage.setItem(COVER_TITLE_LAYOUTS_STORAGE_KEY, JSON.stringify(layout)); setCoverTitleLayouts(layout); setCoverTitleWidth(value); }} coverPrompt={coverPrompt} setCoverPrompt={(value:string) => { touchProject(); setCoverPrompt(value); }} suggestedCoverPrompt={coverPromptSuggestion(title, script, contentFormat, visualStyle, creativeDirection)} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={(value:string) => { touchProject(); setCoverShotId(value); setChosenCoverUrl(value ? (shots.find((s:Shot) => s.id === value)?.image || "") : ""); }} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={(url:string) => { touchProject(); setChosenCoverUrl(url); }} generateCover={generateCover} downloadCover={downloadCover} saveCover={saveCover} screenRatio={screenRatio} setScreenRatio={changeScreenRatio} busy={busy} coverPreviewRef={coverPreviewRef} />}
 {stage === "livestream" && <LivestreamPage shots={shots} audioData={audioData} covers={covers} chosenCoverUrl={chosenCoverUrl} transcription={transcription} subtitleStyle={subtitleStyle} setSubtitleStyle={changeSubtitleStyle} broadcastMode={broadcastMode} setBroadcastMode={setBroadcastMode} headlineText={headlineText} setHeadlineText={setHeadlineText} headlinePosition={headlinePosition} setHeadlinePosition={setHeadlinePosition} headlineStyle={headlineStyle} setHeadlineStyle={setHeadlineStyle} preBroadcastStyle={preBroadcastStyle} setPreBroadcastStyle={setPreBroadcastStyle} episodeHistory={episodeHistory} loadEpisodeData={loadEpisodeDataForLivestream} currentEpisodeId={episodeId} />}
 {stage === "prompter" && <PrompterPanel currentEpisodeId={episodeId} />}
         </>}
