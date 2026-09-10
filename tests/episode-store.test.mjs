@@ -64,6 +64,25 @@ test("episodes stay ordered by creation time even after older episodes are re-sa
   assert.deepEqual(store.listEpisodes().map((episode) => episode.id), ["episode-second", "episode-first"]);
 });
 
+test("stale saves retain existing video builds while their export artifact exists", async (t) => {
+  const storageRoot = await mkdtemp(path.join(tmpdir(), "shortform-episode-builds-"));
+  const store = new EpisodeStore({ storageRoot, publicBaseUrl:"http://127.0.0.1:4317" });
+  t.after(() => store.close());
+  const initial = await store.saveEpisode({ id:"episode-build", title:"Build", shots:[], videoBuilds:[] });
+  const buildPath = path.join(storageRoot, "episodes", initial.summary.slug, "exports", "build-one.mp4");
+  await import("node:fs/promises").then(({ writeFile }) => writeFile(buildPath, "video"));
+  const build = {
+    id:"build-one",
+    path:"/episodes/episode-build/files/exports/build-one.mp4",
+    url:"http://127.0.0.1:4317/episodes/episode-build/files/exports/build-one.mp4",
+    screenRatio:"16:9",
+    resolution:"1080",
+  };
+  await store.saveEpisode({ ...store.getEpisode("episode-build"), videoBuilds:[build] });
+  await store.saveEpisode({ ...store.getEpisode("episode-build"), videoBuilds:[] });
+  assert.equal(store.getEpisode("episode-build").videoBuilds[0].id, "build-one");
+});
+
 test("renames keep an episode organized and deletion moves files to recoverable trash", async (t) => {
   const storageRoot = await mkdtemp(path.join(tmpdir(), "shortform-episode-rename-"));
   const store = new EpisodeStore({ storageRoot });

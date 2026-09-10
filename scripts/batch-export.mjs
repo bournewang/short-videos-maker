@@ -84,26 +84,35 @@ export function hasMatchingBuild(project, resolution) {
 export async function hasExportArtifact(episode, project, resolution, storageRoot = workRoot) {
   const slug = String(episode?.slug || "").trim();
   if (!slug) return false;
-  const build = (Array.isArray(project?.videoBuilds) ? project.videoBuilds : []).find((item) =>
+  const builds = (Array.isArray(project?.videoBuilds) ? project.videoBuilds : []).filter((item) =>
     normalizeScreenRatio(item?.screenRatio) === normalizeScreenRatio(project?.screenRatio) && String(item?.resolution || "") === String(resolution)
   );
-  if (!build) return false;
-  let pathname = String(build.path || build.url || "");
-  try {
-    pathname = new URL(pathname, "http://127.0.0.1").pathname;
-  } catch {
-    // A filesystem path can still be a valid artifact reference.
+  for (const build of builds) {
+    let pathname = String(build.path || build.url || "");
+    try {
+      pathname = new URL(pathname, "http://127.0.0.1").pathname;
+    } catch {
+      // A filesystem path can still be a valid artifact reference.
+    }
+    const prefix = `/episodes/${encodeURIComponent(episode.id)}/files/exports/`;
+    const filename = pathname.startsWith(prefix)
+      ? path.join(storageRoot, "episodes", slug, "exports", ...pathname.slice(prefix.length).split("/").map(decodeURIComponent))
+      : pathname;
+    try {
+      if ((await stat(filename)).isFile()) return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
   }
-  const prefix = `/episodes/${encodeURIComponent(episode.id)}/files/exports/`;
-  const filename = pathname.startsWith(prefix)
-    ? path.join(storageRoot, "episodes", slug, "exports", ...pathname.slice(prefix.length).split("/").map(decodeURIComponent))
-    : pathname;
-  try {
-    return (await stat(filename)).isFile();
-  } catch (error) {
-    if (error?.code === "ENOENT") return false;
-    throw error;
+  return false;
+}
+
+export function batchSubtitleStyle(project) {
+  const style = { ...(project?.subtitleStyle || {}) };
+  if (normalizeScreenRatio(project?.screenRatio) === "16:9") {
+    style.fontScale = Math.max(260, Number(style.fontScale) || 100);
   }
+  return style;
 }
 
 async function generateVideos(project, indexes, videoResolution, videoProvider) {
@@ -168,7 +177,7 @@ async function exportEpisode(episode, opts) {
       voicePreset: project.denoiseNarration !== false ? "denoise" : "original",
       bgmPath: project.bgm || "",
       bgmVolume: Number(project.bgmVolume) / 100,
-      subtitleStyle: project.subtitleStyle,
+      subtitleStyle: batchSubtitleStyle(project),
       broadcastMode: Boolean(project.broadcastMode),
       headlineText: project.headlineText || "",
       headlinePosition: Number(project.headlinePosition) || 4,

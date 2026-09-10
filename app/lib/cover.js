@@ -45,6 +45,13 @@ function wrapCoverText(context, value, maxWidth) {
 export async function downloadCoverFile(url, filename, headline, titlePosition, screenRatio, titleScale = 100, titleWidth = 84, titleVertical = 90) {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Download failed (${response.status})`);
+  if (!headline.trim()) {
+    const objectUrl = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = objectUrl; link.download = filename; document.body.appendChild(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    return;
+  }
   const sourceUrl = URL.createObjectURL(await response.blob());
   const image = new Image();
   await new Promise((resolve, reject) => {
@@ -111,7 +118,7 @@ export async function downloadCoverFile(url, filename, headline, titlePosition, 
     });
   }
   URL.revokeObjectURL(sourceUrl);
-  const result = await new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Could not create the cover download")), "image/png"));
+  const result = await new Promise((resolve, reject) => canvas.toBlob((blob) => blob ? resolve(blob) : reject(new Error("Could not create the cover download")), "image/jpeg", .9));
   const objectUrl = URL.createObjectURL(result);
   const link = document.createElement("a");
   link.href = objectUrl; link.download = filename; document.body.appendChild(link); link.click(); link.remove();

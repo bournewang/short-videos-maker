@@ -870,10 +870,10 @@ export async function bakeEpisodeCover(payload) {
     const screenRatio = normalizeScreenRatio(payload.screenRatio);
     const coverId = `cover-${screenRatio.replace(":", "x")}`;
     return await episodeStore.withMediaTarget(episodeId, payload.title, "covers", coverId, async (target) => {
-      const filename = path.join(target.directory, `${target.baseName}.png`);
+      const filename = path.join(target.directory, `${target.baseName}.jpg`);
       await writeFile(filename, data);
-      await unlink(path.join(target.directory, `${target.baseName}.jpg`)).catch(() => {});
-      const publicPath = `${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.png`)}`;
+      await unlink(path.join(target.directory, `${target.baseName}.png`)).catch(() => {});
+      const publicPath = `${target.urlPrefix}/${encodeURIComponent(`${target.baseName}.jpg`)}`;
       const createdAt = Date.now();
       return { id:coverId, path:publicPath, url:`http://127.0.0.1:${port}${publicPath}?v=${createdAt}`, screenRatio, createdAt };
     });
@@ -1077,7 +1077,7 @@ function assText(value) { return String(value || "").replace(/\\/g, "\\\\").repl
 
 export function buildSubtitleAss(shots, width, height, value = {}, broadcastMode = false, headlineText = "", headlinePosition = 4, transcription = null) {
   const style = normalizeSubtitleStyle(value);
-  const fontSizeBase = width > height ? width * .036 : height * .028;
+  const fontSizeBase = width > height ? width * .0252 : height * .028;
   const fontSize = Math.max(10, Math.round(fontSizeBase * style.fontScale / 100));
   const marginV = Math.round(height * style.position / 100); const marginH = Math.round(width * .065);
   const alignment = { left:1, center:2, right:3 }[style.alignment];

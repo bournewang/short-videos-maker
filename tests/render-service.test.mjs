@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { buildSubtitleAss, completeText, generateDocumentaryScript, generateImage, generateImageGroup, generateStoryScript, generateVideo, getProviderStatus, persistGeneratedImage, persistGeneratedVideo, planEpisode, prepareProviderImage, renderDimensions, renderEpisode, stillMotionFilter, streamImageGroup, supportsImageGroups, synthesizeSpeech, testProviderConnection, transcribeAudio } from "../scripts/render-service.mjs";
+import { batchSubtitleStyle } from "../scripts/batch-export.mjs";
 
 const ppmBytes = Buffer.concat([Buffer.from("P6\n2 2\n255\n"), Buffer.from([92,54,36, 170,116,66, 42,55,53, 206,176,119])]);
 const png = `data:image/x-portable-pixmap;base64,${ppmBytes.toString("base64")}`;
@@ -101,12 +102,19 @@ test("subtitle ASS uses the editable episode style", () => {
   assert.doesNotMatch(buildSubtitleAss([{ start:0, end:1, narration:"No box" }], 1080, 1920, { backgroundOpacity:0 }), /,Box,,/);
 });
 
-test("landscape subtitle sizing increases 260 percent text to 180 pixels", () => {
+test("landscape subtitle sizing renders 260 percent text at 126 pixels", () => {
   const ass = buildSubtitleAss([{ start:0, end:1, narration:"Landscape caption" }], 1920, 1080, {
     fontScale:260, position:5,
   });
-  assert.match(ass, /Style: Main,Arial,180,/);
+  assert.match(ass, /Style: Main,Arial,126,/);
   assert.match(ass, /,125,125,54,1\n/);
+});
+
+test("batch exports raise landscape subtitles to the 126 pixel scale", () => {
+  const style = batchSubtitleStyle({ screenRatio:"16:9", subtitleStyle:{ fontScale:100 } });
+  const ass = buildSubtitleAss([{ start:0, end:1, narration:"中文测试" }], 1920, 1080, style);
+  assert.match(ass, /Style: Main,Arial,126,/);
+  assert.equal(batchSubtitleStyle({ screenRatio:"9:16", subtitleStyle:{ fontScale:100 } }).fontScale, 100);
 });
 
 test("subtitle ASS cues follow transcription word timestamps, not planned shot times", () => {

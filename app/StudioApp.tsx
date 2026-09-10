@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect, react-hooks/exhaustive-deps, @next/next/no-img-element */
 
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
-import { toPng } from "html-to-image";
+import { toJpeg } from "html-to-image";
 import PrompterPanel from "./PrompterPanel";
 import { SubtitleStyleEditor } from "./components/SubtitleStyleEditor";
 import { readStyleCache, writeStyleCache } from "./lib/style-cache";
@@ -150,7 +150,7 @@ function safeFileStem(value:string) {
 export default function StudioApp() {
   const [episodeId, setEpisodeId] = useState(() => createEpisodeId());
   const [stage, setStage] = useState("episode");
-  const [title, setTitle] = useState("");
+    const [title, setTitle] = useState("");
   const [script, setScript] = useState("");
   const [contentFormat, setContentFormat] = useState("Documentary");
   const [visualStyle, setVisualStyle] = useState("Photorealistic");
@@ -1080,20 +1080,20 @@ export default function StudioApp() {
     finally { setBusy(""); }
   }
 
-  async function downloadCover(cover:CoverImage) {
+  async function downloadCover(cover:CoverImage, includeTitle = true) {
     try {
-      const headline = coverHeadline.trim() || title.trim() || "Watch this story";
-      await downloadCoverFile(cover.url, `${safeFileStem(title)}-cover-${cover.screenRatio.replace(":","x")}.png`, headline, coverTitlePosition, cover.screenRatio, coverTitleScale, coverTitleWidth, coverTitleVertical);
+      const headline = includeTitle ? coverHeadline.trim() || title.trim() || "Watch this story" : "";
+      await downloadCoverFile(cover.url, `${safeFileStem(title)}-cover-${cover.screenRatio.replace(":","x")}.jpg`, headline, coverTitlePosition, cover.screenRatio, coverTitleScale, coverTitleWidth, coverTitleVertical);
       setMessage(`${cover.screenRatio} cover downloaded.`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "Cover download failed"); }
   }
 
   async function saveCover(cover:CoverImage) {
-    if (!cover?.url || busy || !coverPreviewRef.current) return;
+    if (!cover?.url || busy || !coverPreviewRef.current) return null;
     touchProject(); setBusy("Saving cover artwork");
     try {
       const dimensions = screenRatio === "16:9" ? { width:1280, height:720 } : screenRatio === "1:1" ? { width:1080, height:1080 } : { width:1080, height:1920 };
-      const image = await toPng(coverPreviewRef.current, { cacheBust:true, canvasWidth:dimensions.width, canvasHeight:dimensions.height, pixelRatio:1 });
+      const image = await toJpeg(coverPreviewRef.current, { cacheBust:true, canvasWidth:dimensions.width, canvasHeight:dimensions.height, pixelRatio:1, quality:.9 });
       const response = await fetch(`${SERVICE}/covers/bake`, {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
@@ -1106,8 +1106,10 @@ export default function StudioApp() {
       setChosenCoverUrl(nextCover.url);
       persistProject(projectSnapshot({ covers:[nextCover, ...covers.filter((item) => item.id !== nextCover.id)], chosenCoverUrl:nextCover.url }));
       setMessage(`${screenRatio} cover saved to this episode.`);
+      return nextCover;
     } catch (error) { setMessage(error instanceof Error ? error.message : "Cover save failed"); }
     finally { setBusy(""); }
+    return null;
   }
 
   function changeScreenRatio(value:string) {
@@ -1488,7 +1490,11 @@ function ExportPanel({ title, productionMode, shots, approved, duration, audioNa
 }
 
 function CoverPanel({ title, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setCoverTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, chosenCoverUrl, setChosenCoverUrl, generateCover, downloadCover, saveCover, screenRatio, setScreenRatio, busy, coverPreviewRef }: any) {
-  return <div className={`panel cover-panel ratio-${screenRatio.replace(':','-')}`}><div className="section-head"><div><span className="eyebrow">PUBLISHING ASSETS</span><h1>Cover artwork</h1><p>Generate a striking cover image for your episode, or pick a storyboard frame as the background. Add your headline and position it to avoid the main subject.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={setCoverTitleVertical} coverTitleScale={coverTitleScale} setTitleScale={setCoverTitleScale} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={setCoverTitleWidth} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={setCoverShotId} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={setChosenCoverUrl} generateCover={generateCover} downloadCover={downloadCover} saveCover={saveCover} screenRatio={screenRatio} busy={busy} coverPreviewRef={coverPreviewRef}/></div>;
+  const saveAndDownloadCover = async (cover:CoverImage) => {
+    const saved = await saveCover(cover);
+    if (saved) await downloadCover(saved, false);
+  };
+  return <div className={`panel cover-panel ratio-${screenRatio.replace(':','-')}`}><div className="section-head"><div><span className="eyebrow">PUBLISHING ASSETS</span><h1>Cover artwork</h1><p>Generate a striking cover image for your episode, or pick a storyboard frame as the background. Add your headline and position it to avoid the main subject.</p></div><RatioSelect screenRatio={screenRatio} setScreenRatio={setScreenRatio}/></div><CoverStudio defaultHeadline={title} coverHeadline={coverHeadline} setCoverHeadline={setCoverHeadline} coverTitlePosition={coverTitlePosition} setCoverTitlePosition={setCoverTitlePosition} coverTitleVertical={coverTitleVertical} setCoverTitleVertical={setCoverTitleVertical} coverTitleScale={coverTitleScale} setTitleScale={setCoverTitleScale} coverTitleWidth={coverTitleWidth} setCoverTitleWidth={setCoverTitleWidth} coverPrompt={coverPrompt} setCoverPrompt={setCoverPrompt} suggestedCoverPrompt={suggestedCoverPrompt} covers={covers} shots={shots} coverShotId={coverShotId} setCoverShotId={setCoverShotId} chosenCoverUrl={chosenCoverUrl} setChosenCoverUrl={setChosenCoverUrl} generateCover={generateCover} downloadCover={downloadCover} saveAndDownloadCover={saveAndDownloadCover} screenRatio={screenRatio} busy={busy} coverPreviewRef={coverPreviewRef}/></div>;
 }
 
 function CharactersPanel({ characters, extractCharacters, updateCharacter, addCharacter, removeCharacter, generatePortrait, continueToStoryboard, busy }: any) {
@@ -1501,7 +1507,7 @@ function CharactersPanel({ characters, extractCharacters, updateCharacter, addCh
   </div>;
 }
 
-function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, chosenCoverUrl, setChosenCoverUrl, generateCover, downloadCover, saveCover, screenRatio, busy, coverPreviewRef }:any) {
+function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTitlePosition, setCoverTitlePosition, coverTitleVertical, setCoverTitleVertical, coverTitleScale, setTitleScale, coverTitleWidth, setCoverTitleWidth, coverPrompt, setCoverPrompt, suggestedCoverPrompt, covers, shots, coverShotId, setCoverShotId, chosenCoverUrl, setChosenCoverUrl, generateCover, downloadCover, saveAndDownloadCover, screenRatio, busy, coverPreviewRef }:any) {
   const generatedCover = covers.find((cover:CoverImage) => cover.screenRatio === screenRatio);
   const shotBackgrounds = (shots || []).filter((shot:Shot) => shot.image);
   const backgroundShot = shotBackgrounds.find((shot:Shot) => shot.id === coverShotId);
@@ -1584,7 +1590,7 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 </label>
 </div>}<div className="cover-actions">
 <button type="button" className="ghost" onClick={() => setCoverPrompt(suggestedCoverPrompt)}>Use suggested artwork</button>
-<button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <><button type="button" className="primary" onClick={() => void saveCover(currentCover)} disabled={!!busy}>{busy === "Saving cover artwork" ? "Saving…" : "Save cover"}</button><button type="button" className="ghost" onClick={() => void downloadCover(currentCover)}>Download with text</button></>}</div>
+<button type="button" className="primary" onClick={generateCover} disabled={!!busy}>{busy === "Generating cover artwork" ? "Generating…" : currentCover ? "Generate another" : "Generate cover"}</button>{currentCover && <button type="button" className="primary" onClick={() => void saveAndDownloadCover(currentCover)} disabled={!!busy}>{busy === "Saving cover artwork" ? "Saving…" : "Save & Download"}</button>}</div>
 </div>
 </div>{covers.length > 0 && <div className="cover-history">
 <h3>Saved covers</h3>
@@ -1598,7 +1604,7 @@ function CoverStudio({ defaultHeadline, coverHeadline, setCoverHeadline, coverTi
 <time>{cover.createdAt ? new Date(cover.createdAt).toLocaleString([], { dateStyle:"medium", timeStyle:"short" }) : "Earlier cover"}</time>
 </span>
 <button type="button" className={chosenCoverUrl === cover.url ? "primary" : "ghost"} onClick={() => setChosenCoverUrl(chosenCoverUrl === cover.url ? "" : cover.url)}>{chosenCoverUrl === cover.url ? "✓ Background" : "Use as background"}</button>
-<button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download with text</button>
+<button type="button" className="ghost" onClick={() => void downloadCover(cover)}>Download</button>
 </article>)}</div>
 </div>}</section>;
 }

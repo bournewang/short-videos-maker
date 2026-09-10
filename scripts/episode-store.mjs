@@ -106,6 +106,10 @@ function cloneProject(value) {
   return JSON.parse(JSON.stringify(value || {}));
 }
 
+function buildIdentity(build) {
+  return String(build?.id || build?.path || build?.url || "").trim();
+}
+
 export class EpisodeStore {
   constructor(options = {}) {
     this.storageRoot = path.resolve(options.storageRoot || ".shortform");
@@ -308,6 +312,22 @@ export class EpisodeStore {
     return project;
   }
 
+  async retainExistingVideoBuilds(project, existing, context) {
+    if (!existing) return project;
+    const previous = JSON.parse(existing.project_json || "{}");
+    const currentBuilds = Array.isArray(project.videoBuilds) ? project.videoBuilds : [];
+    const knownBuilds = new Set(currentBuilds.map(buildIdentity).filter(Boolean));
+    const retained = [];
+    for (const build of Array.isArray(previous.videoBuilds) ? previous.videoBuilds : []) {
+      const identity = buildIdentity(build);
+      if (!identity || knownBuilds.has(identity)) continue;
+      const filename = await this.resolveLocalSource(build.path || build.url);
+      if (filename && await exists(filename)) retained.push(build);
+    }
+    if (retained.length) project.videoBuilds = [...currentBuilds, ...retained];
+    return project;
+  }
+
   hydrateProject(value) {
     const project = cloneProject(value);
     if (project.audioPath) project.audioData = hydratedUrl(this.publicBaseUrl, project.audioPath);
@@ -333,7 +353,8 @@ export class EpisodeStore {
       const reviewInput = existing && options.overrideReview !== true
         ? { ...input, reviewStatus: String(existing.review_status || "draft"), reviewedAt: Number(existing.reviewed_at) || 0 }
         : input;
-      const project = await this.prepareProjectForStorage(reviewInput, context);
+      const prepared = await this.prepareProjectForStorage(reviewInput, context);
+      const project = await this.retainExistingVideoBuilds(prepared, existing, context);
       const summary = episodeSummary(project, context.slug);
       const createdAt = Number(existing?.created_at) || Date.now();
       const projectJson = JSON.stringify(project);

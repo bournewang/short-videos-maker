@@ -79,7 +79,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Career explainer", defaultVisualStyle: "Photorealistic",
     visualTone: "authentic workplace procedures, tools, uniforms, and operational scale",
     planningStyle: "immersive day-in-the-life progression with accurate process and safety context",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -93,7 +93,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Comparative explainer", defaultVisualStyle: "Cinematic illustration",
     visualTone: "period-accurate parallel worlds, maps, institutions, and material culture",
     planningStyle: "fair side-by-side comparison built around one precise question; avoid simplistic winners",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -107,7 +107,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Engineering explainer", defaultVisualStyle: "Technical 3D illustration",
     visualTone: "industrial realism, clean cutaways, structural details, and scale references",
     planningStyle: "begin with the visible puzzle, then reveal forces, constraints, and the design solution",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -121,7 +121,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Geographic explainer", defaultVisualStyle: "Editorial collage",
     visualTone: "crisp maps, satellite geography, routes, borders, and real landscapes",
     planningStyle: "make the map the protagonist: reveal a geographic surprise, then explain its cause and consequence",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -135,7 +135,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Immersive POV story", defaultVisualStyle: "Cinematic illustration",
     visualTone: "first-person cinematic immersion with period-accurate sensory detail",
     planningStyle: "second-person POV: place the viewer in a specific moment, then guide discoveries in chronological real time",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -149,7 +149,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Systems explainer", defaultVisualStyle: "Photorealistic",
     visualTone: "global infrastructure, networks, control rooms, routes, and real-world scale",
     planningStyle: "trace one familiar outcome backward through the hidden global system that enables it",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -163,7 +163,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Why explainer", defaultVisualStyle: "Photorealistic",
     visualTone: "recognizable everyday spaces, products, and behavioral details",
     planningStyle: "lead with an everyday mystery, expose the incentive or constraint, and close with a new way to notice it",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -177,7 +177,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Case study", defaultVisualStyle: "Photorealistic",
     visualTone: "real archival context, pivotal decisions, product details, and consequential moments",
     planningStyle: "open at the irreversible failure, reconstruct the chain of causes, and end with the lesson without hindsight smugness",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 
@@ -191,7 +191,7 @@ export const GENRES = Object.freeze({
     defaultContentFormat: "Rules explainer", defaultVisualStyle: "Photorealistic",
     visualTone: "real public spaces, signage, people following systems, and geographic context",
     planningStyle: "state the surprising rule, show the problem it solves, then explain its historical and practical tradeoffs",
-    tts: Object.freeze({ provider:"minimax", voice:"English_Trustworthy_Man", model:"speech-2.8-hd", speed:1 }),
+    tts: Object.freeze({ provider:"minimax", voice:"Chinese (Mandarin)_Male_Announcer", model:"speech-2.8-hd", speed:1 }),
     subtitleFont: "Arial", coverStyle: "documentary",
   }),
 });

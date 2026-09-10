@@ -14,6 +14,13 @@ test("the ten new content templates are registered with storyboard guidance", ()
   }
 });
 
+test("career-inside uses a Mandarin MiniMax narrator", () => {
+  const genre = getGenre("career-inside");
+  assert.equal(genre.primaryLanguage, "zh");
+  assert.equal(genre.tts.provider, "minimax");
+  assert.equal(genre.tts.voice, "Chinese (Mandarin)_Male_Announcer");
+});
+
 test("AI shot timing is normalized to the narration duration", () => {
   const shots = normalizePlannedShots([
     { narration:"A compact battery powers the prototype.", chinese:"一块紧凑型电池为原型机供电。", type:"Opening", duration:1.2, prompt:"Photorealistic technology prototype, vertical 9:16", videoPrompt:"Indicator lights pulse while the camera slowly pushes toward the battery", motion:"Slow push-in" },
